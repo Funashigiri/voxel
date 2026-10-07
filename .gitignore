@@ -1,0 +1,12 @@
+# build output
+bin/
+*.exe
+*.pdb
+*.obj
+*.ilk
+
+# in-game screenshots (F2)
+/screenshots/
+
+# user skin override
+/assets/skin.png

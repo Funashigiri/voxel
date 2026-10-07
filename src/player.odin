@@ -1,0 +1,287 @@
+package main
+
+// Игрок: физика как в Minecraft (20 тиков/с, те же константы ускорения,
+// трения и гравитации), коллизии AABB с блоками и состояние анимаций.
+
+import "core:math"
+import eng "engine"
+
+PLAYER_HALF_WIDTH :: 0.3
+PLAYER_HEIGHT :: 1.8
+EYE_HEIGHT :: 1.62
+SNEAK_EYE_HEIGHT :: 1.27
+TICK_RATE :: 20.0
+TICK_DT :: 1.0 / TICK_RATE
+
+@(private = "file")
+EPS :: 1e-7
+
+Player_Input :: struct {
+	forward, strafe:     f32, // -1..1 (strafe > 0 — влево, как в Minecraft)
+	jump, sneak, sprint: bool,
+}
+
+Player :: struct {
+	pos, prev_pos:              [3]f64,
+	vel:                        [3]f64,
+	yaw, pitch:                 f32, // радианы; yaw 0 = смотрит на +Z, растёт вправо
+	on_ground, in_water:        bool,
+	h_collision:                bool,
+	sprinting, sneaking:        bool,
+
+	// анимация (обновляется каждый тик, интерполируется при отрисовке)
+	limb_pos:                   f32,
+	limb_speed, prev_limb_speed: f32,
+	body_yaw, prev_body_yaw:    f32,
+	age:                        f32,
+	air, prev_air:              f32, // 0..1 — в прыжке/падении
+	crouch, prev_crouch:        f32, // 0..1 — присед
+	land, prev_land:            f32, // 0..1 — "приземление", затухает
+	walk_dist, prev_walk_dist:  f32, // для покачивания камеры
+	bob, prev_bob:              f32,
+	eye_h, prev_eye_h:          f32,
+	fov_mod, prev_fov_mod:      f32,
+}
+
+AABB :: struct {
+	min, max: [3]f64,
+}
+
+player_box :: proc(pos: [3]f64) -> AABB {
+	return {
+		{pos.x - PLAYER_HALF_WIDTH, pos.y, pos.z - PLAYER_HALF_WIDTH},
+		{pos.x + PLAYER_HALF_WIDTH, pos.y + PLAYER_HEIGHT, pos.z + PLAYER_HALF_WIDTH},
+	}
+}
+
+box_offset :: proc(b: AABB, d: [3]f64) -> AABB {
+	return {b.min + d, b.max + d}
+}
+
+@(private = "file")
+cell_range :: proc(lo, hi: f64) -> (i32, i32) {
+	return i32(math.floor(lo + EPS)), i32(math.floor(hi - EPS))
+}
+
+box_collides :: proc(w: ^World, b: AABB) -> bool {
+	x0, x1 := cell_range(b.min.x, b.max.x)
+	y0, y1 := cell_range(b.min.y, b.max.y)
+	z0, z1 := cell_range(b.min.z, b.max.z)
+	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
+		if world_is_solid(w, x, y, z) do return true
+	}
+	return false
+}
+
+// Насколько можно сдвинуть коробку по оси, не войдя в твёрдый блок.
+@(private = "file")
+clip_axis :: proc(w: ^World, b: AABB, d: f64, axis: int) -> f64 {
+	if d == 0 do return 0
+	region := b
+	if d > 0 {
+		region.max[axis] += d
+	} else {
+		region.min[axis] += d
+	}
+	x0, x1 := cell_range(region.min.x, region.max.x)
+	y0, y1 := cell_range(region.min.y, region.max.y)
+	z0, z1 := cell_range(region.min.z, region.max.z)
+	d := d
+	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
+		if !world_is_solid(w, x, y, z) do continue
+		cmin := [3]f64{f64(x), f64(y), f64(z)}
+		cmax := cmin + 1
+		overlap := true
+		for a in 0 ..< 3 {
+			if a == axis do continue
+			if b.max[a] <= cmin[a] + EPS || b.min[a] >= cmax[a] - EPS do overlap = false
+		}
+		if !overlap do continue
+		if d > 0 && b.max[axis] <= cmin[axis] + EPS {
+			d = min(d, cmin[axis] - b.max[axis])
+		} else if d < 0 && b.min[axis] >= cmax[axis] - EPS {
+			d = max(d, cmax[axis] - b.min[axis])
+		}
+	}
+	return d
+}
+
+@(private = "file")
+in_water_check :: proc(w: ^World, pos: [3]f64) -> bool {
+	b := player_box(pos)
+	b.min += {0.001, 0.4, 0.001}
+	b.max -= {0.001, 0.4, 0.001}
+	x0, x1 := cell_range(b.min.x, b.max.x)
+	y0, y1 := cell_range(b.min.y, b.max.y)
+	z0, z1 := cell_range(b.min.z, b.max.z)
+	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
+		if blk, _ := world_get_block(w, x, y, z); blk == .Water do return true
+	}
+	return false
+}
+
+@(private = "file")
+move_relative :: proc(p: ^Player, strafe, forward: f32, accel: f64) {
+	f := strafe * strafe + forward * forward
+	if f < 1e-4 do return
+	f = math.sqrt(f)
+	if f < 1 do f = 1
+	k := accel / f64(f)
+	s := f64(strafe) * k
+	fw := f64(forward) * k
+	sy := f64(math.sin(p.yaw))
+	cy := f64(math.cos(p.yaw))
+	p.vel.x += s * cy - fw * sy
+	p.vel.z += fw * cy + s * sy
+}
+
+@(private = "file")
+player_move :: proc(p: ^Player, w: ^World) {
+	d := p.vel
+	box := player_box(p.pos)
+
+	// присед: не даём сойти с края блока
+	if p.sneaking && p.on_ground {
+		STEP :: 0.05
+		shrink :: proc(v: f64) -> f64 {
+			if abs(v) < STEP do return 0
+			return v - math.sign(v) * STEP
+		}
+		for d.x != 0 && !box_collides(w, box_offset(box, {d.x, -1, 0})) do d.x = shrink(d.x)
+		for d.z != 0 && !box_collides(w, box_offset(box, {0, -1, d.z})) do d.z = shrink(d.z)
+		for d.x != 0 && d.z != 0 && !box_collides(w, box_offset(box, {d.x, -1, d.z})) {
+			d.x = shrink(d.x)
+			d.z = shrink(d.z)
+		}
+	}
+
+	orig := d
+	d.y = clip_axis(w, box, d.y, 1)
+	box = box_offset(box, {0, d.y, 0})
+	d.x = clip_axis(w, box, d.x, 0)
+	box = box_offset(box, {d.x, 0, 0})
+	d.z = clip_axis(w, box, d.z, 2)
+	box = box_offset(box, {0, 0, d.z})
+
+	p.pos = {box.min.x + PLAYER_HALF_WIDTH, box.min.y, box.min.z + PLAYER_HALF_WIDTH}
+	p.h_collision = orig.x != d.x || orig.z != d.z
+	p.on_ground = orig.y != d.y && orig.y < 0
+	if orig.x != d.x do p.vel.x = 0
+	if orig.y != d.y do p.vel.y = 0
+	if orig.z != d.z do p.vel.z = 0
+}
+
+player_spawn :: proc(p: ^Player, w: ^World, pos: [3]f64) {
+	p^ = {}
+	p.pos = pos
+	// если попали в дерево или склон — поднимаемся
+	for i := 0; i < 64 && box_collides(w, player_box(p.pos)); i += 1 do p.pos.y += 1
+	p.prev_pos = p.pos
+	p.eye_h = EYE_HEIGHT
+	p.prev_eye_h = EYE_HEIGHT
+	p.fov_mod = 1
+	p.prev_fov_mod = 1
+}
+
+player_tick :: proc(p: ^Player, w: ^World, input: Player_Input) {
+	p.prev_pos = p.pos
+	p.prev_limb_speed = p.limb_speed
+	p.prev_body_yaw = p.body_yaw
+	p.prev_air = p.air
+	p.prev_crouch = p.crouch
+	p.prev_land = p.land
+	p.prev_walk_dist = p.walk_dist
+	p.prev_bob = p.bob
+	p.prev_eye_h = p.eye_h
+	p.prev_fov_mod = p.fov_mod
+
+	forward := input.forward * 0.98
+	strafe := input.strafe * 0.98
+	p.sneaking = input.sneak
+	if p.sneaking {
+		forward *= 0.3
+		strafe *= 0.3
+	}
+
+	if input.sprint && input.forward > 0 && !p.sneaking do p.sprinting = true
+	if input.forward <= 0 || p.sneaking || p.h_collision do p.sprinting = false
+
+	was_on_ground := p.on_ground
+	vy_before := p.vel.y
+
+	if p.in_water {
+		if input.jump do p.vel.y += 0.04
+		move_relative(p, strafe, forward, 0.02)
+		player_move(p, w)
+		p.vel *= 0.8
+		p.vel.y -= 0.02
+		if p.h_collision && input.jump do p.vel.y = 0.3 // выбраться на берег
+	} else {
+		if input.jump && p.on_ground {
+			p.vel.y = 0.42
+			if p.sprinting {
+				p.vel.x -= f64(math.sin(p.yaw)) * 0.2
+				p.vel.z += f64(math.cos(p.yaw)) * 0.2
+			}
+		}
+		accel: f64
+		if p.on_ground {
+			friction: f64 = 0.546
+			speed: f64 = p.sprinting ? 0.13 : 0.1
+			accel = speed * (0.16277136 / (friction * friction * friction))
+		} else {
+			accel = p.sprinting ? 0.026 : 0.02
+		}
+		move_relative(p, strafe, forward, accel)
+		player_move(p, w)
+		friction: f64 = p.on_ground ? 0.546 : 0.91
+		p.vel.y -= 0.08
+		p.vel.y *= 0.98
+		p.vel.x *= friction
+		p.vel.z *= friction
+	}
+	for &v in p.vel do if abs(v) < 0.003 do v = 0
+
+	p.in_water = in_water_check(w, p.pos)
+
+	// --- анимация ---
+	dx := f32(p.pos.x - p.prev_pos.x)
+	dz := f32(p.pos.z - p.prev_pos.z)
+	dist := math.sqrt(dx * dx + dz * dz)
+
+	p.limb_speed += (min(dist * 4, 1) - p.limb_speed) * 0.4
+	p.limb_pos += p.limb_speed
+
+	// корпус поворачивается в сторону движения, голова — куда смотрит камера
+	target := p.body_yaw
+	if dist * dist > 0.0025 {
+		move_yaw := math.atan2(dz, dx) - math.PI / 2
+		if abs(eng.wrap_angle(p.yaw - move_yaw)) > math.to_radians(f32(95)) do move_yaw += math.PI
+		target = move_yaw
+	}
+	p.body_yaw += eng.wrap_angle(target - p.body_yaw) * 0.3
+	rel := clamp(eng.wrap_angle(p.yaw - p.body_yaw), -math.to_radians(f32(75)), math.to_radians(f32(75)))
+	p.body_yaw = p.yaw - rel
+	if abs(rel) > math.to_radians(f32(50)) do p.body_yaw += rel * 0.2
+
+	p.walk_dist += dist * 0.6
+	p.bob += ((p.on_ground ? min(0.1, dist) : 0) - p.bob) * 0.4
+	p.air += ((!p.on_ground && !p.in_water ? f32(1) : 0) - p.air) * 0.5
+	p.crouch += ((p.sneaking ? f32(1) : 0) - p.crouch) * 0.5
+	p.land *= 0.55
+	if p.on_ground && !was_on_ground && vy_before < -0.25 {
+		p.land = min(1, f32(-vy_before) / 0.7)
+	}
+	p.eye_h += ((p.sneaking ? f32(SNEAK_EYE_HEIGHT) : EYE_HEIGHT) - p.eye_h) * 0.5
+	p.fov_mod += ((p.sprinting ? f32(1.15) : 1) - p.fov_mod) * 0.5
+	p.age += 1
+}
+
+player_look_dir :: proc(yaw, pitch: f32) -> [3]f32 {
+	cp := math.cos(pitch)
+	return {-math.sin(yaw) * cp, -math.sin(pitch), math.cos(yaw) * cp}
+}
+
+player_render_pos :: proc(p: ^Player, t: f32) -> [3]f64 {
+	return p.prev_pos + (p.pos - p.prev_pos) * f64(t)
+}
