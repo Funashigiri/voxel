@@ -67,12 +67,24 @@ src/
   star_system.odin  генерация звёздной системы
   game_time.odin игровое время
   hud.odin       часы и панель F3
+  landing.odin   высадка в капсулах
+  capsule.odin   модель капсулы и парашюта
+  black_hole.odin эффект чёрной дыры (линза, ядро, кольцо)
+  particles.odin частицы (дым, пыль, искры, вихрь)
   camera.odin    камеры 1-го/3-го лица, покачивание при ходьбе
   sky.odin       небо, солнце, облака
   renderer.odin  отрисовка кадра
   shaders.odin   GLSL
 docs/            референсы и скриншоты версий
 ```
+
+## Высадка
+
+Игра начинается с падения: ты и двое спутников летите к планете в
+одноместных капсулах. Мышью можно оглядываться, WASD немного уводят
+капсулу в сторону. Парашют сорвёт — посадка будет жёсткой. После удара
+персонаж сам выскакивает и отбегает, а капсула схлопывается, как в
+чёрную дыру. Дальше — управление твоё.
 
 ## Мир и время
 
@@ -88,5 +100,5 @@ docs/            референсы и скриншоты версий
 
 ## Отладочные параметры
 
-`bin\voxel.exe -shot:out.png -delay:3 -cam:back|fp|front -yaw:0 -pitch:15 -walk -sprint -jump -sneak -strafe -orbit:90 -burst:6 -interval:0.1 -seed:123 -time:21:30 -f3 -size:1280x720 -select:1|2|3 -order:follow|hold|go -order_at:0.5 -spawn:water`
+`bin\voxel.exe -shot:out.png -delay:3 -cam:back|fp|front -yaw:0 -pitch:15 -walk -sprint -jump -sneak -strafe -orbit:90 -burst:6 -interval:0.1 -seed:123 -time:21:30 -f3 -nointro -size:1280x720 -select:1|2|3 -order:follow|hold|go -order_at:0.5 -spawn:water`
 — автоматический скриншот (или серия) и выход. `-dump-textures:tex.png` сохраняет все текстуры блоков.

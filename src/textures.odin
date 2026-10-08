@@ -28,6 +28,7 @@ Tex :: enum u8 {
 	Tall_Grass,
 	Dandelion,
 	Poppy,
+	Scorched,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -269,6 +270,23 @@ gen_flower :: proc(petal_light, petal_mid, petal_dark, centre: RGBA) -> (img: Pi
 }
 
 @(private = "file")
+gen_scorched :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(34, 30, 27), rgb(44, 38, 33), rgb(54, 46, 39), rgb(64, 54, 45), rgb(72, 60, 49)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.6 * h(x, y, 90) + 0.4 * vn(x, y, 4, 91)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		a := h(x, y, 92)
+		if a < 0.07 {
+			c = rgb(118, 112, 104) // пепел
+		} else if a < 0.1 {
+			c = rgb(20, 18, 17) // уголь
+		}
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+@(private = "file")
 gen_water :: proc(frame: int) -> (img: Pixels) {
 	pal := []RGBA{{38, 76, 184, 168}, {50, 94, 206, 168}, {66, 114, 222, 172}, {94, 142, 236, 178}}
 	phase := f32(frame) / f32(WATER_FRAMES) * math.TAU
@@ -337,6 +355,8 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_flower(rgb(255, 240, 92), rgb(250, 208, 36), rgb(216, 160, 18), rgb(226, 150, 12))
 	case .Poppy:
 		return gen_flower(rgb(236, 64, 52), rgb(204, 32, 30), rgb(150, 18, 18), rgb(44, 30, 24))
+	case .Scorched:
+		return gen_scorched()
 	case .Water:
 		return gen_water(0)
 	}

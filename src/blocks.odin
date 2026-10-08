@@ -18,6 +18,7 @@ Block :: enum u8 {
 	Tall_Grass,
 	Dandelion,
 	Poppy,
+	Scorched, // выжженная земля (место посадки капсулы)
 }
 
 Render_Kind :: enum u8 {
@@ -78,6 +79,7 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Sand] = cube(all_faces(.Sand))
 	BLOCK_INFO[.Gravel] = cube(all_faces(.Gravel))
 	BLOCK_INFO[.Bedrock] = cube(all_faces(.Bedrock))
+	BLOCK_INFO[.Scorched] = cube(all_faces(.Scorched))
 	BLOCK_INFO[.Oak_Log] = cube(column_faces(.Oak_Log, .Oak_Log_Top, .Oak_Log_Top))
 	BLOCK_INFO[.Birch_Log] = cube(column_faces(.Birch_Log, .Birch_Log_Top, .Birch_Log_Top))
 	BLOCK_INFO[.Water] = {

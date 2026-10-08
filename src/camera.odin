@@ -70,7 +70,6 @@ raycast_solid :: proc(w: ^World, origin, dir: [3]f64, max_dist: f64) -> (hit: bo
 }
 
 // Отодвигает камеру ближе, если между ней и игроком есть блоки.
-@(private = "file")
 clip_distance :: proc(w: ^World, eye, dir: [3]f64, dist: f64) -> f64 {
 	d := dist
 	for i in 0 ..< 8 {
@@ -82,6 +81,21 @@ clip_distance :: proc(w: ^World, eye, dir: [3]f64, dist: f64) -> f64 {
 
 camera_cycle_mode :: proc(cam: ^Camera) {
 	cam.mode = Camera_Mode((int(cam.mode) + 1) % len(Camera_Mode))
+}
+
+// Матрицы вида и проекции из позиции, углов, покачивания и FOV камеры.
+camera_build_matrices :: proc(cam: ^Camera, aspect: f32) {
+	dir := look_dir(cam.yaw, cam.pitch)
+	cam.view = cam.bob * linalg.matrix4_look_at_f32({0, 0, 0}, dir, {0, 1, 0})
+	cam.proj = linalg.matrix4_perspective_f32(math.to_radians(cam.fov), aspect, NEAR_PLANE, FAR_PLANE)
+	cam.view_proj = cam.proj * cam.view
+}
+
+// Направление взгляда -> (yaw, pitch) в соглашении look_dir.
+yaw_pitch_of :: proc(d: [3]f64) -> (yaw, pitch: f32) {
+	l := math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
+	if l < 1e-9 do return 0, 0
+	return math.atan2(f32(-d.x), f32(d.z)), -math.asin(f32(d.y / l))
 }
 
 camera_update :: proc(cam: ^Camera, p: ^Character, w: ^World, t: f32, aspect: f32, dt: f32) {
@@ -115,11 +129,8 @@ camera_update :: proc(cam: ^Camera, p: ^Character, w: ^World, t: f32, aspect: f3
 			linalg.matrix4_rotate_f32(math.to_radians(abs(math.cos(f1 - 0.2) * f2) * 5), {1, 0, 0})
 	}
 
-	dir := look_dir(cam.yaw, cam.pitch)
-	cam.view = cam.bob * linalg.matrix4_look_at_f32({0, 0, 0}, dir, {0, 1, 0})
 	cam.fov = BASE_FOV * math.lerp(p.prev_fov_mod, p.fov_mod, t)
-	cam.proj = linalg.matrix4_perspective_f32(math.to_radians(cam.fov), aspect, NEAR_PLANE, FAR_PLANE)
-	cam.view_proj = cam.proj * cam.view
+	camera_build_matrices(cam, aspect)
 
 	k := 1 - math.pow(f32(0.5), dt * 20)
 	cam.hand_yaw = eng.lerp_angle(cam.hand_yaw, p.yaw, k)

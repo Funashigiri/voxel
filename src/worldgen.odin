@@ -242,3 +242,18 @@ find_water_spawn :: proc(seed: u32) -> [3]f64 {
 	}
 	return find_spawn(seed)
 }
+
+// Отладка: точка в горах недалеко от (0, 0) — для проверки посадки на склоны.
+find_mountain_spawn :: proc(seed: u32) -> [3]f64 {
+	s := i64(seed)
+	for r := i32(0); r < 1500; r += 6 {
+		for dz := -r; dz <= r; dz += 6 {
+			for dx := -r; dx <= r; dx += 6 {
+				if max(abs(dx), abs(dz)) != r do continue
+				h := terrain_height(s, f64(dx), f64(dz))
+				if h >= 92 do return {f64(dx) + 0.5, f64(h) + 1, f64(dz) + 0.5}
+			}
+		}
+	}
+	return find_spawn(seed)
+}

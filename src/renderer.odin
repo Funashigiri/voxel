@@ -17,7 +17,8 @@ Chunk_Shader :: struct {
 
 Entity_Shader :: struct {
 	prog:                                                         u32,
-	u_mvp, u_model, u_skin, u_light, u_fog: i32,
+	u_mvp, u_model, u_skin, u_light, u_fog, u_tint: i32,
+	u_view_proj, u_collapse:                       i32,
 }
 
 Sky_Shader :: struct {
@@ -35,6 +36,7 @@ Renderer :: struct {
 	entity:         Entity_Shader,
 	sky:            Sky_Shader,
 	cloud:          Cloud_Shader,
+	lens:           Lens_Renderer,
 	atlas:          u32,
 	fog:            [2]f32, // туман над водой (из дальности прорисовки)
 	underwater:     bool, // камера под водой в этом кадре
@@ -49,6 +51,8 @@ Frame_Params :: struct {
 	sky:         ^Sky,
 	model:       ^Humanoid_Model,
 	player_skin: u32,
+	capsule:     ^Capsule_Model,
+	landing:     ^Landing,
 	squad:       ^Squad,
 	clock:       ^Game_Clock,
 	system:      ^Star_System,
@@ -85,6 +89,9 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_skin        = loc(p, "u_skin"),
 			u_light       = loc(p, "u_light"),
 			u_fog         = loc(p, "u_fog"),
+			u_tint        = loc(p, "u_tint"),
+			u_view_proj   = loc(p, "u_view_proj"),
+			u_collapse    = loc(p, "u_collapse"),
 		}
 	}
 	{
@@ -105,6 +112,7 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 		}
 	}
 	eng.imm_init() or_return
+	lens_init(&r.lens) or_return
 	eng.text_init()
 
 	pixels := build_block_textures(context.temp_allocator)
@@ -240,12 +248,20 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_i32(r.entity.u_skin, 0)
 	eng.set_vec2(r.entity.u_fog, fog)
 	set_sky_uniforms(r, r.entity.prog)
+	eng.set_vec4(r.entity.u_tint, {})
+	eng.set_vec4(r.entity.u_collapse, {})
+	eng.set_mat4(r.entity.u_view_proj, cam.view_proj)
+	ld := fp.landing
+	landing_ui := ld.active // пока игрок без управления — никакого интерфейса
 	update_light(&r.player_light, fp.world, p, fp.t, fp.dt)
-	if cam.mode != .First_Person do draw_character(r, &fp, p, fp.player_skin, r.player_light)
-	for &c in fp.squad.members {
-		update_light(&c.light, fp.world, &c.body, fp.t, fp.dt)
-		draw_character(r, &fp, &c.body, c.skin_tex, c.light)
+	if ld.pods[0].rider_out && (cam.mode != .First_Person || landing_ui) {
+		draw_character(r, &fp, p, fp.player_skin, r.player_light)
 	}
+	for &c, i in fp.squad.members {
+		update_light(&c.light, fp.world, &c.body, fp.t, fp.dt)
+		if ld.pods[i + 1].rider_out do draw_character(r, &fp, &c.body, c.skin_tex, c.light)
+	}
+	draw_pods(r, &fp)
 
 	// ---- вода (сзади вперёд, полупрозрачная)
 	gl.UseProgram(r.chunk.prog)
@@ -262,9 +278,26 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	}
 	gl.Enable(gl.CULL_FACE)
 
-	// ---- значки приказов и метки целей (видны сквозь воду, но не сквозь землю)
+	// ---- частицы (дым и пыль, затем светящиеся — огонь, искры)
 	gl.Disable(gl.CULL_FACE)
-	squad_draw_world(fp.squad, cam, fp.t, fp.time)
+	if len(ld.particles.list) > 0 {
+		particles_draw(&ld.particles, cam, false)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE)
+		particles_draw(&ld.particles, cam, true)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	}
+
+	// ---- чёрные дыры (искажают уже нарисованную сцену)
+	if holes := landing_holes(ld); len(holes) > 0 {
+		lens_draw(&r.lens, holes, cam, fp.width, fp.height)
+		gl.Enable(gl.BLEND)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+		gl.DepthMask(false)
+		gl.Disable(gl.CULL_FACE)
+	}
+
+	// ---- значки приказов и метки целей (видны сквозь воду, но не сквозь землю)
+	if !landing_ui do squad_draw_world(fp.squad, cam, fp.t, fp.time)
 	gl.Enable(gl.CULL_FACE)
 	gl.DepthMask(true)
 
@@ -289,7 +322,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	}
 	gl.Disable(gl.BLEND)
 
-	if cam.mode == .First_Person {
+	if cam.mode == .First_Person && !landing_ui {
 		// ---- рука
 		gl.Clear(gl.DEPTH_BUFFER_BIT)
 		gl.UseProgram(r.entity.prog)
@@ -314,18 +347,60 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.Disable(gl.DEPTH_TEST)
 	gl.Disable(gl.CULL_FACE)
 	gl.Enable(gl.BLEND)
-	if cam.mode != .Third_Front {
-		gl.BlendFunc(gl.ONE_MINUS_DST_COLOR, gl.ONE_MINUS_SRC_COLOR)
-		draw_crosshair(fp.width, fp.height)
-	}
-	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-	squad_draw_hud(fp.squad, fp.width, fp.height)
 	fp.chunks_drawn = r.chunks_drawn
-	hud_draw(&fp)
+	if landing_ui {
+		if fp.show_debug {
+			gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+			hud_draw(&fp)
+		}
+	} else {
+		if cam.mode != .Third_Front {
+			gl.BlendFunc(gl.ONE_MINUS_DST_COLOR, gl.ONE_MINUS_SRC_COLOR)
+			draw_crosshair(fp.width, fp.height)
+		}
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+		squad_draw_hud(fp.squad, fp.width, fp.height)
+		hud_draw(&fp)
+	}
 	gl.Disable(gl.BLEND)
 	gl.Enable(gl.DEPTH_TEST)
 	gl.Enable(gl.CULL_FACE)
 	gl.BindVertexArray(0)
+}
+
+// Капсулы высадки и их парашюты.
+@(private = "file")
+draw_pods :: proc(r: ^Renderer, fp: ^Frame_Params) {
+	cam := fp.cam
+	eng.set_f32(r.entity.u_light, 1)
+	for &pod in fp.landing.pods {
+		if pod.state != .Gone {
+			root := capsule_matrix(cam, pod.pos, pod.yaw, pod.tilt.x, pod.tilt.y)
+			if pod.state == .Collapsing {
+				c := pod.hole.center - cam.pos
+				eng.set_vec4(r.entity.u_collapse, {f32(c.x), f32(c.y), f32(c.z), pod.collapse})
+				eng.set_vec4(r.entity.u_tint, {0, 0, 0, pod.collapse * 0.6})
+			}
+			capsule_draw(fp.capsule, &r.entity, cam, root, pod.hatch, pod.chute == .Packed)
+			eng.set_vec4(r.entity.u_collapse, {})
+			eng.set_vec4(r.entity.u_tint, {})
+			if pod.chute == .Open {
+				g := eng.smoothstep(0, CHUTE_GROW, pod.chute_t)
+				flutter := 1 + 0.06 * math.sin(pod.chute_t * 23)
+				m := root * linalg.matrix4_translate_f32({0, POD_TOP, 0}) * linalg.matrix4_scale_f32({g * flutter, 0.3 + 0.7 * g, g / flutter})
+				capsule_draw_chute(fp.capsule, &r.entity, cam, m)
+			}
+		}
+		if pod.chute == .Torn {
+			rel := [3]f32{f32(pod.chute_pos.x - cam.pos.x), f32(pod.chute_pos.y - cam.pos.y), f32(pod.chute_pos.z - cam.pos.z)}
+			m :=
+				linalg.matrix4_translate_f32(rel) *
+				linalg.matrix4_rotate_f32(pod.chute_rot.y, {0, 1, 0}) *
+				linalg.matrix4_rotate_f32(pod.chute_rot.x, {1, 0, 0}) *
+				linalg.matrix4_rotate_f32(pod.chute_rot.z, {0, 0, 1})
+			capsule_draw_chute(fp.capsule, &r.entity, cam, m)
+		}
+	}
 }
 
 // Положение правой руки в пространстве камеры (подобрано на глаз).

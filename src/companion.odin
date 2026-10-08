@@ -48,6 +48,7 @@ Companion :: struct {
 	rng:          u32,
 	light:        f32, // для отрисовки
 	marker:       f32, // видимость метки цели 0..1
+	held:         bool, // управляется сценой посадки, а не ИИ
 }
 
 Squad :: struct {
@@ -386,9 +387,10 @@ companion_tick :: proc(c: ^Companion, w: ^World, player: ^Character) {
 }
 
 squad_tick :: proc(s: ^Squad, w: ^World, player: ^Character) {
-	for &c in s.members do companion_tick(&c, w, player)
+	for &c in s.members do if !c.held do companion_tick(&c, w, player)
 	for i in 0 ..< SQUAD_SIZE {
+		if s.members[i].held do continue
 		character_push_apart(player, &s.members[i].body)
-		for j in i + 1 ..< SQUAD_SIZE do character_push_apart(&s.members[i].body, &s.members[j].body)
+		for j in i + 1 ..< SQUAD_SIZE do if !s.members[j].held do character_push_apart(&s.members[i].body, &s.members[j].body)
 	}
 }

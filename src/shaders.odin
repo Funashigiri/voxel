@@ -106,14 +106,29 @@ layout(location = 1) in vec2 a_uv;
 layout(location = 2) in vec3 a_normal;
 uniform mat4 u_mvp;
 uniform mat4 u_model;    // в мировые оси (относительно камеры)
+uniform mat4 u_view_proj;
+uniform vec4 u_collapse; // xyz — центр чёрной дыры (относительно камеры), w — 0..1
 out vec2 v_uv;
 out vec3 v_normal;
 out vec3 v_rel;
 void main() {
 	v_uv = a_uv;
 	v_normal = mat3(u_model) * a_normal;
-	v_rel = (u_model * vec4(a_pos, 1.0)).xyz;
-	gl_Position = u_mvp * vec4(a_pos, 1.0);
+	vec3 wp = (u_model * vec4(a_pos, 1.0)).xyz;
+	if (u_collapse.w > 0.0) {
+		// стягивание в точку: дальние части затягиваются позже, всё закручивается
+		vec3 d = wp - u_collapse.xyz;
+		float r = length(d);
+		float k = u_collapse.w;
+		float s = pow(1.0 - k, 1.0 + 1.5 / (r + 0.3));
+		float a = k * k * 7.0 / (r + 0.6);
+		d = vec3(d.x * cos(a) - d.z * sin(a), d.y * (1.0 - 0.3 * k), d.x * sin(a) + d.z * cos(a));
+		wp = u_collapse.xyz + d * s;
+		gl_Position = u_view_proj * vec4(wp, 1.0);
+	} else {
+		gl_Position = u_mvp * vec4(a_pos, 1.0);
+	}
+	v_rel = wp;
 }
 `
 
@@ -124,6 +139,7 @@ in vec3 v_rel;
 uniform sampler2D u_skin;
 uniform float u_light;
 uniform vec2 u_fog;
+uniform vec4 u_tint; // rgb + сила (свечение, вспышки)
 out vec4 o_color;
 ` + SKY_GLSL + `
 // два источника света, как у мобов в Minecraft
@@ -135,6 +151,7 @@ void main() {
 	vec3 n = normalize(v_normal);
 	float diff = min(1.0, 0.4 + 0.6 * (max(dot(n, L0), 0.0) + max(dot(n, L1), 0.0)));
 	vec3 col = c.rgb * diff * u_light;
+	col = mix(col, u_tint.rgb, u_tint.a);
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
 	o_color = vec4(col, 1.0);

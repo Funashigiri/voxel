@@ -30,6 +30,14 @@ World :: struct {
 	chunks:      map[Chunk_Key]^Chunk,
 	view_radius: i32,
 	load_order:  [dynamic]Chunk_Key, // смещения чанков, отсортированные по расстоянию
+	// Изменения мира поверх генерации — переживают выгрузку чанков
+	// (пока только до выхода из игры: сохранения ещё нет).
+	edits:       map[Chunk_Key][dynamic]Block_Edit,
+}
+
+Block_Edit :: struct {
+	index: i32,
+	block: Block,
 }
 
 block_index :: #force_inline proc "contextless" (x, y, z: i32) -> i32 {
@@ -58,6 +66,8 @@ world_destroy :: proc(w: ^World) {
 	}
 	delete(w.chunks)
 	delete(w.load_order)
+	for _, list in w.edits do delete(list)
+	delete(w.edits)
 }
 
 world_get_chunk :: proc(w: ^World, cx, cz: i32) -> ^Chunk {
@@ -97,8 +107,36 @@ ensure_chunk :: proc(w: ^World, key: Chunk_Key) -> (c: ^Chunk, created: bool) {
 	c = new(Chunk)
 	c.key = key
 	generate_chunk(w, c)
+	if list, ok := w.edits[key]; ok {
+		for e in list do c.blocks[e.index] = e.block
+		chunk_update_light(c)
+	}
 	w.chunks[key] = c
 	return c, true
+}
+
+// Меняет блок, запоминает изменение и помечает чанки на перестройку сетки.
+world_set_block :: proc(w: ^World, x, y, z: i32, b: Block) {
+	if y < 0 || y >= CHUNK_HEIGHT do return
+	key := Chunk_Key{eng.floor_div(x, CHUNK_SIZE), eng.floor_div(z, CHUNK_SIZE)}
+	lx := eng.floor_mod(x, CHUNK_SIZE)
+	lz := eng.floor_mod(z, CHUNK_SIZE)
+	idx := block_index(lx, y, lz)
+
+	list := w.edits[key]
+	append(&list, Block_Edit{idx, b})
+	w.edits[key] = list
+
+	c := world_get_chunk(w, key.x, key.y)
+	if c == nil do return
+	c.blocks[idx] = b
+	chunk_update_light(c)
+	// соседям тоже: их AO и грани на границе зависят от этого блока
+	for dz in i32(-1) ..= 1 do for dx in i32(-1) ..= 1 {
+		if dx < 0 && lx != 0 || dx > 0 && lx != CHUNK_SIZE - 1 do continue
+		if dz < 0 && lz != 0 || dz > 0 && lz != CHUNK_SIZE - 1 do continue
+		if n := world_get_chunk(w, key.x + dx, key.y + dz); n != nil do n.meshed = false
+	}
 }
 
 // Генерирует и строит меши ближайших чанков, укладываясь в бюджет времени.

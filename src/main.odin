@@ -11,7 +11,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.004"
+VERSION :: "0.005"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -36,8 +36,11 @@ Options :: struct {
 	order:         string, // follow | hold | go — отдать приказ автоматически
 	order_at:      f64, // через сколько секунд
 	select:        int, // 1, 2 или 3 (оба)
-	water_spawn:   bool, // появиться в воде
+	water_spawn:   bool, // появиться над водой
+	mountain_spawn: bool, // появиться над горами
 	debug_panel:   bool, // сразу открыть панель F3
+	no_intro:      bool, // без высадки в капсулах (сразу на земле)
+	has_look:      bool, // заданы -yaw / -pitch
 	dump_textures: string,
 }
 
@@ -67,8 +70,10 @@ parse_options :: proc() -> (o: Options) {
 			}
 		case "-yaw":
 			o.yaw = f32(strconv.parse_f64(val) or_else 0)
+			o.has_look = true
 		case "-pitch":
 			o.pitch = f32(strconv.parse_f64(val) or_else 0)
+			o.has_look = true
 		case "-seed":
 			if v, ok := strconv.parse_u64(val); ok {
 				o.seed = u32(v)
@@ -99,10 +104,13 @@ parse_options :: proc() -> (o: Options) {
 			o.order_at = strconv.parse_f64(val) or_else 0.3
 		case "-select":
 			o.select = strconv.parse_int(val) or_else 3
+		case "-nointro":
+			o.no_intro = true
 		case "-f3":
 			o.debug_panel = true
 		case "-spawn":
 			o.water_spawn = val == "water"
+			o.mountain_spawn = val == "mountain"
 		case "-orbit":
 			o.orbit = f32(strconv.parse_f64(val) or_else 0)
 		case "-interval":
@@ -174,6 +182,7 @@ main :: proc() {
 	player_skin := skin_load_or_generate("assets/skin.png", PALETTE_PLAYER)
 	player_skin_tex := skin_texture_create(&player_skin)
 	model := humanoid_model_create()
+	capsule := capsule_model_create()
 
 	sky: Sky
 	sky_init(&sky, opts.seed)
@@ -182,8 +191,14 @@ main :: proc() {
 	world_init(&world, opts.seed, VIEW_RADIUS)
 	defer world_destroy(&world)
 
-	spawn := opts.water_spawn ? find_water_spawn(opts.seed) : find_spawn(opts.seed)
+	spawn := find_spawn(opts.seed)
+	if opts.water_spawn do spawn = find_water_spawn(opts.seed)
+	if opts.mountain_spawn do spawn = find_mountain_spawn(opts.seed)
 	for !spawn_area_ready(&world, spawn, 2) {
+		world_update(&world, spawn, 0.1)
+		free_all(context.temp_allocator)
+	}
+	for !spawn_area_ready(&world, spawn, 4) {
 		world_update(&world, spawn, 0.1)
 		free_all(context.temp_allocator)
 	}
@@ -200,6 +215,17 @@ main :: proc() {
 	defer squad_destroy(&squad)
 	if opts.select > 0 do squad_select(&squad, opts.select == 3 ? -1 : opts.select - 1)
 	auto_order_done := opts.order == ""
+
+	// высадка: игрок и спутники падают в капсулах над точкой появления
+	landing := landing_create(&world, &player, &squad, spawn, opts.seed)
+	if opts.no_intro {
+		landing_skip(&landing, &squad, &player)
+		if opts.has_look {
+			player.yaw = math.to_radians(opts.yaw)
+			player.pitch = math.to_radians(opts.pitch)
+			player.body_yaw, player.prev_body_yaw = player.yaw, player.yaw
+		}
+	}
 
 	cam := Camera {
 		mode       = opts.cam_mode,
@@ -230,6 +256,7 @@ main :: proc() {
 		last = now
 
 		// --- системные клавиши
+		playing := !landing.active // во время высадки — только увод капсулы и взгляд
 		if eng.key_pressed(glfw.KEY_ESCAPE) {
 			if eng.win.cursor_locked {
 				eng.set_cursor_locked(false)
@@ -237,14 +264,14 @@ main :: proc() {
 				eng.window_request_close()
 			}
 		}
-		if !eng.win.cursor_locked && !auto_mode && eng.mouse_pressed(glfw.MOUSE_BUTTON_LEFT) {
+		if playing && !eng.win.cursor_locked && !auto_mode && eng.mouse_pressed(glfw.MOUSE_BUTTON_LEFT) {
 			eng.set_cursor_locked(true)
 		}
-		if eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
+		if playing && eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
 		if eng.key_pressed(glfw.KEY_F2) do screenshot_requested = true
 		if eng.key_pressed(glfw.KEY_F3) do show_debug = !show_debug
-		if eng.win.focused do handle_squad_keys(&squad, &world, &player)
-		if !auto_order_done && now - start > opts.order_at {
+		if playing && eng.win.focused do handle_squad_keys(&squad, &world, &player)
+		if playing && !auto_order_done && now - start > opts.order_at {
 			auto_order_done = true
 			switch opts.order {
 			case "follow":
@@ -257,7 +284,7 @@ main :: proc() {
 		}
 
 		// --- обзор мышью
-		if eng.win.cursor_locked {
+		if playing && eng.win.cursor_locked {
 			player.yaw += eng.win.mouse_dx * MOUSE_SENSITIVITY
 			player.pitch += eng.win.mouse_dy * MOUSE_SENSITIVITY
 			limit := math.to_radians(f32(89.9))
@@ -266,7 +293,7 @@ main :: proc() {
 
 		// --- управление
 		input: Move_Input
-		if eng.win.focused {
+		if playing && eng.win.focused {
 			if eng.key_pressed(glfw.KEY_W) {
 				if now - last_w_press < 0.3 do sprint_latch = true
 				last_w_press = now
@@ -290,19 +317,42 @@ main :: proc() {
 		accumulator += dt
 		ticks := 0
 		for accumulator >= TICK_DT && ticks < 10 {
-			character_tick(&player, &world, input)
+			landing_tick(&landing, &world)
+			if !landing.active do character_tick(&player, &world, input)
 			squad_tick(&squad, &world, &player)
 			clock_tick(&clock)
 			accumulator -= TICK_DT
 			ticks += 1
 		}
 		t := f32(accumulator / TICK_DT)
+		{
+			// увод капсулы WASD относительно камеры
+			drift: [3]f64
+			mdx, mdy: f32
+			if landing.active && eng.win.focused {
+				f := look_dir(landing.cam_yaw, 0)
+				fwd := [3]f64{f64(f.x), 0, f64(f.z)}
+				right := [3]f64{-fwd.z, 0, fwd.x}
+				if eng.key_down(glfw.KEY_W) do drift += fwd
+				if eng.key_down(glfw.KEY_S) do drift -= fwd
+				if eng.key_down(glfw.KEY_D) do drift += right
+				if eng.key_down(glfw.KEY_A) do drift -= right
+				if opts.walk do drift += fwd // отладка: "держать W"
+				if l := math.sqrt(drift.x * drift.x + drift.z * drift.z); l > 1 do drift /= l
+			}
+			if eng.win.cursor_locked do mdx, mdy = eng.win.mouse_dx, eng.win.mouse_dy
+			landing_update(&landing, &world, drift, mdx, mdy, cam.pos, f32(dt))
+		}
 
 		world_update(&world, player.pos, WORLD_BUDGET)
 
 		fbw, fbh := eng.win.fb_width, eng.win.fb_height
 		if fbw > 0 && fbh > 0 {
-			camera_update(&cam, &player, &world, t, f32(fbw) / f32(fbh), f32(dt))
+			if landing.active {
+				landing_camera(&landing, &cam, &player, &world, t, f32(fbw) / f32(fbh), f32(dt))
+			} else {
+				camera_update(&cam, &player, &world, t, f32(fbw) / f32(fbh), f32(dt))
+			}
 			render_frame(&r, {
 				world = &world,
 				player = &player,
@@ -310,6 +360,8 @@ main :: proc() {
 				sky = &sky,
 				model = &model,
 				player_skin = player_skin_tex,
+				capsule = &capsule,
+				landing = &landing,
 				squad = &squad,
 				clock = &clock,
 				system = &system,
