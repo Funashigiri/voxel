@@ -11,11 +11,12 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.001"
+VERSION :: "0.002"
 VIEW_RADIUS :: 10 // чанков
 DEFAULT_SEED :: 20261007
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
+ORDER_RANGE :: 128.0 // дальность приказа «Иди туда», блоков
 
 Options :: struct {
 	width, height: i32,
@@ -31,6 +32,9 @@ Options :: struct {
 	burst:         int, // сколько кадров снять подряд
 	interval:      f64, // пауза между кадрами серии
 	orbit:         f32, // градусы, поворот камеры вокруг игрока
+	order:         string, // follow | hold | go — отдать приказ автоматически
+	order_at:      f64, // через сколько секунд
+	select:        int, // 1, 2 или 3 (оба)
 	dump_textures: string,
 }
 
@@ -40,6 +44,7 @@ parse_options :: proc() -> (o: Options) {
 	o.cam_mode = .Third_Back
 	o.shot_delay = 1.0
 	o.burst = 1
+	o.order_at = 0.3
 	o.interval = 0.1
 	for arg in os.args[1:] {
 		key, _, val := strings.partition(arg, ":")
@@ -79,6 +84,12 @@ parse_options :: proc() -> (o: Options) {
 			o.strafe = true
 		case "-burst":
 			o.burst = max(1, strconv.parse_int(val) or_else 1)
+		case "-order":
+			o.order = val
+		case "-order_at":
+			o.order_at = strconv.parse_f64(val) or_else 0.3
+		case "-select":
+			o.select = strconv.parse_int(val) or_else 3
 		case "-orbit":
 			o.orbit = f32(strconv.parse_f64(val) or_else 0)
 		case "-interval":
@@ -88,6 +99,27 @@ parse_options :: proc() -> (o: Options) {
 		}
 	}
 	return
+}
+
+// Приказ «Иди туда»: точка — блок под прицелом (луч из глаз игрока).
+order_go_to_aim :: proc(s: ^Squad, w: ^World, player: ^Character) -> bool {
+	eye := player.pos + [3]f64{0, f64(player.eye_h), 0}
+	d := look_dir(player.yaw, player.pitch)
+	hit, _, cell, normal := raycast_solid(w, eye, {f64(d.x), f64(d.y), f64(d.z)}, ORDER_RANGE)
+	if !hit do return false
+	target, ok := find_stand_cell(w, cell + normal, 1)
+	if !ok do return false
+	squad_order(s, w, player, .Go_To, target)
+	return true
+}
+
+handle_squad_keys :: proc(s: ^Squad, w: ^World, player: ^Character) {
+	if eng.key_pressed(glfw.KEY_1) do squad_select(s, 0)
+	if eng.key_pressed(glfw.KEY_2) do squad_select(s, 1)
+	if eng.key_pressed(glfw.KEY_3) do squad_select(s, -1)
+	if eng.key_pressed(glfw.KEY_F) do squad_order(s, w, player, .Follow)
+	if eng.key_pressed(glfw.KEY_H) do squad_order(s, w, player, .Hold)
+	if eng.key_pressed(glfw.KEY_G) do order_go_to_aim(s, w, player)
 }
 
 spawn_area_ready :: proc(w: ^World, pos: [3]f64, radius: i32) -> bool {
@@ -116,8 +148,9 @@ main :: proc() {
 	r: Renderer
 	if !renderer_init(&r, VIEW_RADIUS) do os.exit(1)
 
-	skin := skin_load_or_generate("assets/skin.png")
-	model := player_model_create(&skin)
+	player_skin := skin_load_or_generate("assets/skin.png", PALETTE_PLAYER)
+	player_skin_tex := skin_texture_create(&player_skin)
+	model := humanoid_model_create()
 
 	sky: Sky
 	sky_init(&sky, opts.seed)
@@ -132,12 +165,18 @@ main :: proc() {
 		free_all(context.temp_allocator)
 	}
 
-	player: Player
-	player_spawn(&player, &world, spawn)
+	player: Character
+	character_spawn(&player, &world, spawn)
 	player.yaw = math.to_radians(opts.yaw)
 	player.pitch = math.to_radians(opts.pitch)
 	player.body_yaw = player.yaw
 	player.prev_body_yaw = player.yaw
+
+	squad: Squad
+	squad_init(&squad, &world, &player, opts.seed)
+	defer squad_destroy(&squad)
+	if opts.select > 0 do squad_select(&squad, opts.select == 3 ? -1 : opts.select - 1)
+	auto_order_done := opts.order == ""
 
 	cam := Camera {
 		mode       = opts.cam_mode,
@@ -179,6 +218,18 @@ main :: proc() {
 		}
 		if eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
 		if eng.key_pressed(glfw.KEY_F2) do screenshot_requested = true
+		if eng.win.focused do handle_squad_keys(&squad, &world, &player)
+		if !auto_order_done && now - start > opts.order_at {
+			auto_order_done = true
+			switch opts.order {
+			case "follow":
+				squad_order(&squad, &world, &player, .Follow)
+			case "hold":
+				squad_order(&squad, &world, &player, .Hold)
+			case "go":
+				if !order_go_to_aim(&squad, &world, &player) do fmt.println("go: no target under crosshair")
+			}
+		}
 
 		// --- обзор мышью
 		if eng.win.cursor_locked {
@@ -189,7 +240,7 @@ main :: proc() {
 		}
 
 		// --- управление
-		input: Player_Input
+		input: Move_Input
 		if eng.win.focused {
 			if eng.key_pressed(glfw.KEY_W) {
 				if now - last_w_press < 0.3 do sprint_latch = true
@@ -214,7 +265,8 @@ main :: proc() {
 		accumulator += dt
 		ticks := 0
 		for accumulator >= TICK_DT && ticks < 10 {
-			player_tick(&player, &world, input)
+			character_tick(&player, &world, input)
+			squad_tick(&squad, &world, &player)
 			accumulator -= TICK_DT
 			ticks += 1
 		}
@@ -231,6 +283,8 @@ main :: proc() {
 				cam = &cam,
 				sky = &sky,
 				model = &model,
+				player_skin = player_skin_tex,
+				squad = &squad,
 				t = t,
 				time = now - start,
 				dt = f32(dt),
@@ -267,7 +321,7 @@ main :: proc() {
 		if fps_timer >= 0.5 {
 			last_fps = f64(fps_frames) / fps_timer
 			eng.window_set_title(fmt.tprintf(
-				"Voxel %s  |  %d FPS  |  XYZ %.1f %.1f %.1f  |  чанков: %d/%d  |  F5 — камера",
+				"Voxel %s  |  %d FPS  |  XYZ %.1f %.1f %.1f  |  чанков: %d/%d  |  F5 камера  |  1/2/3 выбор, F за мной, H стой, G иди туда",
 				VERSION, int(f64(fps_frames) / fps_timer + 0.5),
 				player.pos.x, player.pos.y, player.pos.z,
 				r.chunks_drawn, len(world.chunks),

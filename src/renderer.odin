@@ -30,19 +30,12 @@ Cloud_Shader :: struct {
 	u_view_proj, u_origin, u_fog, u_sky_top, u_sky_horizon: i32,
 }
 
-UI_Shader :: struct {
-	prog:               u32,
-	u_screen, u_color: i32,
-}
-
 Renderer :: struct {
 	chunk:          Chunk_Shader,
 	entity:         Entity_Shader,
 	sky:            Sky_Shader,
 	cloud:          Cloud_Shader,
-	ui:             UI_Shader,
 	atlas:          u32,
-	ui_vao, ui_vbo: u32,
 	fog:            [2]f32,
 	player_light:   f32,
 	chunks_drawn:   int,
@@ -50,10 +43,12 @@ Renderer :: struct {
 
 Frame_Params :: struct {
 	world:       ^World,
-	player:      ^Player,
+	player:      ^Character,
 	cam:         ^Camera,
 	sky:         ^Sky,
-	model:       ^Player_Model,
+	model:       ^Humanoid_Model,
+	player_skin: u32,
+	squad:       ^Squad,
 	t:           f32, // доля между тиками
 	time:        f64,
 	dt:          f32,
@@ -111,25 +106,10 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_sky_horizon = loc(p, "u_sky_horizon"),
 		}
 	}
-	{
-		p := eng.shader_create("ui", UI_VS, UI_FS) or_return
-		r.ui = {
-			prog     = p,
-			u_screen = loc(p, "u_screen"),
-			u_color  = loc(p, "u_color"),
-		}
-	}
+	eng.imm_init() or_return
 
 	pixels := build_block_textures(context.temp_allocator)
 	r.atlas = eng.texture_array_create(TEX_SIZE, TEX_SIZE, i32(TEX_LAYER_COUNT), pixels)
-
-	gl.GenVertexArrays(1, &r.ui_vao)
-	gl.GenBuffers(1, &r.ui_vbo)
-	gl.BindVertexArray(r.ui_vao)
-	gl.BindBuffer(gl.ARRAY_BUFFER, r.ui_vbo)
-	gl.EnableVertexAttribArray(0)
-	gl.VertexAttribPointer(0, 2, gl.FLOAT, false, size_of([2]f32), 0)
-	gl.BindVertexArray(0)
 
 	view_blocks := f32(view_radius * CHUNK_SIZE)
 	r.fog = {view_blocks * 0.55, view_blocks * 0.95}
@@ -170,12 +150,27 @@ set_sky_uniforms :: proc(top, horizon: i32) {
 	eng.set_vec3(horizon, SKY_HORIZON)
 }
 
+// Плавно подстраивает яркость персонажа под свет в его клетке (тень деревьев и т.п.).
 @(private = "file")
-ui_rect :: proc(out: ^[dynamic][2]f32, x0, y0, x1, y1: f32) {
-	append(out, [2]f32{x0, y0}, [2]f32{x1, y0}, [2]f32{x1, y1}, [2]f32{x0, y0}, [2]f32{x1, y1}, [2]f32{x0, y1})
+update_light :: proc(light: ^f32, w: ^World, ch: ^Character, t, dt: f32) {
+	pos := character_render_pos(ch, t)
+	target := world_sky_light(w, i32(math.floor(pos.x)), i32(math.floor(pos.y + 1)), i32(math.floor(pos.z)))
+	light^ += (target - light^) * min(1, dt * 6)
 }
 
-render_frame :: proc(r: ^Renderer, fp: Frame_Params) {
+@(private = "file")
+draw_character :: proc(r: ^Renderer, fp: ^Frame_Params, ch: ^Character, skin: u32, light: f32) {
+	cam := fp.cam
+	pose, body_yaw := character_pose(ch, fp.t)
+	feet := character_render_pos(ch, fp.t)
+	rel := [3]f32{f32(feet.x - cam.pos.x), f32(feet.y - cam.pos.y), f32(feet.z - cam.pos.z)}
+	eng.set_f32(r.entity.u_light, light)
+	gl.BindTexture(gl.TEXTURE_2D, skin)
+	humanoid_model_draw(fp.model, &r.entity, cam.view_proj, rel, body_yaw, &pose)
+}
+
+render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
+	fp := frame
 	cam := fp.cam
 	p := fp.player
 	gl.Viewport(0, 0, fp.width, fp.height)
@@ -231,23 +226,16 @@ render_frame :: proc(r: ^Renderer, fp: Frame_Params) {
 	}
 	r.chunks_drawn = len(visible)
 
-	// ---- персонаж (от третьего лица)
-	{
-		eye := player_render_pos(p, fp.t)
-		target := world_sky_light(fp.world, i32(math.floor(eye.x)), i32(math.floor(eye.y + 1)), i32(math.floor(eye.z)))
-		r.player_light += (target - r.player_light) * min(1, fp.dt * 6)
-	}
+	// ---- персонажи: игрок (от третьего лица) и отряд
 	gl.UseProgram(r.entity.prog)
 	eng.set_i32(r.entity.u_skin, 0)
-	eng.set_f32(r.entity.u_light, r.player_light)
 	eng.set_vec2(r.entity.u_fog, r.fog)
 	set_sky_uniforms(r.entity.u_sky_top, r.entity.u_sky_horizon)
-	gl.BindTexture(gl.TEXTURE_2D, fp.model.skin_tex)
-	if cam.mode != .First_Person {
-		pose, body_yaw := player_pose(p, fp.t)
-		feet := player_render_pos(p, fp.t)
-		rel := [3]f32{f32(feet.x - cam.pos.x), f32(feet.y - cam.pos.y), f32(feet.z - cam.pos.z)}
-		player_model_draw(fp.model, &r.entity, cam.view_proj, rel, body_yaw, &pose)
+	update_light(&r.player_light, fp.world, p, fp.t, fp.dt)
+	if cam.mode != .First_Person do draw_character(r, &fp, p, fp.player_skin, r.player_light)
+	for &c in fp.squad.members {
+		update_light(&c.light, fp.world, &c.body, fp.t, fp.dt)
+		draw_character(r, &fp, &c.body, c.skin_tex, c.light)
 	}
 
 	// ---- вода (сзади вперёд, полупрозрачная)
@@ -263,8 +251,13 @@ render_frame :: proc(r: ^Renderer, fp: Frame_Params) {
 		eng.set_vec3(r.chunk.u_origin, v.origin)
 		chunk_mesh_draw(&v.chunk.water_mesh)
 	}
-	gl.DepthMask(true)
 	gl.Enable(gl.CULL_FACE)
+
+	// ---- значки приказов и метки целей (видны сквозь воду, но не сквозь землю)
+	gl.Disable(gl.CULL_FACE)
+	squad_draw_world(fp.squad, cam, fp.t, fp.time)
+	gl.Enable(gl.CULL_FACE)
+	gl.DepthMask(true)
 
 	// ---- облака: сначала глубина, потом цвет (без двойного наложения граней)
 	cloud_origin := sky_update_clouds(fp.sky, cam.pos, fp.time)
@@ -291,7 +284,8 @@ render_frame :: proc(r: ^Renderer, fp: Frame_Params) {
 		// ---- рука
 		gl.Clear(gl.DEPTH_BUFFER_BIT)
 		gl.UseProgram(r.entity.prog)
-		gl.BindTexture(gl.TEXTURE_2D, fp.model.skin_tex)
+		gl.BindTexture(gl.TEXTURE_2D, fp.player_skin)
+		eng.set_f32(r.entity.u_light, r.player_light)
 		eng.set_vec2(r.entity.u_fog, {1e6, 2e6})
 		aspect := f32(fp.width) / f32(max(fp.height, 1))
 		hand_proj := linalg.matrix4_perspective_f32(math.to_radians(f32(BASE_FOV)), aspect, NEAR_PLANE, 10)
@@ -303,32 +297,23 @@ render_frame :: proc(r: ^Renderer, fp: Frame_Params) {
 			linalg.matrix4_rotate_f32(sway_yaw, {0, 1, 0}) *
 			HAND_TRANSFORM()
 		view_to_world := linalg.matrix4_inverse_f32(cam.view)
-		player_model_draw_hand(fp.model, &r.entity, hand_proj, view_to_world, hand)
+		humanoid_model_draw_hand(fp.model, &r.entity, hand_proj, view_to_world, hand)
 
-		// ---- прицел (инвертирует цвет под собой, как в Minecraft)
-		scale := max(1, math.round(f32(fp.height) / 360))
-		cx, cy := f32(fp.width) / 2, f32(fp.height) / 2
-		th := scale // толщина
-		half := 4.5 * scale
-		verts := make([dynamic][2]f32, context.temp_allocator)
-		ui_rect(&verts, cx - half, cy - th / 2, cx + half, cy + th / 2)
-		ui_rect(&verts, cx - th / 2, cy - half, cx + th / 2, cy - th / 2)
-		ui_rect(&verts, cx - th / 2, cy + th / 2, cx + th / 2, cy + half)
-		gl.Disable(gl.DEPTH_TEST)
-		gl.Disable(gl.CULL_FACE)
-		gl.Enable(gl.BLEND)
-		gl.BlendFunc(gl.ONE_MINUS_DST_COLOR, gl.ONE_MINUS_SRC_COLOR)
-		gl.UseProgram(r.ui.prog)
-		eng.set_vec2(r.ui.u_screen, {f32(fp.width), f32(fp.height)})
-		eng.set_vec4(r.ui.u_color, {1, 1, 1, 1})
-		gl.BindVertexArray(r.ui_vao)
-		gl.BindBuffer(gl.ARRAY_BUFFER, r.ui_vbo)
-		gl.BufferData(gl.ARRAY_BUFFER, len(verts) * size_of([2]f32), raw_data(verts), gl.STREAM_DRAW)
-		gl.DrawArrays(gl.TRIANGLES, 0, i32(len(verts)))
-		gl.Disable(gl.BLEND)
-		gl.Enable(gl.DEPTH_TEST)
-		gl.Enable(gl.CULL_FACE)
 	}
+
+	// ---- интерфейс
+	gl.Disable(gl.DEPTH_TEST)
+	gl.Disable(gl.CULL_FACE)
+	gl.Enable(gl.BLEND)
+	if cam.mode != .Third_Front {
+		gl.BlendFunc(gl.ONE_MINUS_DST_COLOR, gl.ONE_MINUS_SRC_COLOR)
+		draw_crosshair(fp.width, fp.height)
+	}
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	squad_draw_hud(fp.squad, fp.width, fp.height)
+	gl.Disable(gl.BLEND)
+	gl.Enable(gl.DEPTH_TEST)
+	gl.Enable(gl.CULL_FACE)
 	gl.BindVertexArray(0)
 }
 

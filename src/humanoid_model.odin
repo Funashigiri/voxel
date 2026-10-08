@@ -45,10 +45,10 @@ PART_DEFS := [Model_Part]Part_Def {
 
 MODEL_SCALE :: 0.9375 / 16.0 // пиксель скина -> блоки
 
-Player_Model :: struct {
+// Общая геометрия для всех персонажей; скин (текстура) у каждого свой.
+Humanoid_Model :: struct {
 	vao, vbo: u32,
 	ranges:   [Model_Part][2]i32, // first, count
-	skin_tex: u32,
 }
 
 // Поза: углы в соглашении Minecraft (x — вперёд/назад, y — поворот, z — в сторону).
@@ -82,7 +82,7 @@ add_box :: proc(out: ^[dynamic]Entity_Vertex, mn, mx: [3]f32, tex: [2]int, size:
 	add_face(out, {{x0, y0, z0}, {x1, y0, z0}, {x1, y0, z1}, {x0, y0, z1}}, u + d + w, v + d, u + d + 2 * w, v, {0, -1, 0}) // низ
 }
 
-player_model_create :: proc(skin: ^Skin) -> (m: Player_Model) {
+humanoid_model_create :: proc() -> (m: Humanoid_Model) {
 	verts := make([dynamic]Entity_Vertex, context.temp_allocator)
 	for part in Model_Part {
 		def := PART_DEFS[part]
@@ -105,20 +105,11 @@ player_model_create :: proc(skin: ^Skin) -> (m: Player_Model) {
 	gl.EnableVertexAttribArray(2)
 	gl.VertexAttribPointer(2, 3, gl.FLOAT, false, size_of(Entity_Vertex), offset_of(Entity_Vertex, normal))
 	gl.BindVertexArray(0)
-
-	pixels := make([]u8, SKIN_SIZE * SKIN_SIZE * 4, context.temp_allocator)
-	for p, i in skin.pixels {
-		pixels[i * 4 + 0] = p.r
-		pixels[i * 4 + 1] = p.g
-		pixels[i * 4 + 2] = p.b
-		pixels[i * 4 + 3] = p.a
-	}
-	m.skin_tex = eng.texture_2d_create(SKIN_SIZE, SKIN_SIZE, pixels)
 	return
 }
 
 // Вычисляет позу персонажа для момента t (0..1) между тиками.
-player_pose :: proc(p: ^Player, t: f32) -> (pose: Pose, body_yaw: f32) {
+character_pose :: proc(p: ^Character, t: f32) -> (pose: Pose, body_yaw: f32) {
 	lerp :: math.lerp
 	speed := min(lerp(p.prev_limb_speed, p.limb_speed, t), 1)
 	swing := p.limb_pos - p.limb_speed * (1 - t)
@@ -168,6 +159,14 @@ player_pose :: proc(p: ^Player, t: f32) -> (pose: Pose, body_yaw: f32) {
 	pose.offset[.Right_Leg] = {0, -0.2 * crouch, -4 * crouch}
 	pose.offset[.Left_Leg] = {0, -0.2 * crouch, -4 * crouch}
 	pose.root_y = -0.125 / MODEL_SCALE * crouch
+
+	// взмах рукой — ответ на приказ
+	wave := lerp(p.prev_wave, p.wave, t)
+	if wave > 0.001 {
+		arm := &pose.rot[.Right_Arm]
+		arm.x = lerp(arm.x, -2.75, wave)
+		arm.z = lerp(arm.z, 0.25 + math.sin(age * 0.9) * 0.4, wave)
+	}
 	return
 }
 
@@ -181,7 +180,7 @@ part_matrix :: proc(part: Model_Part, pose: ^Pose) -> eng.Mat4 {
 }
 
 // Рисует персонажа. rel_pos — позиция ног относительно камеры.
-player_model_draw :: proc(m: ^Player_Model, sh: ^Entity_Shader, view_proj: eng.Mat4, rel_pos: [3]f32, body_yaw: f32, pose: ^Pose) {
+humanoid_model_draw :: proc(m: ^Humanoid_Model, sh: ^Entity_Shader, view_proj: eng.Mat4, rel_pos: [3]f32, body_yaw: f32, pose: ^Pose) {
 	root :=
 		linalg.matrix4_translate_f32(rel_pos) *
 		linalg.matrix4_rotate_f32(-body_yaw, {0, 1, 0}) *
@@ -197,7 +196,7 @@ player_model_draw :: proc(m: ^Player_Model, sh: ^Entity_Shader, view_proj: eng.M
 }
 
 // Правая рука в режиме от первого лица. hand — матрица в пространстве камеры.
-player_model_draw_hand :: proc(m: ^Player_Model, sh: ^Entity_Shader, proj: eng.Mat4, view_to_world: eng.Mat4, hand: eng.Mat4) {
+humanoid_model_draw_hand :: proc(m: ^Humanoid_Model, sh: ^Entity_Shader, proj: eng.Mat4, view_to_world: eng.Mat4, hand: eng.Mat4) {
 	model := hand * linalg.matrix4_scale_f32({1.0 / 16, 1.0 / 16, 1.0 / 16})
 	eng.set_mat4(sh.u_model, view_to_world * model)
 	eng.set_mat4(sh.u_mvp, proj * model)

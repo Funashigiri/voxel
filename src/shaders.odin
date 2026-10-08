@@ -168,21 +168,3 @@ void main() {
 	o_color = vec4(col, 0.8 * (1.0 - fog));
 }
 `
-
-// ---------------------------------------------------------------- интерфейс
-UI_VS :: `#version 330 core
-layout(location = 0) in vec2 a_pos;  // пиксели экрана
-uniform vec2 u_screen;
-void main() {
-	vec2 ndc = a_pos / u_screen * 2.0 - 1.0;
-	gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-}
-`
-
-UI_FS :: `#version 330 core
-uniform vec4 u_color;
-out vec4 o_color;
-void main() {
-	o_color = u_color;
-}
-`

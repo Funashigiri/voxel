@@ -1,13 +1,14 @@
 package main
 
-// Игрок: физика как в Minecraft (20 тиков/с, те же константы ускорения,
-// трения и гравитации), коллизии AABB с блоками и состояние анимаций.
+// Персонаж (игрок или спутник): физика как в Minecraft (20 тиков/с, те же
+// константы ускорения, трения и гравитации), коллизии AABB с блоками и
+// состояние анимаций.
 
 import "core:math"
 import eng "engine"
 
-PLAYER_HALF_WIDTH :: 0.3
-PLAYER_HEIGHT :: 1.8
+CHAR_HALF_WIDTH :: 0.3
+CHAR_HEIGHT :: 1.8
 EYE_HEIGHT :: 1.62
 SNEAK_EYE_HEIGHT :: 1.27
 TICK_RATE :: 20.0
@@ -16,12 +17,12 @@ TICK_DT :: 1.0 / TICK_RATE
 @(private = "file")
 EPS :: 1e-7
 
-Player_Input :: struct {
+Move_Input :: struct {
 	forward, strafe:     f32, // -1..1 (strafe > 0 — влево, как в Minecraft)
 	jump, sneak, sprint: bool,
 }
 
-Player :: struct {
+Character :: struct {
 	pos, prev_pos:              [3]f64,
 	vel:                        [3]f64,
 	yaw, pitch:                 f32, // радианы; yaw 0 = смотрит на +Z, растёт вправо
@@ -41,16 +42,18 @@ Player :: struct {
 	bob, prev_bob:              f32,
 	eye_h, prev_eye_h:          f32,
 	fov_mod, prev_fov_mod:      f32,
+	wave, prev_wave:            f32, // 0..1 — машет рукой (ответ на приказ)
+	wave_ticks:                 i32,
 }
 
 AABB :: struct {
 	min, max: [3]f64,
 }
 
-player_box :: proc(pos: [3]f64) -> AABB {
+character_box :: proc(pos: [3]f64) -> AABB {
 	return {
-		{pos.x - PLAYER_HALF_WIDTH, pos.y, pos.z - PLAYER_HALF_WIDTH},
-		{pos.x + PLAYER_HALF_WIDTH, pos.y + PLAYER_HEIGHT, pos.z + PLAYER_HALF_WIDTH},
+		{pos.x - CHAR_HALF_WIDTH, pos.y, pos.z - CHAR_HALF_WIDTH},
+		{pos.x + CHAR_HALF_WIDTH, pos.y + CHAR_HEIGHT, pos.z + CHAR_HALF_WIDTH},
 	}
 }
 
@@ -108,7 +111,7 @@ clip_axis :: proc(w: ^World, b: AABB, d: f64, axis: int) -> f64 {
 
 @(private = "file")
 in_water_check :: proc(w: ^World, pos: [3]f64) -> bool {
-	b := player_box(pos)
+	b := character_box(pos)
 	b.min += {0.001, 0.4, 0.001}
 	b.max -= {0.001, 0.4, 0.001}
 	x0, x1 := cell_range(b.min.x, b.max.x)
@@ -121,7 +124,7 @@ in_water_check :: proc(w: ^World, pos: [3]f64) -> bool {
 }
 
 @(private = "file")
-move_relative :: proc(p: ^Player, strafe, forward: f32, accel: f64) {
+move_relative :: proc(p: ^Character, strafe, forward: f32, accel: f64) {
 	f := strafe * strafe + forward * forward
 	if f < 1e-4 do return
 	f = math.sqrt(f)
@@ -136,9 +139,9 @@ move_relative :: proc(p: ^Player, strafe, forward: f32, accel: f64) {
 }
 
 @(private = "file")
-player_move :: proc(p: ^Player, w: ^World) {
+character_move :: proc(p: ^Character, w: ^World) {
 	d := p.vel
-	box := player_box(p.pos)
+	box := character_box(p.pos)
 
 	// присед: не даём сойти с края блока
 	if p.sneaking && p.on_ground {
@@ -163,7 +166,7 @@ player_move :: proc(p: ^Player, w: ^World) {
 	d.z = clip_axis(w, box, d.z, 2)
 	box = box_offset(box, {0, 0, d.z})
 
-	p.pos = {box.min.x + PLAYER_HALF_WIDTH, box.min.y, box.min.z + PLAYER_HALF_WIDTH}
+	p.pos = {box.min.x + CHAR_HALF_WIDTH, box.min.y, box.min.z + CHAR_HALF_WIDTH}
 	p.h_collision = orig.x != d.x || orig.z != d.z
 	p.on_ground = orig.y != d.y && orig.y < 0
 	if orig.x != d.x do p.vel.x = 0
@@ -171,11 +174,11 @@ player_move :: proc(p: ^Player, w: ^World) {
 	if orig.z != d.z do p.vel.z = 0
 }
 
-player_spawn :: proc(p: ^Player, w: ^World, pos: [3]f64) {
+character_spawn :: proc(p: ^Character, w: ^World, pos: [3]f64) {
 	p^ = {}
 	p.pos = pos
 	// если попали в дерево или склон — поднимаемся
-	for i := 0; i < 64 && box_collides(w, player_box(p.pos)); i += 1 do p.pos.y += 1
+	for i := 0; i < 64 && box_collides(w, character_box(p.pos)); i += 1 do p.pos.y += 1
 	p.prev_pos = p.pos
 	p.eye_h = EYE_HEIGHT
 	p.prev_eye_h = EYE_HEIGHT
@@ -183,7 +186,7 @@ player_spawn :: proc(p: ^Player, w: ^World, pos: [3]f64) {
 	p.prev_fov_mod = 1
 }
 
-player_tick :: proc(p: ^Player, w: ^World, input: Player_Input) {
+character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 	p.prev_pos = p.pos
 	p.prev_limb_speed = p.limb_speed
 	p.prev_body_yaw = p.body_yaw
@@ -194,6 +197,7 @@ player_tick :: proc(p: ^Player, w: ^World, input: Player_Input) {
 	p.prev_bob = p.bob
 	p.prev_eye_h = p.eye_h
 	p.prev_fov_mod = p.fov_mod
+	p.prev_wave = p.wave
 
 	forward := input.forward * 0.98
 	strafe := input.strafe * 0.98
@@ -212,7 +216,7 @@ player_tick :: proc(p: ^Player, w: ^World, input: Player_Input) {
 	if p.in_water {
 		if input.jump do p.vel.y += 0.04
 		move_relative(p, strafe, forward, 0.02)
-		player_move(p, w)
+		character_move(p, w)
 		p.vel *= 0.8
 		p.vel.y -= 0.02
 		if p.h_collision && input.jump do p.vel.y = 0.3 // выбраться на берег
@@ -233,7 +237,7 @@ player_tick :: proc(p: ^Player, w: ^World, input: Player_Input) {
 			accel = p.sprinting ? 0.026 : 0.02
 		}
 		move_relative(p, strafe, forward, accel)
-		player_move(p, w)
+		character_move(p, w)
 		friction: f64 = p.on_ground ? 0.546 : 0.91
 		p.vel.y -= 0.08
 		p.vel.y *= 0.98
@@ -274,14 +278,35 @@ player_tick :: proc(p: ^Player, w: ^World, input: Player_Input) {
 	}
 	p.eye_h += ((p.sneaking ? f32(SNEAK_EYE_HEIGHT) : EYE_HEIGHT) - p.eye_h) * 0.5
 	p.fov_mod += ((p.sprinting ? f32(1.15) : 1) - p.fov_mod) * 0.5
+	p.wave += ((p.wave_ticks > 0 ? f32(1) : 0) - p.wave) * 0.35
+	if p.wave_ticks > 0 do p.wave_ticks -= 1
 	p.age += 1
 }
 
-player_look_dir :: proc(yaw, pitch: f32) -> [3]f32 {
+// Персонажи мягко расталкивают друг друга, если их коробки пересеклись
+// (та же формула, что у сущностей в Minecraft).
+character_push_apart :: proc(a, b: ^Character) {
+	ba, bb := character_box(a.pos), character_box(b.pos)
+	for i in 0 ..< 3 {
+		if ba.max[i] <= bb.min[i] || ba.min[i] >= bb.max[i] do return
+	}
+	dx := b.pos.x - a.pos.x
+	dz := b.pos.z - a.pos.z
+	d := max(abs(dx), abs(dz))
+	if d < 0.01 do return
+	d = math.sqrt(d)
+	k := min(1 / d, 1) * 0.05 / d
+	a.vel.x -= dx * k
+	a.vel.z -= dz * k
+	b.vel.x += dx * k
+	b.vel.z += dz * k
+}
+
+look_dir :: proc(yaw, pitch: f32) -> [3]f32 {
 	cp := math.cos(pitch)
 	return {-math.sin(yaw) * cp, -math.sin(pitch), math.cos(yaw) * cp}
 }
 
-player_render_pos :: proc(p: ^Player, t: f32) -> [3]f64 {
+character_render_pos :: proc(p: ^Character, t: f32) -> [3]f64 {
 	return p.prev_pos + (p.pos - p.prev_pos) * f64(t)
 }
