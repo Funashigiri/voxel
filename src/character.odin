@@ -15,6 +15,9 @@ SWIM_HEIGHT :: 0.6 // в позе плавания хитбокс 0.6 x 0.6, к�
 SWIM_EYE_HEIGHT :: 0.4
 TICK_RATE :: 20.0
 TICK_DT :: 1.0 / TICK_RATE
+JUMP_SPEED :: 0.42 // блоков за тик — сила ног, на любой планете одна
+GRAVITY_PER_TICK :: 0.08 // ускорение падения при 1 g (как в Minecraft)
+CLIMB_TICKS :: 24 // дольше этого на уступ не лезет
 
 @(private = "file")
 EPS :: 1e-7
@@ -51,6 +54,8 @@ Character :: struct {
 	wave_ticks:                 i32,
 	swim, prev_swim:            f32, // 0..1 — поза плавания
 	tread, prev_tread:          f32, // 0..1 — "бултыхание" на месте в воде
+	climb:                      i32, // > 0 — залезает на уступ (тиков осталось)
+	climb_top:                  f64, // высота верха уступа
 }
 
 AABB :: struct {
@@ -154,6 +159,25 @@ move_relative :: proc(p: ^Character, strafe, forward: f32, accel: f64) {
 	cy := f64(math.cos(p.yaw))
 	p.vel.x += s * cy - fw * sy
 	p.vel.z += fw * cy + s * sy
+}
+
+// Уступ высотой в блок прямо по ходу, на который можно залезть: блок впереди
+// на уровне ног, над ним два свободных, над головой тоже свободно.
+@(private = "file")
+ledge_ahead :: proc(p: ^Character, w: ^World) -> (top: f64, ok: bool) {
+	fx, fz := f64(-math.sin(p.yaw)), f64(math.cos(p.yaw))
+	by := i32(math.floor(p.pos.y + 0.01))
+	px, pz := i32(math.floor(p.pos.x)), i32(math.floor(p.pos.z))
+	if world_is_solid(w, px, by + 2, pz) do return
+	for dist in ([2]f64{0.45, 0.8}) {
+		bx, bz := i32(math.floor(p.pos.x + fx * dist)), i32(math.floor(p.pos.z + fz * dist))
+		if bx == px && bz == pz do continue
+		if world_is_solid(w, bx, by, bz) && !world_is_solid(w, bx, by + 1, bz) && !world_is_solid(w, bx, by + 2, bz) {
+			return f64(by + 1), true
+		}
+		return
+	}
+	return
 }
 
 @(private = "file")
@@ -262,12 +286,33 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 		p.vel *= 0.8
 		p.vel.y -= 0.02
 		if p.h_collision && input.jump do p.vel.y = 0.3 // выбраться на берег
+	} else if p.climb > 0 {
+		// залезает на уступ: подтягивается вверх (на тяжёлой планете — медленнее), потом шаг вперёд
+		p.climb -= 1
+		p.vel.y = 0.1 / math.sqrt(max(w.gravity, 0.1))
+		move_relative(p, 0, 1, 0.04)
+		character_move(p, w)
+		p.vel.x *= 0.546
+		p.vel.z *= 0.546
+		if p.pos.y >= p.climb_top + 0.01 {
+			p.climb = 0
+			p.vel.y = 0
+			p.vel.x -= f64(math.sin(p.yaw)) * 0.15
+			p.vel.z += f64(math.cos(p.yaw)) * 0.15
+		}
 	} else {
 		if input.jump && p.on_ground {
-			p.vel.y = 0.42
-			if p.sprinting {
-				p.vel.x -= f64(math.sin(p.yaw)) * 0.2
-				p.vel.z += f64(math.cos(p.yaw)) * 0.2
+			// прыжка не хватает на блок (тяжёлая планета) — лезем на уступ руками
+			top, ledge := 0.0, false
+			if w.jump_apex < 1.05 && input.forward > 0 do top, ledge = ledge_ahead(p, w)
+			if ledge {
+				p.climb, p.climb_top = CLIMB_TICKS, top
+			} else {
+				p.vel.y = JUMP_SPEED
+				if p.sprinting {
+					p.vel.x -= f64(math.sin(p.yaw)) * 0.2
+					p.vel.z += f64(math.cos(p.yaw)) * 0.2
+				}
 			}
 		}
 		accel: f64
@@ -281,7 +326,7 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 		move_relative(p, strafe, forward, accel)
 		character_move(p, w)
 		friction: f64 = p.on_ground ? 0.546 : 0.91
-		p.vel.y -= 0.08
+		p.vel.y -= GRAVITY_PER_TICK * w.gravity
 		p.vel.y *= 0.98
 		p.vel.x *= friction
 		p.vel.z *= friction

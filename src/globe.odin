@@ -35,10 +35,10 @@ uniform vec3 u_light;
 out vec4 o_color;
 void main() {
 	vec3 n = normalize(v_n);
-	float d = max(dot(n, u_light), 0.0);
-	vec3 col = v_color * (0.18 + 0.9 * d);
+	float d = smoothstep(-0.08, 0.3, dot(n, u_light)); // мягкая граница дня и ночи
+	vec3 col = v_color * (0.04 + 0.96 * d);
 	float rim = pow(1.0 - max(n.z, 0.0), 3.0); // атмосфера по краю диска
-	col += vec3(0.35, 0.55, 1.0) * rim * (0.25 + 0.6 * d);
+	col += vec3(0.35, 0.55, 1.0) * rim * (0.05 + 0.7 * d);
 	o_color = vec4(col, 1.0);
 }
 `
@@ -121,8 +121,8 @@ Globe_View :: struct {
 }
 
 // Рисует глобус в квадрате (x, y — левый верхний угол в пикселях, size — сторона),
-// повёрнутый к игроку.
-globe_draw :: proc(gb: ^Globe, player_dir: [3]f64, time: f64, x, y, size: f32, screen_h: i32) -> Globe_View {
+// повёрнутый к игроку; освещён настоящим солнцем (sun — в осях планеты).
+globe_draw :: proc(gb: ^Globe, player_dir, sun: [3]f64, time: f64, x, y, size: f32, screen_h: i32) -> Globe_View {
 	lat := f32(math.asin(clamp(player_dir.y, -1, 1)))
 	lon := f32(math.atan2(player_dir.x, player_dir.z))
 	sway := f32(math.sin(time * 0.35)) * 0.35
@@ -145,7 +145,8 @@ globe_draw :: proc(gb: ^Globe, player_dir: [3]f64, time: f64, x, y, size: f32, s
 	gl.UseProgram(gb.prog)
 	eng.set_mat4(gb.u_mvp, mvp)
 	eng.set_mat4(gb.u_model, model)
-	eng.set_vec3(gb.u_light, linalg.normalize([3]f32{-0.55, 0.45, 0.7}))
+	light := model * [4]f32{f32(sun.x), f32(sun.y), f32(sun.z), 0}
+	eng.set_vec3(gb.u_light, linalg.normalize(light.xyz))
 	gl.BindVertexArray(gb.vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, gb.count)
 	gl.Disable(gl.SCISSOR_TEST)

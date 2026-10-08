@@ -370,7 +370,7 @@ update_pod :: proc(l: ^Landing, pod: ^Pod, i: int, w: ^World, drift: [3]f64, cam
 			pod.vel.x *= 0.95
 			pod.vel.z *= 0.95
 		} else {
-			pod.vel.y = max(pod.vel.y - DROP_GRAVITY * f64(dt), -DROP_TERMINAL)
+			pod.vel.y = max(pod.vel.y - DROP_GRAVITY * w.gravity * f64(dt), -DROP_TERMINAL)
 		}
 		pod.pos += pod.vel * f64(dt)
 

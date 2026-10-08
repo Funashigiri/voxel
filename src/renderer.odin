@@ -23,7 +23,8 @@ Entity_Shader :: struct {
 
 Sky_Shader :: struct {
 	prog:                                                   u32,
-	u_inv_view_proj, u_sun_dir: i32,
+	u_inv_view_proj, u_sun_size, u_sun_color, u_px: i32,
+	u_moon, u_moon_light:                 i32,
 }
 
 Cloud_Shader :: struct {
@@ -41,6 +42,13 @@ Renderer :: struct {
 	fog:            [2]f32, // туман над водой (из дальности прорисовки)
 	underwater:     bool, // камера под водой в этом кадре
 	player_light:   f32,
+	// небо и свет этого кадра (из Sky_State)
+	sky_top:        [3]f32,
+	sky_horizon:    [3]f32,
+	sun_dir:        [3]f32,
+	glow:           [4]f32,
+	light:          [4]f32, // цвет и яркость освещения, обесцвечивание
+	light_k:        f32, // яркость
 	chunks_drawn:   int,
 	// затенение боков вдоль x и z кадра; после поворота кадра (переход через
 	// ребро) значения меняются местами и плавно возвращаются к обычным
@@ -55,6 +63,7 @@ Frame_Params :: struct {
 	player:      ^Character,
 	cam:         ^Camera,
 	sky:         ^Sky,
+	sky_state:   ^Sky_State, // солнце, луны, свет (astro.odin)
 	model:       ^Humanoid_Model,
 	player_skin: u32,
 	capsule:     ^Capsule_Model,
@@ -97,7 +106,7 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_mvp         = loc(p, "u_mvp"),
 			u_model       = loc(p, "u_model"),
 			u_skin        = loc(p, "u_skin"),
-			u_light       = loc(p, "u_light"),
+			u_light       = loc(p, "u_light_k"),
 			u_fog         = loc(p, "u_fog"),
 			u_tint        = loc(p, "u_tint"),
 			u_view_proj   = loc(p, "u_view_proj"),
@@ -109,7 +118,11 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 		r.sky = {
 			prog            = p,
 			u_inv_view_proj = loc(p, "u_inv_view_proj"),
-			u_sun_dir       = loc(p, "u_sun_dir"),
+			u_sun_size      = loc(p, "u_sun_size"),
+			u_sun_color     = loc(p, "u_sun_color"),
+			u_px            = loc(p, "u_px"),
+			u_moon          = loc(p, "u_moon"),
+			u_moon_light    = loc(p, "u_moon_light"),
 		}
 	}
 	{
@@ -169,10 +182,35 @@ Visible_Chunk :: struct {
 // Цвета неба и тумана. Под водой туман синий и густой (как в Minecraft).
 @(private = "file")
 set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
-	eng.set_vec3(eng.uniform_loc(prog, "u_sky_top"), SKY_TOP)
-	eng.set_vec3(eng.uniform_loc(prog, "u_sky_horizon"), SKY_HORIZON)
-	eng.set_vec4(eng.uniform_loc(prog, "u_fog_override"), r.underwater ? WATER_FOG_COLOR : {})
+	eng.set_vec3(eng.uniform_loc(prog, "u_sky_top"), r.sky_top)
+	eng.set_vec3(eng.uniform_loc(prog, "u_sky_horizon"), r.sky_horizon)
+	eng.set_vec3(eng.uniform_loc(prog, "u_sun_dir"), r.sun_dir)
+	eng.set_vec4(eng.uniform_loc(prog, "u_glow"), r.glow)
+	eng.set_vec4(eng.uniform_loc(prog, "u_light"), r.light)
+	water := WATER_FOG_COLOR * [4]f32{r.light_k, r.light_k, r.light_k, 1} // ночью под водой черно
+	eng.set_vec4(eng.uniform_loc(prog, "u_fog_override"), r.underwater ? water : {})
 	eng.set_vec4(eng.uniform_loc(prog, "u_anomaly"), r.anomaly)
+}
+
+// Солнце и луны для шейдера неба.
+@(private = "file")
+sky_uniforms_sun :: proc(r: ^Renderer, fp: ^Frame_Params) {
+	st := fp.sky_state
+	eng.set_f32(r.sky.u_sun_size, f32(st.sun_ang_r))
+	sc := st.sun_color
+	eng.set_vec4(r.sky.u_sun_color, {sc.r, sc.g, sc.b, f32(st.sun_visible)})
+	eng.set_f32(r.sky.u_px, 2 * math.tan(math.to_radians(fp.cam.fov) / 2) / f32(max(fp.height, 1)))
+	moon, moon_light: [MAX_MOONS][4]f32
+	for i in 0 ..< st.moon_n {
+		m := &st.moons[i]
+		moon[i] = {m.frame.x, m.frame.y, m.frame.z, f32(m.ang_r)}
+		// в тени планеты луна тускнеет и краснеет (лунное затмение); пепельный свет — ночью
+		s := f32(m.shadow)
+		c := [3]f32{0.95, 0.93, 0.88} * s + [3]f32{0.3, 0.07, 0.02} * (1 - s) * 0.6
+		moon_light[i] = {c.r, c.g, c.b, 0.035 * (1 - st.brightness)}
+	}
+	gl.Uniform4fv(r.sky.u_moon, MAX_MOONS, &moon[0][0])
+	gl.Uniform4fv(r.sky.u_moon_light, MAX_MOONS, &moon_light[0][0])
 }
 
 // Туман ближайшей аномалии (вершины куба) — в координатах относительно камеры.
@@ -215,8 +253,12 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	}
 	fog := r.underwater ? WATER_FOG : r.fog
 	update_anomaly(r, fp.world, cam)
+	st := fp.sky_state
+	r.sky_top, r.sky_horizon, r.sun_dir, r.glow = st.sky_top, st.sky_horizon, st.sun_frame, st.glow
+	r.light = {st.light.r, st.light.g, st.light.b, st.desat}
+	r.light_k = st.brightness
 	r.side_shade += (SIDE_SHADE - r.side_shade) * min(1, fp.dt * 1.5)
-	gl.ClearColor(SKY_HORIZON.r, SKY_HORIZON.g, SKY_HORIZON.b, 1)
+	gl.ClearColor(r.sky_horizon.r, r.sky_horizon.g, r.sky_horizon.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 
 	// ---- небо
@@ -224,7 +266,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.DepthMask(false)
 	gl.UseProgram(r.sky.prog)
 	eng.set_mat4(r.sky.u_inv_view_proj, linalg.matrix4_inverse_f32(cam.view_proj))
-	eng.set_vec3(r.sky.u_sun_dir, fp.sky.sun_dir)
+	sky_uniforms_sun(r, &fp)
 	set_sky_uniforms(r, r.sky.prog)
 	gl.BindVertexArray(fp.sky.empty_vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, 3)
@@ -311,9 +353,9 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	// ---- частицы (дым и пыль, затем светящиеся — огонь, искры)
 	gl.Disable(gl.CULL_FACE)
 	if len(ld.particles.list) > 0 {
-		particles_draw(&ld.particles, cam, false)
+		particles_draw(&ld.particles, cam, false, r.light.rgb)
 		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE)
-		particles_draw(&ld.particles, cam, true)
+		particles_draw(&ld.particles, cam, true, r.light.rgb)
 		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 	}
 

@@ -2,16 +2,31 @@ package main
 
 // Исходники GLSL 3.30.
 
-// Градиент неба; им же окрашивается туман, чтобы дальние блоки
-// плавно растворялись в горизонте.
+// Градиент неба (цвета — от высоты солнца, astro.odin) и зарево заката со
+// стороны солнца; им же окрашивается туман, чтобы дальние блоки плавно
+// растворялись в горизонте. apply_light — освещение мира светом неба.
 SKY_GLSL :: `
 uniform vec3 u_sky_top;
 uniform vec3 u_sky_horizon;
 uniform vec4 u_fog_override; // rgb + флаг (1 — камера под водой)
+uniform vec3 u_sun_dir;      // направление на солнце (оси кадра)
+uniform vec4 u_glow;         // зарево заката: цвет и сила
+uniform vec4 u_light;        // освещение: цвет и яркость (rgb), обесцвечивание (a)
 vec3 sky_color(vec3 dir) {
 	if (u_fog_override.w > 0.5) return u_fog_override.rgb;
 	float t = max(dir.y, 0.0);
-	return mix(u_sky_horizon, u_sky_top, 1.0 - exp(-t * 5.0));
+	vec3 col = mix(u_sky_horizon, u_sky_top, 1.0 - exp(-t * 5.0));
+	float sl = length(u_sun_dir.xz);
+	float side = sl > 1e-4 ? dot(normalize(dir.xz + vec2(1e-6)), u_sun_dir.xz / sl) : 0.0;
+	float hz = pow(1.0 - min(abs(dir.y), 1.0), 6.0);
+	col += u_glow.rgb * u_glow.a * hz * (0.2 + 0.8 * pow(max(side, 0.0), 3.0));
+	return col;
+}
+// В темноте цвета пропадают — ночное зрение видит только яркость.
+vec3 apply_light(vec3 c) {
+	vec3 lit = c * u_light.rgb;
+	float l = dot(lit, vec3(0.3, 0.59, 0.11));
+	return mix(lit, vec3(l) * vec3(0.85, 0.95, 1.15), u_light.a);
 }
 `
 
@@ -93,7 +108,7 @@ out vec4 o_color;
 void main() {
 	vec4 c = texture(u_atlas, v_uvl);
 	if (c.a < u_alpha_cutoff) discard;
-	vec3 col = c.rgb * v_light;
+	vec3 col = apply_light(c.rgb * v_light);
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
 	col = apply_anomaly(col, v_rel, length(v_rel));
@@ -111,32 +126,64 @@ void main() {
 }
 `
 
+// Небо: солнце настоящего углового размера (с потемнением к краю и ореолом —
+// так глаз видит яркое солнце), луны — освещённые солнцем шары с фазами.
+// Тёмная часть луны днём прозрачна, но закрывает солнце — затмения выходят сами.
 SKY_FS :: `#version 330 core
 in vec2 v_ndc;
 uniform mat4 u_inv_view_proj;
-uniform vec3 u_sun_dir;
+uniform float u_sun_size;     // угловой радиус солнца, рад
+uniform vec4 u_sun_color;     // цвет диска (rgb), не закрытая лунами доля (a)
+uniform float u_px;           // угловой размер пикселя, рад
+uniform vec4 u_moon[3];       // направление (xyz) и угловой радиус (w; 0 — луны нет)
+uniform vec4 u_moon_light[3]; // освещённая часть: цвет и яркость (rgb); пепельный свет (a)
 out vec4 o_color;
 ` + SKY_GLSL + ANOMALY_GLSL + `
+float hash12(vec2 p) {
+	return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
 void main() {
 	vec4 a = u_inv_view_proj * vec4(v_ndc, 1.0, 1.0);
 	vec3 dir = normalize(a.xyz / a.w);
 	vec3 col = sky_color(dir);
+	bool under = u_fog_override.w > 0.5;
 
-	// квадратное пиксельное солнце с ореолом
-	float sd = dot(dir, u_sun_dir);
-	if (sd > 0.0 && u_fog_override.w < 0.5) {
-		vec3 right = normalize(cross(u_sun_dir, vec3(0.0, 0.0, 1.0)));
-		vec3 up = cross(right, u_sun_dir);
-		vec2 q = vec2(dot(dir, right), dot(dir, up)) / sd;
-		vec2 px = floor(q / 0.16 * 16.0) + 0.5;
-		float m = max(abs(px.x), abs(px.y));
-		if (m < 16.0) {
-			float g = 1.0 - m / 16.0;
-			col += vec3(1.0, 0.92, 0.7) * g * g * 0.45;
-		}
-		if (m < 8.0) col = vec3(1.0, 0.96, 0.72);
-		if (m < 6.0) col = vec3(1.0, 1.0, 0.93);
+	// солнце
+	float sd = length(dir - u_sun_dir); // угол до центра (для малых углов)
+	float r = max(u_sun_size, u_px * 0.7);
+	float vis = u_sun_color.a;
+	vec3 sun_disc = vec3(0.0);
+	if (!under && u_sun_dir.y > -u_sun_size - 0.02) {
+		float k = smoothstep(r + u_px, r - u_px, sd);
+		float x = min(sd / r, 1.0);
+		float limb = 1.0 - 0.5 * (1.0 - sqrt(1.0 - x * x));
+		sun_disc = u_sun_color.rgb * 1.6 * k * limb;
+		col += u_sun_color.rgb * vis * (0.55 * exp(-sd / (r * 2.5 + 0.004)) + 0.12 * exp(-sd / 0.12));
+		if (vis < 0.03 && sd > r) col += u_sun_color.rgb * 0.35 * exp(-(sd - r) / (r * 0.9)); // корона
 	}
+
+	// луны
+	bool covered = false;
+	for (int i = 0; i < 3; i++) {
+		vec4 m = u_moon[i];
+		if (m.w <= 0.0 || under || m.y < -m.w - 0.02) continue;
+		float mr = max(m.w, u_px * 0.6);
+		vec3 v = dir - m.xyz;
+		if (length(v) > mr + u_px) continue;
+		vec3 right = normalize(cross(m.xyz, abs(m.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+		vec3 up = cross(right, m.xyz);
+		vec2 p = vec2(dot(v, right), dot(v, up)) / mr;
+		float q = dot(p, p);
+		float edge = smoothstep(1.0 + u_px / mr, 1.0 - u_px / mr, sqrt(q));
+		vec3 n = right * p.x + up * p.y - m.xyz * sqrt(max(1.0 - q, 0.0));
+		float lit = max(dot(n, u_sun_dir), 0.0);
+		vec2 cell = floor((p * 0.5 + 0.5) * 12.0); // пиксельные моря и кратеры
+		float tex = 0.8 + 0.3 * hash12(cell) - 0.28 * step(0.7, hash12(cell * 0.37 + 7.0));
+		vec3 mc = (u_moon_light[i].rgb * lit + vec3(0.6, 0.7, 0.9) * u_moon_light[i].a) * tex;
+		col = mix(col, max(col, mc), edge);
+		if (edge > 0.5) covered = true;
+	}
+	if (!covered) col += sun_disc;
 	col = apply_anomaly(col, dir, 1e4);
 	o_color = vec4(col, 1.0);
 }
@@ -180,7 +227,7 @@ in vec2 v_uv;
 in vec3 v_normal;
 in vec3 v_rel;
 uniform sampler2D u_skin;
-uniform float u_light;
+uniform float u_light_k; // свет в клетке персонажа (тень деревьев)
 uniform vec2 u_fog;
 uniform vec4 u_tint; // rgb + сила (свечение, вспышки)
 out vec4 o_color;
@@ -193,7 +240,7 @@ void main() {
 	if (c.a < 0.1) discard;
 	vec3 n = normalize(v_normal);
 	float diff = min(1.0, 0.4 + 0.6 * (max(dot(n, L0), 0.0) + max(dot(n, L1), 0.0)));
-	vec3 col = c.rgb * diff * u_light;
+	vec3 col = apply_light(c.rgb * diff * u_light_k);
 	col = mix(col, u_tint.rgb, u_tint.a);
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
@@ -225,7 +272,7 @@ uniform vec2 u_fog;
 out vec4 o_color;
 ` + SKY_GLSL + ANOMALY_GLSL + `
 void main() {
-	vec3 col = vec3(1.0) * v_shade;
+	vec3 col = apply_light(vec3(1.0) * v_shade);
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
 	col = apply_anomaly(col, v_rel, length(v_rel));

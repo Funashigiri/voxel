@@ -52,7 +52,8 @@ particles_clear :: proc(ps: ^Particles) {
 }
 
 // Рисует частицы одного типа (обычные или светящиеся); смешивание задаёт вызывающий.
-particles_draw :: proc(ps: ^Particles, cam: ^Camera, additive: bool) {
+// light — освещение мира: дым и пыль ночью тёмные, огонь и искры светятся сами.
+particles_draw :: proc(ps: ^Particles, cam: ^Camera, additive: bool, light: [3]f32) {
 	right := [3]f32{cam.view[0, 0], cam.view[0, 1], cam.view[0, 2]}
 	up := [3]f32{cam.view[1, 0], cam.view[1, 1], cam.view[1, 2]}
 	for &p in ps.list {
@@ -61,6 +62,7 @@ particles_draw :: proc(ps: ^Particles, cam: ^Camera, additive: bool) {
 		size := math.lerp(p.size0, p.size1, k) * 0.5
 		c: [4]u8
 		for i in 0 ..< 4 do c[i] = u8(math.lerp(f32(p.color0[i]), f32(p.color1[i]), k))
+		if !additive do for i in 0 ..< 3 do c[i] = u8(f32(c[i]) * min(light[i], 1))
 		centre := [3]f32{f32(p.pos.x - cam.pos.x), f32(p.pos.y - cam.pos.y), f32(p.pos.z - cam.pos.z)}
 		r := right * size
 		u := up * size

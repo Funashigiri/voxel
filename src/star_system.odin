@@ -37,12 +37,17 @@ Planet :: struct {
 	radius_km:  f64,
 	mass_earth: f64,
 	year_hours: f64, // стандартных часов
+	// эллиптическая орбита (astro.odin): эксцентриситет, долгота перицентра,
+	// средняя аномалия в момент высадки
+	ecc, peri, mean0: f64,
 }
 
 Moon :: struct {
 	radius_km:    f64,
 	orbit_km:     f64,
 	period_hours: f64,
+	// орбита: эксцентриситет, наклон к плоскости орбиты планеты, узел, перицентр, средняя аномалия
+	ecc, incl, node, peri, mean0: f64,
 }
 
 // Наша планета — подробнее.
@@ -52,6 +57,7 @@ Home_Planet :: struct {
 	day_hours:      f64, // солнечные сутки, стандартных часов
 	sidereal_hours: f64, // оборот вокруг оси относительно звёзд
 	axial_tilt_deg: f64,
+	tilt_dir:       f64, // долгота, к которой наклонена ось (рад)
 	year_days:      f64, // местных суток в году
 	moons:          [MAX_MOONS]Moon,
 	moon_count:     int,
@@ -132,6 +138,7 @@ planet_count_for :: proc(class: Star_Class, r: ^eng.Rng) -> int {
 // Система звезды star. home — наша звезда: одна планета каменная и в зоне жизни.
 star_system_generate :: proc(world_seed: u32, star: Star, home: bool) -> (s: Star_System) {
 	r := eng.rng_make(star.seed * 0x2545F4914F6CDD1D + 1)
+	o := eng.rng_make(star.seed ~ 0x0E11_1F5E) // орбиты — отдельно, чтобы не менять остальное
 	s.seed = world_seed
 	s.star = star
 	s.star.name = star_name(star.seed)
@@ -180,6 +187,11 @@ star_system_generate :: proc(world_seed: u32, star: Star, home: bool) -> (s: Sta
 			p.mass_earth = eng.rng_range(&r, 30, 700)
 		}
 		p.year_hours = year_hours(p.orbit_au, mass)
+		// вытянутость: у нашей — умеренная (иначе сезоны слишком резкие), у гигантов — меньше
+		e_max := i == home_i ? 0.15 : p.kind == .Rocky ? 0.25 : 0.12
+		p.ecc = e_max * eng.rng_f64(&o) * eng.rng_f64(&o)
+		p.peri = eng.rng_range(&o, 0, 2 * math.PI)
+		p.mean0 = eng.rng_range(&o, 0, 2 * math.PI)
 	}
 	if !home do return
 
@@ -214,6 +226,15 @@ star_system_generate :: proc(world_seed: u32, star: Star, home: bool) -> (s: Sta
 	sign: f64 = eng.rng_f64(&r) < 0.5 ? -1 : 1
 	h.latitude_deg = sign * eng.rng_range(&r, 25, 55)
 	h.longitude_deg = eng.rng_range(&r, 0, 360)
+	h.tilt_dir = eng.rng_range(&o, 0, 2 * math.PI)
+	for i in 0 ..< h.moon_count {
+		m := &h.moons[i]
+		m.ecc = 0.08 * eng.rng_f64(&o) * eng.rng_f64(&o)
+		m.incl = math.to_radians(eng.rng_range(&o, 0, 8))
+		m.node = eng.rng_range(&o, 0, 2 * math.PI)
+		m.peri = eng.rng_range(&o, 0, 2 * math.PI)
+		m.mean0 = eng.rng_range(&o, 0, 2 * math.PI)
+	}
 	return
 }
 

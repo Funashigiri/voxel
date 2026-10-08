@@ -1,6 +1,6 @@
 package main
 
-// Небо (градиент + квадратное солнце) и объёмные "кубические" облака,
+// Небо и объёмные "кубические" облака (солнце, луны и цвета неба — astro.odin),
 // медленно плывущие над миром, как в Minecraft (Fancy clouds).
 //
 // Узор облаков привязан к шару: клетка облачной сетки берёт шум в своей
@@ -24,7 +24,6 @@ Cloud_Vertex :: struct {
 }
 
 Sky :: struct {
-	sun_dir:     [3]f32,
 	empty_vao:   u32,
 	cloud_vao:   u32,
 	cloud_vbo:   u32,
@@ -42,10 +41,6 @@ Sky :: struct {
 }
 
 sky_init :: proc(s: ^Sky, seed: u32) {
-	// солнце в утренней части неба (на востоке, +X), путь — в плоскости XY
-	elev := math.to_radians(f32(50))
-	s.sun_dir = {math.cos(elev), math.sin(elev), 0}
-
 	gl.GenVertexArrays(1, &s.empty_vao)
 	s.seed = seed
 	s.wind = {CLOUD_SPEED, 0}
@@ -125,11 +120,9 @@ sky_update_clouds :: proc(s: ^Sky, g: ^Planet_Geo, cam_pos: [3]f64, time: f64) -
 	}
 }
 
-// Переход кадра через ребро: солнце, ветер и облачная сетка поворачиваются
+// Переход кадра через ребро: ветер и облачная сетка поворачиваются
 // вместе с кадром — на небе ничего не меняется.
 sky_rebase :: proc(s: ^Sky, m: Xform) {
-	sx, sz := xform_vec(m, f64(s.sun_dir.x), f64(s.sun_dir.z))
-	s.sun_dir.x, s.sun_dir.z = f32(sx), f32(sz)
 	s.phase.x, s.phase.y = xform_pos(m, s.phase.x, s.phase.y)
 	// фаза важна только по модулю клетки (номера клеток считаются заново)
 	s.phase = {math.mod(s.phase.x, CLOUD_CELL), math.mod(s.phase.y, CLOUD_CELL)}

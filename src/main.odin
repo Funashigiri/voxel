@@ -11,7 +11,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.008"
+VERSION :: "0.009"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -42,6 +42,11 @@ Options :: struct {
 	lat, lon:      f64,
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
 	universe_report: bool, // напечатать отчёт о вселенной с проверками и выйти
+	timescale:     f64, // ускорение времени (отладка)
+	start_day:     int, // день года при высадке (0 — случайный)
+	look_at:       string, // sun | moon — сразу смотреть туда (отладка)
+	start_hours:   f64, // начать через столько стандартных часов после высадки (отладка)
+	sky_report:    bool, // проверить небо за год, найти затмения и выйти
 	no_intro:      bool, // без высадки в капсулах (сразу на земле)
 	has_look:      bool, // заданы -yaw / -pitch
 	has_yaw:       bool,
@@ -54,6 +59,7 @@ Options :: struct {
 parse_options :: proc() -> (o: Options) {
 	o.width, o.height = 1280, 720
 	o.start_hour = 7
+	o.timescale = 1
 	o.cam_mode = .Third_Back
 	o.shot_delay = 1.0
 	o.burst = 1
@@ -115,6 +121,16 @@ parse_options :: proc() -> (o: Options) {
 			o.no_intro = true
 		case "-f3":
 			o.debug_page = val == "" ? 1 : clamp(strconv.parse_int(val) or_else 1, 1, 3)
+		case "-hours":
+			o.start_hours = max(0, strconv.parse_f64(val) or_else 0)
+		case "-sky":
+			o.sky_report = true
+		case "-look":
+			o.look_at = val
+		case "-timescale":
+			o.timescale = max(0, strconv.parse_f64(val) or_else 1)
+		case "-day":
+			o.start_day = max(1, strconv.parse_int(val) or_else 1)
 		case "-universe":
 			o.universe_report = true
 		case "-spawn":
@@ -213,7 +229,8 @@ main :: proc() {
 	if !eng.window_create(fmt.tprintf("Voxel %s", VERSION), opts.width, opts.height) do os.exit(1)
 	defer eng.window_destroy()
 
-	clock := clock_init(system.home.day_hours, opts.start_hour)
+	clock := clock_init(system.home.day_hours, opts.timescale)
+	clock.std_hours = opts.start_hours
 
 	r: Renderer
 	if !renderer_init(&r, VIEW_RADIUS) do os.exit(1)
@@ -273,6 +290,15 @@ main :: proc() {
 
 	world: World
 	world_init(&world, opts.seed, VIEW_RADIUS, geo)
+	world_set_gravity(&world, system.home.gravity_g)
+
+	// небесная механика: в момент высадки на её долготе — start_hour местного времени
+	astro: Astro
+	astro_init(&astro, &system, opts.start_hour, opts.start_day, lon, opts.seed)
+	if opts.sky_report {
+		if astro_report(&astro, &system, geo_dir(&world.geo, world.geo.face, site_x, site_z)) > 0 do os.exit(1)
+		return
+	}
 	defer world_destroy(&world)
 
 	globe, globe_ok := globe_create(&world.geo, opts.seed)
@@ -318,6 +344,14 @@ main :: proc() {
 		if opts.has_look {
 			player.yaw = math.to_radians(opts.yaw)
 			player.pitch = math.to_radians(opts.pitch)
+			player.body_yaw, player.prev_body_yaw = player.yaw, player.yaw
+		}
+		// отладка: сразу смотреть на солнце или на первую луну
+		if opts.look_at != "" {
+			st := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours)
+			d := opts.look_at == "moon" && st.moon_n > 0 ? st.moons[0].frame : st.sun_frame
+			player.yaw = math.atan2(-d.x, d.z)
+			player.pitch = -math.asin(clamp(d.y, -1, 1)) + math.to_radians(f32(4)) // цель — чуть выше прицела
 			player.body_yaw, player.prev_body_yaw = player.yaw, player.yaw
 		}
 	}
@@ -444,6 +478,9 @@ main :: proc() {
 
 		world_update(&world, player.pos, WORLD_BUDGET)
 
+		// небо этого кадра: солнце, луны, свет — по положению планеты и игрока на ней
+		sky_state := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours + f64(t) * clock_tick_hours(&clock))
+
 		fbw, fbh := eng.win.fb_width, eng.win.fb_height
 		if fbw > 0 && fbh > 0 {
 			if landing.active {
@@ -456,6 +493,7 @@ main :: proc() {
 				player = &player,
 				cam = &cam,
 				sky = &sky,
+				sky_state = &sky_state,
 				model = &model,
 				player_skin = player_skin_tex,
 				capsule = &capsule,

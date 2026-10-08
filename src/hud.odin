@@ -58,15 +58,33 @@ panel_gap :: proc(p: ^Panel) {
 	p.y += eng.TEXT_LINE_HEIGHT * p.px / 2
 }
 
-hud_draw_clock :: proc(c: ^Game_Clock, width, height: i32) {
+hud_draw_clock :: proc(st: ^Sky_State, width, height: i32) {
 	g := gui_scale(height)
-	day, h, m := clock_local(c)
-	text := fmt.tprintf("День %d  %02d:%02d", day, h, m)
+	text := fmt.tprintf("День %d  %s", st.day, hm_text(st.local_hours))
 	w := eng.text_width(text, g)
 	x := f32(width) - w - 6 * g
 	y := 6 * g
 	eng.imm_rect(x - 3 * g, y - 3 * g, x + w + 3 * g, y + 10 * g, {0, 0, 0, 110})
 	eng.draw_text(text, x, y, g, WHITE)
+}
+
+// Местные часы -> "ЧЧ:ММ".
+@(private = "file")
+hm_text :: proc(hours: f64) -> string {
+	m := int(math.floor(hours * 60)) %% (24 * 60)
+	return fmt.tprintf("%02d:%02d", m / 60, m % 60)
+}
+
+// Освещённость: в темноте — с десятичными, днём — целыми люксами.
+@(private = "file")
+lux_text :: proc(lux: f64) -> string {
+	switch {
+	case lux < 1:
+		return fmt.tprintf("%.3f лк", lux)
+	case lux < 100:
+		return fmt.tprintf("%.1f лк", lux)
+	}
+	return fmt.tprintf("%.0f лк", lux)
 }
 
 @(private = "file")
@@ -110,10 +128,22 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 	panel_line(p, WHITE, fmt.tprintf("Зерно мира: %d", s.seed))
 	panel_gap(p)
 
-	day, h, m := clock_local(c)
-	panel_line(p, GOLD, fmt.tprintf("Время: день %d, %02d:%02d (местное)", day, h, m))
+	st := fp.sky_state
+	panel_line(p, GOLD, fmt.tprintf("Время: день %d, %s (местное, по долготе)", st.day, hm_text(st.local_hours)))
 	panel_line(p, WHITE, fmt.tprintf("Сутки: %.1f ст. ч = %.1f мин; прошло %.2f ст. ч", c.day_hours, clock_day_real_minutes(c), c.std_hours))
-	panel_line(p, GRAY, "1 стандартный час = 100 секунд")
+	panel_line(p, GRAY, c.timescale != 1 ? fmt.tprintf("1 стандартный час = 100 секунд; время ускорено ×%g", c.timescale) : "1 стандартный час = 100 секунд")
+	eclipse := st.sun_visible < 0.999 ? fmt.tprintf("; затмение: закрыто %.0f%%", (1 - st.sun_visible) * 100) : ""
+	panel_line(p, WHITE, fmt.tprintf("солнце: высота %.1f°, азимут %.0f°%s", st.sun_elev, st.sun_azim, eclipse))
+	switch st.polar {
+	case 1:
+		panel_line(p, WHITE, "полярный день — солнце не заходит")
+	case -1:
+		panel_line(p, WHITE, "полярная ночь — солнце не восходит")
+	case:
+		dl := int(st.day_length * 60 + 0.5)
+		panel_line(p, WHITE, fmt.tprintf("восход %s, закат %s, день %d ч %02d мин", hm_text(st.sunrise), hm_text(st.sunset), dl / 60, dl % 60))
+	}
+	panel_line(p, WHITE, fmt.tprintf("освещённость: %s", lux_text(st.lux)))
 	panel_gap(p)
 
 	panel_line(p, GOLD, fmt.tprintf("Наша планета: %s", hp.name))
@@ -143,6 +173,18 @@ page_system :: proc(p: ^Panel, fp: ^Frame_Params) {
 	panel_line(p, GOLD, fmt.tprintf("Звезда: %s — %s, %.0f K", star.name, STAR_CLASS_NAMES[star.class], star.temperature))
 	panel_line(p, WHITE, fmt.tprintf("масса %.2f, светимость %.2f, радиус %.2f (Солнце = 1)", star.mass, star.luminosity, star.radius))
 	panel_gap(p)
+	// где мы на орбите сейчас, время года
+	st := fp.sky_state
+	hp := home_planet(s)
+	panel_line(p, WHITE, fmt.tprintf("до звезды сейчас %.3f а.е. (от %.3f до %.3f, эксцентриситет %.3f)",
+		st.sun_dist, hp.orbit_au * (1 - hp.ecc), hp.orbit_au * (1 + hp.ecc), hp.ecc))
+	if home.axial_tilt_deg < 2 {
+		panel_line(p, WHITE, fmt.tprintf("времён года почти нет (наклон оси %.1f°); день года %d из %.0f", home.axial_tilt_deg, st.day_of_year, home.year_days))
+	} else {
+		panel_line(p, WHITE, fmt.tprintf("время года: %s на севере, %s на юге; день года %d из %.0f",
+			SEASON_NAMES[st.season], SEASON_NAMES[(st.season + 2) % 4], st.day_of_year, home.year_days))
+	}
+	panel_gap(p)
 	panel_line(p, GOLD, fmt.tprintf("Планет: %d", s.planet_count))
 	for i in 0 ..< s.planet_count {
 		pl := &s.planets[i]
@@ -161,6 +203,11 @@ page_system :: proc(p: ^Panel, fp: ^Frame_Params) {
 	for i in 0 ..< home.moon_count {
 		mo := &home.moons[i]
 		panel_line(p, WHITE, fmt.tprintf("луна %d: R %.0f км, орбита %.0f тыс. км, период %.1f сут", i + 1, mo.radius_km, mo.orbit_km / 1000, mo.period_hours / home.day_hours))
+		sm := &st.moons[i]
+		place := sm.elevation > 0 ? fmt.tprintf("над горизонтом, %.0f°", sm.elevation) : "за горизонтом"
+		eclipse := sm.shadow < 0.95 ? "; лунное затмение" : ""
+		panel_line(p, GRAY, fmt.tprintf("   %s, освещено %.0f%%, размер %.2f°; %s%s", moon_phase_name(sm), sm.lit * 100,
+			math.to_degrees(sm.ang_r * 2), place, eclipse))
 	}
 }
 
@@ -207,7 +254,7 @@ page_universe :: proc(p: ^Panel, fp: ^Frame_Params) {
 // Рисует весь текстовый интерфейс (вызывать с включённым смешиванием).
 hud_draw :: proc(fp: ^Frame_Params) {
 	ortho := linalg.matrix_ortho3d_f32(0, f32(fp.width), f32(fp.height), 0, -1, 1)
-	hud_draw_clock(fp.clock, fp.width, fp.height)
+	hud_draw_clock(fp.sky_state, fp.width, fp.height)
 	if fp.debug_page > 0 {
 		g := gui_scale(fp.height)
 		p := Panel{x = 4 * g, y = 4 * g, px = g}
@@ -237,7 +284,7 @@ hud_draw_globe :: proc(fp: ^Frame_Params, ortho: matrix[4, 4]f32) {
 
 	geo := &fp.world.geo
 	dir := geo_frame_dir(geo, fp.player.pos.x, fp.player.pos.z)
-	view := globe_draw(fp.globe, dir, fp.time, x, y, size, fp.height)
+	view := globe_draw(fp.globe, dir, fp.sky_state.sun_body, fp.time, x, y, size, fp.height)
 	gl.Viewport(0, 0, fp.width, fp.height)
 	gl.Enable(gl.BLEND)
 	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)

@@ -43,6 +43,22 @@ World :: struct {
 	// Изменения мира поверх генерации — переживают выгрузку чанков
 	// (пока только до выхода из игры: сохранения ещё нет).
 	edits:       map[Chunk_Key][dynamic]Block_Edit,
+	gravity:     f64, // сила тяжести планеты, g (1 — земная)
+	jump_apex:   f64, // высота прыжка при этой силе тяжести, блоков
+}
+
+// Сила тяжести планеты: падение и прыжки. Высота прыжка считается теми же
+// шагами, что и физика персонажа (character_tick).
+world_set_gravity :: proc(w: ^World, g: f64) {
+	w.gravity = g
+	y, v := 0.0, JUMP_SPEED
+	w.jump_apex = 0
+	for _ in 0 ..< 200 {
+		y += v
+		v = (v - GRAVITY_PER_TICK * g) * 0.98
+		w.jump_apex = max(w.jump_apex, y)
+		if v <= 0 do break
+	}
 }
 
 Block_Edit :: struct {
@@ -58,6 +74,7 @@ world_init :: proc(w: ^World, seed: u32, view_radius: i32, geo: Planet_Geo) {
 	w.seed = seed
 	w.geo = geo
 	w.view_radius = view_radius
+	world_set_gravity(w, 1)
 	r := view_radius
 	for dz in -r ..= r do for dx in -r ..= r {
 		if f32(dx * dx + dz * dz) <= (f32(r) + 0.5) * (f32(r) + 0.5) {
