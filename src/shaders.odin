@@ -30,6 +30,84 @@ vec3 apply_light(vec3 c) {
 }
 `
 
+// Воздушная дымка: даль бледнеет и голубеет (на закате — теплеет, ночью —
+// темнеет) — цвет берётся у неба в ту сторону. Плотность дымки падает с
+// высотой (экспонента), оптическая толщина вдоль луча — по Симпсону с учётом
+// кривизны планеты: на 100 км луч уходит над землёй на ~800 м выше.
+HAZE_GLSL :: `
+uniform vec4 u_haze; // x — ослабление у моря (1/м), y — 1/высота дымки (1/м), z — высота камеры над морем (м), w — 1/(2R)
+float haze_tau(vec3 rel) {
+	if (u_haze.x <= 0.0) return 0.0;
+	float d = length(rel);
+	float hor = dot(rel.xz, rel.xz) * u_haze.w;
+	float h0 = u_haze.z;
+	float h1 = h0 + rel.y + hor;
+	float hm = h0 + 0.5 * rel.y + 0.25 * hor;
+	float e0 = exp(-max(h0, -50.0) * u_haze.y);
+	float em = exp(-max(hm, -50.0) * u_haze.y);
+	float e1 = exp(-max(h1, -50.0) * u_haze.y);
+	return u_haze.x * d * (e0 + 4.0 * em + e1) / 6.0;
+}
+vec3 apply_haze(vec3 col, vec3 rel) {
+	float t = haze_tau(rel);
+	return mix(col, sky_color(normalize(rel)), 1.0 - exp(-t));
+}
+`
+
+// Шум облаков — тот же, что в clouds.odin (целочисленный хеш, value noise):
+// по нему же считаются тени облаков на земле и освещённость там, где стоим.
+CLOUD_GLSL :: `
+uniform vec3 u_cloud_q0; // камера в координатах шума облаков
+uniform mat3 u_cloud_jq; // оси кадра -> координаты шума
+uniform vec4 u_cloud;    // x — облачность мира, y — время (медленные перемены), z — высота облаков над морем (м), w — 1: облака есть
+uniform sampler3D u_cloud_noise; // значения в узлах решётки (128³, повторяется)
+// Value noise: текстура сама смешивает 8 узлов — нужно лишь сдвинуть точку
+// внутри клетки по плавной кривой (smoothstep), как в clouds.odin.
+float cloud_vnoise(vec3 p) {
+	vec3 fl = floor(p);
+	vec3 f = p - fl;
+	vec3 u = f * f * (3.0 - 2.0 * f);
+	return texture(u_cloud_noise, (mod(fl, 128.0) + u + 0.5) / 128.0).r;
+}
+// Плотность облака 0..1. fp — размер пикселя в единицах шума: мелкие октавы
+// вдали гаснут (заменяются средним), чтобы не мерцали; octaves — сколько считать.
+float cloud_density(vec3 q, float fp, int octaves) {
+	float sum = 0.0, amp = 0.5, f = 1.0;
+	for (int i = 0; i < 5; i++) {
+		float w = i < octaves ? clamp(2.0 - 4.0 * fp * f, 0.0, 1.0) : 0.0;
+		sum += amp * (w > 0.0 ? mix(0.5, cloud_vnoise(q * f + float(i) * 17.31), w) : 0.5);
+		amp *= 0.5;
+		f *= 2.0;
+	}
+	float n = sum / 0.96875;
+	float cov = u_cloud.x + 0.45 * (cloud_vnoise(q / 40.0 + vec3(0.0, u_cloud.y, 0.0)) - 0.5) * 2.0;
+	float thr = 0.5 + 0.2 * (0.5 - cov) * 2.0;
+	return smoothstep(thr, thr + 0.14, n);
+}
+float cloud_alpha(float d) {
+	return 1.0 - exp(-d * 3.5);
+}
+// Тень облаков на земле в точке rel (относительно камеры, оси кадра).
+float cloud_shadow(vec3 rel) {
+	float sy = u_sun_dir.y;
+	if (u_cloud.w < 0.5 || sy <= 0.0) return 1.0;
+	float h = u_haze.z + rel.y + dot(rel.xz, rel.xz) * u_haze.w;
+	float t = max(u_cloud.z - h, 0.0) / max(sy, 0.05);
+	vec3 q = u_cloud_q0 + u_cloud_jq * (rel + u_sun_dir * t);
+	float a = cloud_alpha(cloud_density(q, 0.0, 3)) * smoothstep(0.0, 1.0, sy / 0.1);
+	return 1.0 - 0.55 * a;
+}
+`
+
+// Логарифмическая глубина дальнего прохода: от метров до тысяч километров.
+LOGDEPTH_GLSL :: `
+uniform float u_logk; // 2 / log2(дальняя граница + 1)
+vec4 log_depth(vec4 p) {
+	p.z = (log2(max(p.w, 1e-6) + 1.0) * u_logk - 1.0) * p.w;
+	return p;
+}
+`
+
 // Туман аномалии (вершина куба-планеты): шар радиуса R, плотность
 // k·(1 − r²/R²)² — густо у столпа, редеет к краю. Оптическая толщина вдоль
 // луча от камеры считается точно: интеграл многочлена по отрезку внутри шара.
@@ -102,15 +180,16 @@ in float v_light;
 in vec3 v_rel;
 uniform sampler2DArray u_atlas;
 uniform float u_alpha_cutoff;
-uniform vec2 u_fog;
+uniform vec2 u_fog; // туман под водой
 out vec4 o_color;
-` + SKY_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
 void main() {
 	vec4 c = texture(u_atlas, v_uvl);
 	if (c.a < u_alpha_cutoff) discard;
-	vec3 col = apply_light(c.rgb * v_light);
+	vec3 col = apply_light(c.rgb * v_light * cloud_shadow(v_rel));
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
+	col = apply_haze(col, v_rel);
 	col = apply_anomaly(col, v_rel, length(v_rel));
 	o_color = vec4(col, c.a);
 }
@@ -195,7 +274,7 @@ void main() {
 		if (edge > 0.5) covered = true;
 	}
 	if (!covered) col += sun_disc;
-	col = apply_anomaly(col, dir, 1e4);
+	col = apply_anomaly(col, dir, 8e4);
 	o_color = vec4(col, 1.0);
 }
 `
@@ -242,7 +321,7 @@ uniform float u_light_k; // свет в клетке персонажа (тен�
 uniform vec2 u_fog;
 uniform vec4 u_tint; // rgb + сила (свечение, вспышки)
 out vec4 o_color;
-` + SKY_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + ANOMALY_GLSL + `
 // два источника света, как у мобов в Minecraft
 const vec3 L0 = vec3(0.16169, 0.80845, -0.56592);
 const vec3 L1 = vec3(-0.16169, 0.80845, 0.56592);
@@ -255,39 +334,143 @@ void main() {
 	col = mix(col, u_tint.rgb, u_tint.a);
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
+	col = apply_haze(col, v_rel);
 	col = apply_anomaly(col, v_rel, length(v_rel));
 	o_color = vec4(col, 1.0);
 }
 `
 
-// ---------------------------------------------------------------- облака
-CLOUD_VS :: `#version 330 core
-layout(location = 0) in vec3 a_pos;
-layout(location = 1) in float a_shade;
+// ---------------------------------------------------------------- дальний рельеф
+// Вершины тайла — смещения от его начала в осях планеты; в оси кадра у камеры
+// их переводит J⁻¹ (far_terrain.odin). Глубина логарифмическая.
+FAR_VS :: `#version 330 core
+layout(location = 0) in vec3 a_off;
+layout(location = 1) in vec4 a_normal; // оси планеты
+layout(location = 2) in vec4 a_color;  // цвет; a = 1 — вода
 uniform mat4 u_view_proj;
-uniform vec3 u_origin;
-out float v_shade;
+uniform mat3 u_jinv;  // оси планеты -> кадр
+uniform mat3 u_jt;    // для нормалей (J транспонированная)
+uniform vec3 u_rel_o; // начало тайла относительно камеры (кадр)
+uniform sampler2D u_mask; // чанки, уже нарисованные блоками
+uniform vec3 u_mask_org;  // камера в маске (блоки), размер маски (чанки)
+uniform float u_floor;    // 1 — рисуем дно под водой (вершины воды опущены на глубину)
 out vec3 v_rel;
+out vec3 v_n;
+out vec4 v_col;
+` + LOGDEPTH_GLSL + `
 void main() {
-	vec3 p = a_pos + u_origin;
-	v_rel = p;
-	v_shade = a_shade;
-	gl_Position = u_view_proj * vec4(p, 1.0);
+	vec3 rel = u_rel_o + u_jinv * a_off;
+	if (u_floor > 0.5 && a_color.a > 0.5) rel.y -= max(a_normal.w * 127.0, 2.0);
+	// под блоками (у их края) рельеф опущен: блоки рисуются поверх, а щели на
+	// стыке закрывает он, а не небо
+	vec2 m = (u_mask_org.xy + rel.xz) / 16.0;
+	if (m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z && texelFetch(u_mask, ivec2(m), 0).r > 0.25) rel.y -= 6.0;
+	v_rel = rel;
+	v_n = u_jt * a_normal.xyz;
+	v_col = a_color;
+	gl_Position = log_depth(u_view_proj * vec4(rel, 1.0));
 }
 `
 
-CLOUD_FS :: `#version 330 core
-in float v_shade;
+FAR_FS :: `#version 330 core
 in vec3 v_rel;
-uniform vec2 u_fog;
+in vec3 v_n;
+in vec4 v_col;
+uniform sampler2D u_mask;   // какие чанки уже нарисованы блоками
+uniform vec3 u_mask_org;    // камера в маске (блоки), размер маски (чанки)
+uniform vec2 u_side_shade;  // затенение боков вдоль x и z кадра — как у блоков
+uniform float u_floor;      // 1 — дно под водой
 out vec4 o_color;
-` + SKY_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
 void main() {
-	vec3 col = apply_light(vec3(1.0) * v_shade);
-	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
-	col = mix(col, sky_color(normalize(v_rel)), fog);
-	col = apply_anomaly(col, v_rel, length(v_rel));
-	o_color = vec4(col, 0.8 * (1.0 - fog));
+	vec2 m = (u_mask_org.xy + v_rel.xz) / 16.0;
+	float under = m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z ? texelFetch(u_mask, ivec2(m), 0).r : 0.0;
+	if (under > 0.75) discard;
+	vec3 n = normalize(v_n);
+	float dist = length(v_rel);
+	float water = v_col.a;
+	// как у блоков: верх 1.0, бока по осям; ровная земля — ровно как верх блока
+	vec3 n2 = n * n;
+	float shade = n2.y * (n.y > 0.0 ? 1.0 : 0.5) + n2.x * u_side_shade.x + n2.z * u_side_shade.y;
+	// вдали склоны к солнцу светлее, от солнца — темнее (на закате горы светятся)
+	float k = smoothstep(-0.03, 0.12, u_sun_dir.y) * smoothstep(250.0, 2500.0, dist) * (1.0 - water);
+	float lam = (max(dot(n, u_sun_dir), 0.0) + 0.35) / (max(u_sun_dir.y, 0.0) + 0.35);
+	shade *= mix(1.0, clamp(lam, 0.55, 1.6), k);
+	vec3 col = apply_light(v_col.rgb * shade * cloud_shadow(v_rel));
+	if (water > 0.5 && (u_floor > 0.5 || under > 0.25 || dot(v_rel, n) > 0.0)) {
+		// гладь снизу или под ближней водой: сквозь неё должно быть видно тёмное дно
+		col = apply_light(v_col.rgb * 0.45);
+	} else if (water > 0.5) {
+		// гладь отражает небо, сильнее всего — у горизонта (скользящий взгляд)
+		vec3 view = v_rel / max(dist, 1e-3);
+		float fres = 0.02 + 0.98 * pow(1.0 - max(-dot(view, n), 0.0), 5.0);
+		col = mix(col, sky_color(reflect(view, n)), fres * 0.85 * smoothstep(150.0, 1500.0, dist));
+	}
+	col = apply_haze(col, v_rel);
+	col = apply_anomaly(col, v_rel, dist);
+	o_color = vec4(col, 1.0);
+}
+`
+
+// ---------------------------------------------------------------- облака
+// Купол вокруг камеры на шаре радиуса R + высота облаков: (доля пути к краю,
+// азимут) -> точка слоя. Кольца идут равными углами от зенита к горизонту.
+CLOUD_VS :: `#version 330 core
+layout(location = 0) in vec2 a_tp;
+uniform mat4 u_view_proj;
+uniform mat3 u_jinv; // оси планеты -> кадр
+uniform mat3 u_e;    // местные оси камеры (касательная, вверх, касательная) -> оси планеты
+uniform vec4 u_geom; // x — облака над камерой (м), y — радиус слоя (м), z — угол от зенита до края купола
+out vec3 v_rel;
+out vec3 v_v;
+out float v_t;
+` + LOGDEPTH_GLSL + `
+void main() {
+	float s = u_geom.x * tan(a_tp.x * u_geom.z); // путь вдоль слоя
+	float psi = s / u_geom.y;
+	float sh = sin(0.5 * psi);
+	vec3 loc = vec3(u_geom.y * sin(psi) * cos(a_tp.y), u_geom.x - 2.0 * u_geom.y * sh * sh, u_geom.y * sin(psi) * sin(a_tp.y));
+	vec3 v = u_e * loc;
+	vec3 rel = u_jinv * v;
+	v_rel = rel;
+	v_v = v;
+	v_t = a_tp.x;
+	gl_Position = log_depth(u_view_proj * vec4(rel, 1.0));
+}
+`
+
+// Мягкие кучевые облака снизу: толстые середины темнее, тонкие края светлее,
+// против солнца — серебристая кайма, на закате низ подсвечен зарёй; вдали
+// растворяются в дымке у горизонта.
+CLOUD_FS :: `#version 330 core
+in vec3 v_rel;
+in vec3 v_v;
+in float v_t;
+uniform vec3 u_pcs;  // камера в координатах шума
+uniform float u_px;  // угловой размер пикселя, рад
+out vec4 o_color;
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
+void main() {
+	float dist = length(v_rel);
+	vec3 view = v_rel / dist;
+	// размер пикселя на слое (у горизонта луч скользит — пиксель вытянут); 1800 м — CLOUD_SCALE
+	float fp = dist * u_px / max(abs(view.y), 0.02) / 1800.0;
+	float d = cloud_density(u_pcs + v_v / 1800.0, fp, 5);
+	float a = cloud_alpha(d) * (1.0 - smoothstep(0.92, 1.0, v_t));
+	if (a < 0.003) discard;
+	float mu = dot(view, u_sun_dir);
+	float sun_up = smoothstep(-0.05, 0.1, u_sun_dir.y);
+	// низ облака освещён небом (серо-голубой), тонкие края пропускают солнце
+	vec3 shadow = vec3(0.64, 0.68, 0.78);
+	vec3 col = mix(vec3(1.0, 0.99, 0.97), shadow, d * (0.55 + 0.25 * sun_up));
+	col += vec3(1.0, 0.97, 0.9) * sun_up * pow(max(mu, 0.0), 6.0) * (1.0 - d) * 1.2;
+	col = apply_light(col);
+	// заря подсвечивает тонкие края и низ со стороны солнца
+	col += u_glow.rgb * u_glow.a * pow(max(mu, 0.0) * 0.5 + 0.5, 3.0) * (1.0 - 0.6 * d) * 0.7;
+	col = apply_haze(col, v_rel);
+	// за туманом аномалии облаков не видно
+	a *= exp(-anomaly_depth(view, dist));
+	o_color = vec4(col, a);
 }
 `
 
@@ -334,6 +517,6 @@ out vec4 o_color;
 ` + ANOMALY_GLSL + `
 void main() {
 	float k = 1.0 - smoothstep(0.32, 0.55, length(gl_PointCoord - 0.5));
-	o_color = vec4(v_col * k * exp(-anomaly_depth(v_dir, 1e4)), 1.0);
+	o_color = vec4(v_col * k * exp(-anomaly_depth(v_dir, 8e4)), 1.0);
 }
 `

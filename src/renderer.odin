@@ -1,7 +1,8 @@
 package main
 
-// Отрисовка кадра: небо -> непрозрачные чанки -> персонаж -> вода ->
-// облака -> рука от первого лица -> прицел.
+// Отрисовка кадра: небо и звёзды -> дальний проход (рельеф до горизонта,
+// облака; своя логарифмическая глубина) -> очистка глубины -> ближний проход
+// (чанки, персонажи, вода, частицы) -> рука от первого лица -> интерфейс.
 
 import "core:math"
 import "core:math/linalg"
@@ -28,20 +29,23 @@ Sky_Shader :: struct {
 	u_band, u_u2f, u_band_k:              i32,
 }
 
-Cloud_Shader :: struct {
-	prog:                                                  u32,
-	u_view_proj, u_origin, u_fog: i32,
-}
-
 Renderer :: struct {
 	chunk:          Chunk_Shader,
 	entity:         Entity_Shader,
 	sky:            Sky_Shader,
-	cloud:          Cloud_Shader,
 	lens:           Lens_Renderer,
 	atlas:          u32,
-	fog:            [2]f32, // туман над водой (из дальности прорисовки)
 	underwater:     bool, // камера под водой в этом кадре
+	pv:             Planet_View, // как кадр у камеры лежит на шаре
+	haze:           [4]f32, // дымка: ослабление, 1/высота, высота камеры, 1/(2R)
+	haze_beta:      f32, // ослабление дымки у моря, 1/м
+	haze_height:    f32, // высота однородной дымки, м
+	cloud_q0:       [3]f32, // облака для шейдеров (CLOUD_GLSL)
+	cloud_jq:       matrix[3, 3]f32,
+	cloud:          [4]f32,
+	off_far:        bool, // отладка (-off:...): выключенные части — для замеров
+	off_clouds:     bool,
+	off_shadows:    bool,
 	player_light:   f32,
 	// небо и свет этого кадра (из Sky_State)
 	sky_top:        [3]f32,
@@ -71,6 +75,11 @@ Frame_Params :: struct {
 	capsule:     ^Capsule_Model,
 	landing:     ^Landing,
 	globe:       ^Globe,
+	far:         ^Far_Terrain, // рельеф до горизонта
+	clouds:      ^Clouds,
+	cloud_shade: f32, // тень облака там, где стоит игрок (1 — нет)
+	cloud_over:  f64, // облачность прямо над головой, 0..1
+	frame_ms:    f64, // время кадра (сглаженное)
 	squad:       ^Squad,
 	clock:       ^Game_Clock,
 	system:      ^Star_System,
@@ -85,7 +94,7 @@ Frame_Params :: struct {
 	height:      i32,
 }
 
-renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
+renderer_init :: proc(r: ^Renderer) -> bool {
 	loc :: eng.uniform_loc
 	{
 		p := eng.shader_create("chunk", CHUNK_VS, CHUNK_FS) or_return
@@ -130,15 +139,6 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_band_k        = loc(p, "u_band_k"),
 		}
 	}
-	{
-		p := eng.shader_create("cloud", CLOUD_VS, CLOUD_FS) or_return
-		r.cloud = {
-			prog          = p,
-			u_view_proj   = loc(p, "u_view_proj"),
-			u_origin      = loc(p, "u_origin"),
-			u_fog         = loc(p, "u_fog"),
-		}
-	}
 	eng.imm_init() or_return
 	lens_init(&r.lens) or_return
 	eng.text_init()
@@ -146,15 +146,18 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 	pixels := build_block_textures(context.temp_allocator)
 	r.atlas = eng.texture_array_create(TEX_SIZE, TEX_SIZE, i32(TEX_LAYER_COUNT), pixels)
 
-	view_blocks := f32(view_radius * CHUNK_SIZE)
-	r.fog = {view_blocks * 0.55, view_blocks * 0.95}
 	r.player_light = 1
 	r.side_shade = SIDE_SHADE
+	r.haze_beta = HAZE_BETA
+	r.haze_height = HAZE_HEIGHT
 	return true
 }
 
 WATER_FOG_COLOR :: [4]f32{0.12, 0.24, 0.55, 1}
 WATER_FOG :: [2]f32{1, 34}
+NO_FOG :: [2]f32{1e8, 2e8} // над водой тумана нет — дальше дымка (HAZE_GLSL)
+HAZE_BETA :: 4e-5 // ослабление у моря, 1/м: в ясную погоду видно ~100 км
+HAZE_HEIGHT :: 1400.0 // высота однородной дымки на планете с земной тяжестью, м
 
 @(private = "file")
 Frustum :: [6][4]f32
@@ -195,6 +198,28 @@ set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
 	water := WATER_FOG_COLOR * [4]f32{r.light_k, r.light_k, r.light_k, 1} // ночью под водой черно
 	eng.set_vec4(eng.uniform_loc(prog, "u_fog_override"), r.underwater ? water : {})
 	eng.set_vec4(eng.uniform_loc(prog, "u_anomaly"), r.anomaly)
+	eng.set_vec4(eng.uniform_loc(prog, "u_haze"), r.haze)
+	eng.set_vec3(eng.uniform_loc(prog, "u_cloud_q0"), r.cloud_q0)
+	gl.UniformMatrix3fv(eng.uniform_loc(prog, "u_cloud_jq"), 1, false, &r.cloud_jq[0, 0])
+	eng.set_vec4(eng.uniform_loc(prog, "u_cloud"), r.cloud)
+	eng.set_i32(eng.uniform_loc(prog, "u_cloud_noise"), 3)
+}
+
+// Дымка и облака этого кадра — для всех шейдеров.
+@(private = "file")
+update_air :: proc(r: ^Renderer, fp: ^Frame_Params) {
+	pv := &r.pv
+	r.haze = {r.underwater ? 0 : r.haze_beta, 1 / r.haze_height, f32(pv.cam_h), f32(1 / (2 * pv.radius))}
+	r.cloud = {}
+	if c := fp.clouds; c != nil {
+		q := cloud_q(c, pv.pc)
+		r.cloud_q0 = {f32(q.x), f32(q.y), f32(q.z)}
+		for i in 0 ..< 3 do for k in 0 ..< 3 do r.cloud_jq[i, k] = f32(pv.j[i, k] / CLOUD_SCALE)
+		r.cloud = {f32(c.cover), f32(c.time / 1800), f32(c.height), r.off_shadows ? 0 : 1}
+		gl.ActiveTexture(gl.TEXTURE3)
+		gl.BindTexture(gl.TEXTURE_3D, c.noise_tex)
+		gl.ActiveTexture(gl.TEXTURE0)
+	}
 }
 
 // Солнце и луны для шейдера неба.
@@ -231,13 +256,17 @@ sky_uniforms_sun :: proc(r: ^Renderer, fp: ^Frame_Params) {
 	gl.UniformMatrix3fv(r.sky.u_u2f, 1, false, &u2f[0, 0])
 }
 
-// Туман ближайшей аномалии (вершины куба) — в координатах относительно камеры.
+// Туман ближайшей аномалии (вершины куба) — относительно камеры, в осях кадра.
+// Точка берётся на шаре, как у дальнего рельефа: туман виден за десятки км.
 @(private = "file")
-update_anomaly :: proc(r: ^Renderer, w: ^World, cam: ^Camera) {
-	cx, cz, dist := geo_nearest_corner(&w.geo, cam.pos.x, cam.pos.z)
+update_anomaly :: proc(r: ^Renderer) {
+	pv := &r.pv
+	_, cd := nearest_anomaly(pv.up)
+	centre := cd * (pv.radius + ANOMALY_Y - Y_SEA)
 	r.anomaly = {}
-	if dist < ANOMALY_RADIUS + 2000 {
-		r.anomaly = {f32(cx - cam.pos.x), f32(ANOMALY_Y - cam.pos.y), f32(cz - cam.pos.z), ANOMALY_RADIUS}
+	if len3(centre - pv.pc) < 80_000 {
+		rel := planet_rel(pv, centre)
+		r.anomaly = {f32(rel.x), f32(rel.y), f32(rel.z), ANOMALY_RADIUS}
 	}
 }
 
@@ -249,13 +278,43 @@ update_light :: proc(light: ^f32, w: ^World, ch: ^Character, t, dt: f32) {
 	light^ += (target - light^) * min(1, dt * 6)
 }
 
+// Дальний рельеф (тайлы, столп аномалии) и облака — с логарифмической
+// глубиной от метров до тысяч километров.
+@(private = "file")
+draw_far :: proc(r: ^Renderer, fp: ^Frame_Params) {
+	cam := fp.cam
+	far_update_mask(fp.far, fp.world, cam.pos)
+	aspect := f32(fp.width) / f32(max(fp.height, 1))
+	vp := linalg.matrix4_perspective_f32(math.to_radians(cam.fov), aspect, 1, f32(FAR_LOG_FAR)) * cam.view
+	frustum := frustum_from(vp)
+	gl.Disable(gl.CULL_FACE)
+	gl.UseProgram(fp.far.prog)
+	set_sky_uniforms(r, fp.far.prog)
+	far_draw(fp.far, &r.pv, vp, &frustum, r.side_shade)
+
+	if c := fp.clouds; c != nil && !r.off_clouds {
+		gl.Enable(gl.BLEND)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+		gl.DepthMask(false)
+		gl.DepthFunc(gl.LEQUAL)
+		gl.UseProgram(c.prog)
+		set_sky_uniforms(r, c.prog)
+		eng.set_f32(eng.uniform_loc(c.prog, "u_px"), 2 * math.tan(math.to_radians(cam.fov) / 2) / f32(max(fp.height, 1)))
+		clouds_draw(c, &r.pv, vp)
+		gl.Disable(gl.BLEND)
+		gl.DepthMask(true)
+		gl.DepthFunc(gl.LESS)
+	}
+	gl.Enable(gl.CULL_FACE)
+}
+
 @(private = "file")
 draw_character :: proc(r: ^Renderer, fp: ^Frame_Params, ch: ^Character, skin: u32, light: f32) {
 	cam := fp.cam
 	pose, body_yaw := character_pose(ch, fp.t)
 	feet := character_render_pos(ch, fp.t)
 	rel := [3]f32{f32(feet.x - cam.pos.x), f32(feet.y - cam.pos.y), f32(feet.z - cam.pos.z)}
-	eng.set_f32(r.entity.u_light, light)
+	eng.set_f32(r.entity.u_light, light * fp.cloud_shade)
 	gl.BindTexture(gl.TEXTURE_2D, skin)
 	humanoid_model_draw(fp.model, &r.entity, cam.view_proj, rel, body_yaw, &pose)
 }
@@ -269,8 +328,10 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		b, _ := world_get_block(fp.world, i32(math.floor(cam.pos.x)), i32(math.floor(cam.pos.y)), i32(math.floor(cam.pos.z)))
 		r.underwater = b == .Water
 	}
-	fog := r.underwater ? WATER_FOG : r.fog
-	update_anomaly(r, fp.world, cam)
+	fog := r.underwater ? WATER_FOG : NO_FOG
+	r.pv = planet_view_make(&fp.world.geo, cam.pos)
+	update_anomaly(r)
+	update_air(r, &fp)
 	st := fp.sky_state
 	r.sky_top, r.sky_horizon, r.sun_dir, r.glow = st.sky_top, st.sky_horizon, st.sun_frame, st.glow
 	r.light = {st.light.r, st.light.g, st.light.b, st.desat}
@@ -293,6 +354,12 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.Enable(gl.DEPTH_TEST)
 	gl.DepthFunc(gl.LESS)
 	gl.DepthMask(true)
+
+	// ---- дальний проход: рельеф до горизонта и облака (своя глубина)
+	if !r.underwater && fp.far != nil && !r.off_far {
+		draw_far(r, &fp)
+		gl.Clear(gl.DEPTH_BUFFER_BIT) // блоки всегда ближе — рисуются поверх
+	}
 
 	// ---- непрозрачные чанки (спереди назад)
 	gl.Enable(gl.CULL_FACE)
@@ -392,26 +459,6 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	if !landing_ui do squad_draw_world(fp.squad, cam, fp.t, fp.time)
 	gl.Enable(gl.CULL_FACE)
 	gl.DepthMask(true)
-
-	// ---- облака: сначала глубина, потом цвет (без двойного наложения граней)
-	cloud_origin := sky_update_clouds(fp.sky, &fp.world.geo, cam.pos, fp.time)
-	if fp.sky.cloud_verts > 0 {
-		gl.UseProgram(r.cloud.prog)
-		eng.set_mat4(r.cloud.u_view_proj, cam.view_proj)
-		eng.set_vec3(r.cloud.u_origin, cloud_origin)
-		cloud_far := f32(CLOUD_RADIUS * CLOUD_CELL)
-		eng.set_vec2(r.cloud.u_fog, r.underwater ? WATER_FOG : [2]f32{cloud_far * 0.45, cloud_far * 0.95})
-		set_sky_uniforms(r, r.cloud.prog)
-		gl.BindVertexArray(fp.sky.cloud_vao)
-		gl.ColorMask(false, false, false, false)
-		gl.DrawArrays(gl.TRIANGLES, 0, fp.sky.cloud_verts)
-		gl.ColorMask(true, true, true, true)
-		gl.DepthFunc(gl.LEQUAL)
-		gl.DepthMask(false)
-		gl.DrawArrays(gl.TRIANGLES, 0, fp.sky.cloud_verts)
-		gl.DepthMask(true)
-		gl.DepthFunc(gl.LESS)
-	}
 	gl.Disable(gl.BLEND)
 
 	if cam.mode == .First_Person && !landing_ui {
@@ -419,8 +466,9 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		gl.Clear(gl.DEPTH_BUFFER_BIT)
 		gl.UseProgram(r.entity.prog)
 		gl.BindTexture(gl.TEXTURE_2D, fp.player_skin)
-		eng.set_f32(r.entity.u_light, r.player_light)
+		eng.set_f32(r.entity.u_light, r.player_light * fp.cloud_shade)
 		eng.set_vec2(r.entity.u_fog, {1e6, 2e6})
+		eng.set_vec4(eng.uniform_loc(r.entity.prog, "u_haze"), {})
 		aspect := f32(fp.width) / f32(max(fp.height, 1))
 		hand_proj := linalg.matrix4_perspective_f32(math.to_radians(f32(BASE_FOV)), aspect, NEAR_PLANE, 10)
 		sway_pitch := eng.wrap_angle(p.pitch - cam.hand_pitch) * 0.1
@@ -464,7 +512,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 @(private = "file")
 draw_pods :: proc(r: ^Renderer, fp: ^Frame_Params) {
 	cam := fp.cam
-	eng.set_f32(r.entity.u_light, 1)
+	eng.set_f32(r.entity.u_light, fp.cloud_shade)
 	for &pod in fp.landing.pods {
 		if pod.state != .Gone {
 			root := capsule_matrix(cam, pod.pos, pod.yaw, pod.tilt.x, pod.tilt.y)

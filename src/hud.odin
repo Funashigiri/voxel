@@ -147,7 +147,18 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 		dl := int(st.day_length * 60 + 0.5)
 		panel_line(p, WHITE, fmt.tprintf("восход %s, закат %s, день %d ч %02d мин", hm_text(st.sunrise), hm_text(st.sunset), dl / 60, dl % 60))
 	}
-	panel_line(p, WHITE, fmt.tprintf("освещённость: %s", lux_text(st.lux)))
+	panel_line(p, WHITE, fmt.tprintf("освещённость: %s", lux_text(st.lux * f64(fp.cloud_shade))))
+	panel_gap(p)
+
+	// дальность обзора, облака, скорость
+	if ft := fp.far; ft != nil {
+		panel_line(p, GOLD, fmt.tprintf("Обзор: горизонт (по морю) в %s, рельеф нарисован до %s", dist_text(ft.horizon), dist_text(ft.view_dist)))
+		panel_line(p, WHITE, fmt.tprintf("тайлов рельефа: %d на экране, %d в памяти, строится %d", ft.drawn, len(ft.tiles), ft.pending))
+	}
+	if c := fp.clouds; c != nil {
+		panel_line(p, WHITE, fmt.tprintf("облака: нижняя кромка %.0f м, облачность мира %.0f%%, над нами %.0f%%", c.height, c.cover * 100, fp.cloud_over * 100))
+	}
+	panel_line(p, WHITE, fmt.tprintf("кадр: %.1f мс", fp.frame_ms))
 	panel_gap(p)
 
 	panel_line(p, GOLD, fmt.tprintf("Наша планета: %s", hp.name))

@@ -142,6 +142,11 @@ window_end_frame :: proc() {
 	glfw.SwapBuffers(win.handle)
 }
 
+// Вертикальная синхронизация (выключить — для замеров скорости).
+window_set_vsync :: proc(on: bool) {
+	glfw.SwapInterval(on ? 1 : 0)
+}
+
 window_set_title :: proc(title: string) {
 	glfw.SetWindowTitle(win.handle, strings.clone_to_cstring(title, context.temp_allocator))
 }

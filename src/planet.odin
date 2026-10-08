@@ -10,6 +10,7 @@ package main
 // рельеф, по которому ходишь.
 
 import "core:math"
+import "core:math/linalg"
 import eng "engine"
 
 Cube_Face :: enum u8 {
@@ -304,6 +305,50 @@ geo_latlon :: proc(dir: [3]f64) -> (lat, lon: f64) {
 geo_from_latlon :: proc(lat, lon: f64) -> [3]f64 {
 	la, lo := math.to_radians(lat), math.to_radians(lon)
 	return {math.cos(la) * math.sin(lo), math.sin(la), math.cos(la) * math.cos(lo)}
+}
+
+// Поверхность воды — верх водяного блока на уровне моря (блоки по y).
+Y_SEA :: f64(SEA_LEVEL) + 0.875
+
+// Как кадр (сетка текущей грани у камеры) лежит на настоящем шаре.
+// Блоки вблизи рисуются в плоской сетке кадра, всё дальнее (рельеф до
+// горизонта, облака) — на шаре: rel = J⁻¹·(P − pc), где J — якобиан сетки у
+// камеры (столбцы: куда ведут шаги по x, y, z кадра в осях планеты). У камеры
+// оба способа совпадают до миллиметров, вдали работает кривизна.
+Planet_View :: struct {
+	pc:     [3]f64, // камера в осях планеты, м
+	up:     [3]f64, // вертикаль у камеры
+	j:      matrix[3, 3]f64, // кадр -> оси планеты
+	jinv:   matrix[3, 3]f64, // оси планеты -> кадр
+	t1, t2: [3]f64, // ортонормированный базис касательной плоскости
+	cam_h:  f64, // высота камеры над уровнем моря, м
+	radius: f64,
+}
+
+planet_view_make :: proc(g: ^Planet_Geo, pos: [3]f64) -> (v: Planet_View) {
+	R := g.radius
+	v.radius = R
+	v.up = geo_frame_dir(g, pos.x, pos.z)
+	v.cam_h = pos.y - Y_SEA
+	v.pc = v.up * (R + v.cam_h)
+	ex := (geo_frame_dir(g, pos.x + 1, pos.z) - geo_frame_dir(g, pos.x - 1, pos.z)) * (R / 2)
+	ez := (geo_frame_dir(g, pos.x, pos.z + 1) - geo_frame_dir(g, pos.x, pos.z - 1)) * (R / 2)
+	cols := [3][3]f64{ex, v.up, ez}
+	for c in 0 ..< 3 do for r in 0 ..< 3 do v.j[r, c] = cols[c][r]
+	v.jinv = linalg.inverse(v.j)
+	v.t1 = normalize3(ex - v.up * dot3(ex, v.up))
+	v.t2 = cross3(v.up, v.t1)
+	return
+}
+
+// Точка планеты (оси планеты, м) -> относительно камеры в осях кадра.
+planet_rel :: proc(v: ^Planet_View, p: [3]f64) -> [3]f64 {
+	return v.jinv * (p - v.pc)
+}
+
+@(private = "file")
+cross3 :: proc(a, b: [3]f64) -> [3]f64 {
+	return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}
 }
 
 // Расстояние до ближайшего ребра грани, в блоках.

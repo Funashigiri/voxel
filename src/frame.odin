@@ -90,7 +90,7 @@ frame_apply :: proc(f: Frame_Refs, m: Xform, new_face: Cube_Face) {
 	cam.yaw += turn
 	cam.hand_yaw += turn
 
-	sky_rebase(f.sky, m)
+	// облака и дальний рельеф привязаны к шару — им переход не нужен
 	if m.r[0][0] == 0 {
 		// оси x и z кадра поменялись местами — затенение боков тоже, плавно вернётся
 		r := f.renderer

@@ -23,6 +23,40 @@ fbm :: proc(seed: i64, p: [3]f64, scale: f64, octaves: int) -> f32 {
 	return sum / norm
 }
 
+// Тот же шум, но без октав мельче клетки cell (м): их вклад заменён средним —
+// нулём. Для дальнего рельефа: тот же рельеф, только без деталей, которые с
+// такого расстояния всё равно не видны (и не мерцают). Нормировка прежняя.
+fbm_lod :: proc(seed: i64, p: [3]f64, scale: f64, octaves: int, cell: f64) -> f32 {
+	sum, amp, norm: f32 = 0, 1, 0
+	freq := 1 / scale
+	wave := scale
+	for i in 0 ..< octaves {
+		// длина волны больше 3 клеток — целиком, меньше 2 — нет
+		if w := f32(clamp(wave / cell - 2, 0, 1)); w > 0 {
+			sum += noise.noise_3d_improve_xz(seed + i64(i) * 7919, p * freq) * amp * w
+		}
+		norm += amp
+		amp *= 0.5
+		freq *= 2
+		wave *= 0.5
+	}
+	return sum / norm
+}
+
+// Доля амплитуды fbm, отброшенная при клетке cell (0 — все детали на месте).
+@(private = "file")
+fbm_lost :: proc(scale: f64, octaves: int, cell: f64) -> f32 {
+	lost, amp, norm: f32 = 0, 1, 0
+	wave := scale
+	for _ in 0 ..< octaves {
+		lost += amp * (1 - f32(clamp(wave / cell - 2, 0, 1)))
+		norm += amp
+		amp *= 0.5
+		wave *= 0.5
+	}
+	return lost / norm
+}
+
 // Крупный рельеф планеты: материки и океаны (тысячи км) и горные пояса (сотни км).
 // offset — сдвиг средней высоты (океан — сильно ниже уровня моря),
 // belt — насколько здесь горный край (0.3..1).
@@ -46,6 +80,57 @@ terrain_height :: proc(seed: i64, p: [3]f64) -> i32 {
 	ridge := 1 - abs(fbm(seed + 41, p, 110, 4))
 	mountains := mask * ridge * ridge * 46
 	return clamp(i32(math.floor(base + hills + detail + mountains)), 4, CHUNK_HEIGHT - 12)
+}
+
+// Высота поверхности для дальнего рельефа: непрерывная (без округления до
+// блока) и без деталей мельче клетки cell, м. Блоки — floor(v), их верх в
+// среднем на v + 0,5.
+terrain_height_lod :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
+	macro := fbm_lod(seed + 201, p, 1_800_000, 5, cell)
+	regional := fbm_lod(seed + 202, p, 160_000, 4, cell)
+	land := macro + regional * 0.22 + 0.08
+	offset := clamp(land * 70, -38, 12)
+	belt := 0.3 + 0.7 * eng.smoothstep(0.05, 0.45, fbm_lod(seed + 203, p, 400_000, 3, cell))
+	cont := fbm_lod(seed, p, 600, 3, cell)
+	base := 66 + offset + cont * 14
+	hills := fbm_lod(seed + 11, p, 140, 4, cell) * (5 + 10 * clamp(cont + 0.3, 0, 1))
+	detail := fbm_lod(seed + 23, p, 36, 2, cell) * 1.8
+	mask := eng.smoothstep(0.2, 0.6, fbm_lod(seed + 37, p, 420, 2, cell)) * belt
+	ridge := 1 - abs(fbm_lod(seed + 41, p, 110, 4, cell))
+	// гребни нелинейны: без мелких октав (1 − |x|)² ближе к 1, чем в среднем
+	// по настоящим гребням, — отброшенную часть заменяем средним значением
+	ridge2 := math.lerp(ridge * ridge, RIDGE_MEAN, fbm_lost(110, 4, cell))
+	mountains := mask * ridge2 * 46
+	return clamp(f64(base + hills + detail + mountains), 4, CHUNK_HEIGHT - 12)
+}
+
+// Среднее (1 − |шум|)² по горному гребню (проверяется в -selftest).
+RIDGE_MEAN :: 0.67
+
+// Самопроверка дальнего рельефа: среднее (1 − |шум|)² гребней и насколько
+// поверхность дальнего рельефа у границы с блоками (клетка 1,5 м) расходится
+// с верхом блоков.
+far_selftest :: proc(seed: u32, g: ^Planet_Geo) -> (ridge_mean, diff_mean, diff_max: f64) {
+	r := eng.rng_make(u64(seed) + 4242)
+	N :: 4000
+	s := i64(seed)
+	for _ in 0 ..< N {
+		d := [3]f64{eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1)}
+		d /= math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
+		p := d * g.radius
+		ridge := 1 - abs(f64(fbm(s + 41, p, 110, 4)))
+		ridge_mean += ridge * ridge
+		block_top := f64(terrain_height(s, p)) + 1
+		diff := abs(terrain_height_lod(s, p, 1.5) + 0.5 - block_top)
+		diff_mean += diff
+		diff_max = max(diff_max, diff)
+	}
+	return ridge_mean / N, diff_mean / N, diff_max
+}
+
+forest_density_lod :: proc(seed: i64, p: [3]f64, cell: f64) -> f32 {
+	f := fbm_lod(seed + 88, p, 220, 3, cell)
+	return 0.03 + 0.9 * eng.smoothstep(0.02, 0.35, f)
 }
 
 surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32) -> (surface, filler: Block) {

@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.010"
+VERSION :: "0.011"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -55,6 +55,10 @@ Options :: struct {
 	anomaly_dist:  f64, // > 0: высадка в стольких метрах от вершины куба (тест аномалии)
 	selftest:      bool, // проверить геометрию стыков граней и выйти
 	dump_textures: string,
+	no_vsync:      bool, // без вертикальной синхронизации (замер скорости)
+	alt:           f64, // отладка: камера выше на столько метров (вид с высоты)
+	view_km:       f64, // > 0: предел дальности дальнего рельефа, км
+	off:           string, // отладка: выключить части (far,clouds,shadows,haze) — для замеров
 }
 
 parse_options :: proc() -> (o: Options) {
@@ -154,6 +158,14 @@ parse_options :: proc() -> (o: Options) {
 			o.interval = strconv.parse_f64(val) or_else 0.1
 		case "-dump-textures":
 			o.dump_textures = val
+		case "-novsync":
+			o.no_vsync = true
+		case "-alt":
+			o.alt = max(0, strconv.parse_f64(val) or_else 0)
+		case "-view":
+			o.view_km = max(0, strconv.parse_f64(val) or_else 0)
+		case "-off":
+			o.off = val
 		}
 	}
 	return
@@ -233,12 +245,13 @@ main :: proc() {
 
 	if !eng.window_create(fmt.tprintf("Voxel %s", VERSION), opts.width, opts.height) do os.exit(1)
 	defer eng.window_destroy()
+	if opts.no_vsync do eng.window_set_vsync(false)
 
 	clock := clock_init(system.home.day_hours, opts.timescale)
 	clock.std_hours = opts.start_hours
 
 	r: Renderer
-	if !renderer_init(&r, VIEW_RADIUS) do os.exit(1)
+	if !renderer_init(&r) do os.exit(1)
 	if !starsky_gl_init(&star_sky) do os.exit(1)
 
 	player_skin := skin_load_or_generate("assets/skin.png", PALETTE_PLAYER)
@@ -247,7 +260,7 @@ main :: proc() {
 	capsule := capsule_model_create()
 
 	sky: Sky
-	sky_init(&sky, opts.seed)
+	sky_init(&sky)
 
 	// планета-шар реального размера: выбираем грань и точку высадки
 	geo := geo_make(home_planet(&system).radius_km)
@@ -259,6 +272,9 @@ main :: proc() {
 	if opts.selftest {
 		checked, errors := frame_selftest(geo)
 		fmt.printfln("selftest: рёбра %d ошибок; смена кадра: %d точек, %d ошибок", geo_check_links(&geo), checked, errors)
+		ridge, diff, diff_max := far_selftest(opts.seed, &geo)
+		fmt.printfln("дальний рельеф: гребни (1−|шум|)² в среднем %.3f (заложено %.2f); от верха блоков в среднем %.2f м, наибольшее %.2f м",
+			ridge, RIDGE_MEAN, diff, diff_max)
 		return
 	}
 	// тесты: высадка у ребра или у вершины; взгляд — в их сторону
@@ -312,6 +328,20 @@ main :: proc() {
 
 	globe, globe_ok := globe_create(&world.geo, opts.seed)
 	if !globe_ok do os.exit(1)
+
+	// рельеф до горизонта (тайлы строятся в фоне) и облака на настоящей высоте;
+	// у планет со слабой тяжестью атмосфера «выше» — дымка тоже
+	far: Far_Terrain
+	if !far_init(&far, world.geo, opts.seed) do os.exit(1)
+	defer far_destroy(&far)
+	if opts.view_km > 0 do far.max_dist = opts.view_km * 1000
+	clouds: Clouds
+	if !clouds_init(&clouds, opts.seed, system.home.gravity_g) do os.exit(1)
+	r.haze_height = f32(clamp(HAZE_HEIGHT / max(system.home.gravity_g, 0.1), 400, 6000))
+	r.off_far = strings.contains(opts.off, "far")
+	r.off_clouds = strings.contains(opts.off, "clouds")
+	r.off_shadows = strings.contains(opts.off, "shadows")
+	if strings.contains(opts.off, "haze") do r.haze_beta = 0
 
 	sx, sz := i32(site_x), i32(site_z)
 	spawn := find_spawn(&world, sx, sz)
@@ -378,6 +408,18 @@ main :: proc() {
 		orbit      = math.to_radians(opts.orbit),
 	}
 
+	// дальний рельеф вокруг точки появления — ещё до первого кадра (при высадке — с высоты капсул)
+	{
+		eye := player.pos + {0, opts.no_intro ? 1.6 + opts.alt : DROP_ALTITUDE, 0}
+		pv := planet_view_make(&world.geo, eye)
+		deadline := eng.time_now() + 5
+		for eng.time_now() < deadline {
+			far_update(&far, &pv, 1)
+			if far.ready_all do break
+			time.sleep(5 * time.Millisecond)
+		}
+	}
+
 	auto_mode := opts.shot_path != ""
 	if !auto_mode do eng.set_cursor_locked(true)
 
@@ -392,6 +434,8 @@ main :: proc() {
 	fps_frames: int
 	shots_taken := 0
 	last_fps: f64
+	bench_frames, bench_time: f64 // замер для отчёта: кадры после 3-й секунды
+	frame_ms: f64 = 16
 
 	for !eng.window_should_close() {
 		eng.window_begin_frame()
@@ -507,12 +551,28 @@ main :: proc() {
 		// небо этого кадра: солнце, луны, свет — по положению планеты и игрока на ней
 		sky_state := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours + f64(t) * clock_tick_hours(&clock), &star_sky)
 
+		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
+		clouds_tick(&clouds, now - start)
+		cloud_shade, cloud_over: f64
+		{
+			up := geo_frame_dir(&world.geo, player.pos.x, player.pos.z)
+			h := player.pos.y + 1.6 - Y_SEA
+			cloud_shade = cloud_shadow_at(&clouds, up * (world.geo.radius + h), up, sky_state.sun_body, h)
+			cloud_over = cloud_alpha(cloud_density(&clouds, cloud_q(&clouds, up * (world.geo.radius + clouds.height))))
+		}
+		frame_ms += (dt * 1000 - frame_ms) * 0.05
+
 		fbw, fbh := eng.win.fb_width, eng.win.fb_height
 		if fbw > 0 && fbh > 0 {
 			if landing.active {
 				landing_camera(&landing, &cam, &player, &world, t, f32(fbw) / f32(fbh), f32(dt))
 			} else {
 				camera_update(&cam, &player, &world, t, f32(fbw) / f32(fbh), f32(dt))
+				if opts.alt > 0 do cam.pos.y += opts.alt // отладка: вид с высоты
+			}
+			{
+				pv := planet_view_make(&world.geo, cam.pos)
+				far_update(&far, &pv)
 			}
 			render_frame(&r, {
 				world = &world,
@@ -526,6 +586,11 @@ main :: proc() {
 				capsule = &capsule,
 				landing = &landing,
 				globe = &globe,
+				far = &far,
+				clouds = &clouds,
+				cloud_shade = f32(cloud_shade),
+				cloud_over = cloud_over,
+				frame_ms = frame_ms,
 				squad = &squad,
 				clock = &clock,
 				system = &system,
@@ -545,8 +610,8 @@ main :: proc() {
 				path := fmt.tprintf("screenshots/%d.png", time.time_to_unix(time.now()))
 				if eng.save_screenshot(path, fbw, fbh) do fmt.println("Скриншот:", path)
 			}
-			// автоснимок ждёт, пока досчитается звёздное небо
-			if auto_mode && (star_sky.ready || star_sky.worker == nil) && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
+			// автоснимок ждёт, пока досчитаются звёздное небо и дальний рельеф
+			if auto_mode && (star_sky.ready || star_sky.worker == nil) && far.ready_all && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
 				path := opts.shot_path
 				if opts.burst > 1 {
 					base := strings.trim_suffix(path, ".png")
@@ -557,6 +622,9 @@ main :: proc() {
 				shots_taken += 1
 				if shots_taken >= opts.burst {
 					fmt.printfln("fps: %.1f, chunks: %d, drawn: %d", last_fps, len(world.chunks), r.chunks_drawn)
+					if bench_frames > 0 do fmt.printfln("кадр: %.2f мс в среднем (%.0f кадров)", bench_time / bench_frames * 1000, bench_frames)
+					fmt.printfln("дальний рельеф: %d тайлов на экране, выбрано %d (%s), в памяти %d, до %.1f км",
+						far.drawn, len(far.draw), far_stats(&far), len(far.tiles), far.view_dist / 1000)
 					eng.window_request_close()
 				}
 			}
@@ -566,6 +634,10 @@ main :: proc() {
 
 		fps_frames += 1
 		fps_timer += dt
+		if now - start > 3 {
+			bench_frames += 1
+			bench_time += dt
+		}
 		if fps_timer >= 0.5 {
 			last_fps = f64(fps_frames) / fps_timer
 			eng.window_set_title(fmt.tprintf(
