@@ -237,7 +237,6 @@ geo_frame_dir :: proc(g: ^Planet_Geo, x, z: f64) -> [3]f64 {
 
 // Аномалии — в восьми вершинах куба: серый туман и столп из гладкого камня.
 ANOMALY_RADIUS :: 150.0 // радиус тумана, блоков
-ANOMALY_Y :: 64.0 // высота центра тумана
 ANOMALY_DIRS := [8][3]f64 {
 	{-1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {-1, 1, 1},
 	{1, -1, -1}, {1, -1, 1}, {1, 1, -1}, {1, 1, 1},
@@ -358,17 +357,17 @@ geo_edge_dist :: proc(g: ^Planet_Geo, x, z: f64) -> f64 {
 }
 
 // Выбирает точку высадки: начиная с (lat, lon), а если она ближе 20 км к
-// аномалии или в океане — ищет другую в умеренных широтах. Задаёт грань и возвращает
-// локальные x, z.
+// аномалии, в океане или в горах — ищет другую в умеренных широтах. Задаёт
+// грань и возвращает локальные x, z.
 geo_choose_site :: proc(g: ^Planet_Geo, lat, lon: f64, seed: u32, keep_exact: bool) -> (x, z, out_lat, out_lon: f64) {
 	r := eng.rng_make(u64(seed) * 977 + 3)
 	la, lo := lat, lon
 	for attempt in 0 ..< 3000 {
 		dir := geo_from_latlon(la, lo)
 		face, fx, fz := geo_locate(g, dir)
-		offset, _ := planet_relief(i64(seed), dir * g.radius)
+		alt := elevation(i64(seed), dir * g.radius, 2000)
 		_, _, anomaly := geo_nearest_corner(g, fx, fz)
-		good := anomaly >= MIN_ANOMALY_DIST && offset > 3 // на суше
+		good := anomaly >= MIN_ANOMALY_DIST && alt > 10 && alt < 900 // на суше, в низинах
 		if keep_exact || good || attempt == 2999 {
 			g.face = face
 			return fx, fz, la, lo

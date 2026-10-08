@@ -34,9 +34,7 @@ FAR_MIN_TILE :: 48.0 // самый мелкий тайл, м (клетка 1,5 �
 FAR_MAX_TILES :: 1500 // тайлов в видеопамяти
 FAR_WORKERS :: 3
 FAR_UPLOAD_BUDGET :: 0.003 // секунд на загрузку тайлов в видеокарту за кадр
-FAR_VIEW_LIMIT :: 400_000.0 // предел дальности, м (горизонт обычно гораздо ближе)
-FAR_H_MIN :: -64.0 // дно океана, м над уровнем моря
-FAR_H_MAX :: 68.0 // горы с кронами
+FAR_VIEW_LIMIT :: 700_000.0 // предел дальности, м (с вершин видно за сотни км)
 FAR_LOG_FAR :: f64(1e7) // дальняя граница логарифмической глубины, м
 MASK_R :: VIEW_RADIUS + 4 // маска чанков: столько чанков в каждую сторону от камеры
 MASK_N :: 2 * MASK_R + 1
@@ -67,10 +65,12 @@ Far_Tile :: struct {
 	verts:     []Far_Vertex,
 	bound:     f64, // настоящий радиус с высотами
 	top:       f64, // самая высокая точка тайла над уровнем моря, м
+	bottom:    f64, // самая низкая (с дном под водой)
 	err:       f64, // насколько тайл грубее своих потомков (высоты и цвет), м
 	has_water: bool,
 	// главный поток
 	h_top:     f64, // верх тайла для отсечения за горизонтом (пока не построен — с запасом)
+	h_lo:      f64, // низ тайла (дно под водой)
 	in_flight: bool, // в очереди, строится или ждёт загрузки в видеокарту
 	ready:     bool, // загружен в видеокарту
 	used:      u64, // кадр последнего использования
@@ -80,7 +80,7 @@ Far_Tile :: struct {
 
 // Цвета поверхностей — средние цвета текстур блоков (так вдали мир того же цвета, что вблизи).
 Far_Palette :: struct {
-	grass, tall_grass, sand, stone, dirt, gravel, oak, birch, water: [3]f32,
+	grass, tall_grass, sand, stone, dirt, gravel, oak, birch, water, sandstone, limestone, granite: [3]f32,
 }
 
 // Для фоновых потоков — только чтение.
@@ -215,6 +215,9 @@ far_palette :: proc() -> (p: Far_Palette) {
 	p.oak = tex_average(.Oak_Leaves)
 	p.birch = tex_average(.Birch_Leaves)
 	p.water = tex_average(.Water)
+	p.sandstone = tex_average(.Sandstone)
+	p.limestone = tex_average(.Limestone)
+	p.granite = tex_average(.Granite)
 	return
 }
 
@@ -307,15 +310,17 @@ far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64) -> (col: [3
 		return col, 0, true
 	}
 	h = max(v + 0.5 - Y_SEA, 0.1)
-	peak := 102 + f64(fbm_lod(seed + 151, p, 30, 2, cell)) * 8
-	stone := max(smooth(3.0, 4.5, slope), smooth(peak - 1, peak + 1, v))
+	rock := rock_line(seed, p, cell)
+	stone := max(smooth(2.2, 3.5, slope), smooth(rock - 150, rock + 150, h))
 	sand := 1 - smooth(63.5, 64.5, v)
 	grassy := 0.5 + 0.5 * f64(fbm_lod(seed + 55, p, 48, 2, cell))
 	col = mix3(pal.grass, pal.tall_grass, (0.03 + 0.32 * grassy) * 0.6)
-	col = mix3(col, pal.stone, stone)
+	// голая скала — пласты: в низких горах осадочные, в высоких — гранит
+	bare := mix3(pal.sandstone * 0.67 + pal.limestone * 0.33, pal.granite, smooth(1500, 2500, h))
+	col = mix3(col, bare, stone)
 	col = mix3(col, pal.sand, sand)
 	// лес: кроны закрывают землю и поднимают поверхность
-	cover := f64(forest_density_lod(seed, p, cell)) * (1 - stone) * (1 - sand) * (1 - smooth(1.5, 2.5, slope))
+	cover := f64(forest_density(seed, p, h, cell)) * (1 - stone) * (1 - sand) * (1 - smooth(1.5, 2.5, slope))
 	crowns := smooth(0, 0.45, cover)
 	birch := clamp(smooth(0.1, 0.3, f64(fbm_lod(seed + 99, p, 160, 2, cell))) + 0.12, 0, 1)
 	col = mix3(col, mix3(pal.oak, pal.birch, birch) * 0.85, crowns * 0.9)
@@ -392,10 +397,11 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 
 	verts := make([]Far_Vertex, FAR_VERTS)
 	bound := 0.0
-	top := 0.0
+	top, bottom: f64 = -1e9, 1e9
 	for j in 0 ..< FAR_N do for i in 0 ..< FAR_N {
 		k := (j + 1) * G + (i + 1)
 		top = max(top, h[k])
+		bottom = min(bottom, h[k] - min(depth[k], 127))
 		n := dirs[k]
 		if !water[k] {
 			a := P[k + 1] - P[k - 1]
@@ -414,7 +420,8 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 			normal = nrm,
 			color  = {u8(clamp(cc.r, 0, 1) * 255), u8(clamp(cc.g, 0, 1) * 255), u8(clamp(cc.b, 0, 1) * 255), water[k] ? 255 : 0},
 		}
-		bound = max(bound, math.sqrt(off.x * off.x + off.y * off.y + off.z * off.z))
+		bound = max(bound, len3(off))
+		if water[k] do bound = max(bound, len3(off - dirs[k] * min(depth[k], 127))) // дно
 	}
 	// юбки: края тайла, опущенные вниз, — закрывают щели с соседями другого уровня
 	skirt := 3 + 2 * cell
@@ -429,11 +436,14 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 	t.verts = verts
 	t.bound = bound + skirt
 	t.top = top
+	t.bottom = bottom
 }
 
 // ---------------------------------------------------------------- выбор тайлов
 
-// Геометрия тайла на уровне моря: центр, радиус, сторона.
+// Геометрия тайла: центр, ограничивающая сфера, сторона. Пока тайл не
+// построен, его высоты неизвестны — берутся у родителя с запасом (детали
+// добавляют вершины и впадины), у корней — пределы рельефа мира.
 @(private = "file")
 far_tile_new :: proc(ft: ^Far_Terrain, key: Tile_Key) -> ^Far_Tile {
 	g := &ft.shared.geo
@@ -441,21 +451,25 @@ far_tile_new :: proc(ft: ^Far_Terrain, key: Tile_Key) -> ^Far_Tile {
 	x0, z0 := f64(key.x) * S, f64(key.z) * S
 	t := new(Far_Tile)
 	t.key = key
-	t.origin = geo_dir(g, key.face, x0 + S / 2, z0 + S / 2) * g.radius
-	r := 0.0
-	for a in 0 ..= 2 do for b in 0 ..= 2 {
-		p := geo_dir(g, key.face, x0 + f64(a) * S / 2, z0 + f64(b) * S / 2) * g.radius
-		r = max(r, len3(p - t.origin))
-	}
-	t.size = r * math.SQRT_TWO
-	t.radius = r + max(-FAR_H_MIN, FAR_H_MAX)
-	t.h_top = FAR_H_MAX
+	t.h_lo, t.h_top = relief.h_min, relief.h_max
 	if key.level > 0 {
-		// пока не построен — верх родителя с запасом (детали добавляют вершины)
 		if parent, ok := ft.tiles[{key.face, key.level - 1, key.x >> 1, key.z >> 1}]; ok && parent.ready {
-			t.h_top = min(parent.h_top + 12, FAR_H_MAX)
+			m := 60 + 4 * parent.err
+			t.h_lo = max(parent.h_lo - m, relief.h_min)
+			t.h_top = min(parent.h_top + m, relief.h_max)
 		}
 	}
+	R := g.radius
+	cd := geo_dir(g, key.face, x0 + S / 2, z0 + S / 2)
+	t.origin = cd * (R + (t.h_lo + t.h_top) / 2)
+	r, side := 0.0, 0.0
+	for a in 0 ..= 2 do for b in 0 ..= 2 {
+		d := geo_dir(g, key.face, x0 + f64(a) * S / 2, z0 + f64(b) * S / 2)
+		side = max(side, len3((d - cd) * R))
+		r = max(r, len3(d * (R + t.h_lo) - t.origin), len3(d * (R + t.h_top) - t.origin))
+	}
+	t.size = side * math.SQRT_TWO
+	t.radius = r
 	ft.tiles[key] = t
 	return t
 }
@@ -475,7 +489,7 @@ far_visible :: proc(ft: ^Far_Terrain, pv: ^Planet_View, t: ^Far_Tile) -> (ok: bo
 	d := len3(pv.pc - t.origin)
 	dist = max(d - t.radius, 0)
 	if dist > ft.max_dist do return false, dist
-	dir := t.origin / R
+	dir := t.origin / len3(t.origin) // центр тайла — на средней высоте, не на уровне моря
 	cosv := clamp(dir.x * pv.up.x + dir.y * pv.up.y + dir.z * pv.up.z, -1, 1)
 	ang := math.acos(cosv)
 	ang_r := 2 * math.asin(min(t.radius / (2 * R), 1))
@@ -603,6 +617,7 @@ far_upload :: proc(ft: ^Far_Terrain, t: ^Far_Tile) {
 	t.verts = nil
 	t.radius = t.bound
 	t.h_top = t.top
+	t.h_lo = t.bottom
 	t.ready = true
 	t.in_flight = false
 }
@@ -631,8 +646,8 @@ far_update_mask :: proc(ft: ^Far_Terrain, w: ^World, cam_pos: [3]f64) {
 	ccz := eng.floor_div(i32(math.floor(cam_pos.z)), CHUNK_SIZE)
 	meshed: [MASK_N * MASK_N]bool
 	for j in 0 ..< MASK_N do for i in 0 ..< MASK_N {
-		c := world_frame_chunk(w, ccx + i32(i) - MASK_R, ccz + i32(j) - MASK_R)
-		meshed[j * MASK_N + i] = c != nil && c.meshed
+		col := world_frame_column(w, ccx + i32(i) - MASK_R, ccz + i32(j) - MASK_R)
+		meshed[j * MASK_N + i] = col != nil && col.covered
 	}
 	for j in 0 ..< MASK_N do for i in 0 ..< MASK_N {
 		v: u8 = 0

@@ -92,7 +92,8 @@ float cloud_shadow(vec3 rel) {
 	float sy = u_sun_dir.y;
 	if (u_cloud.w < 0.5 || sy <= 0.0) return 1.0;
 	float h = u_haze.z + rel.y + dot(rel.xz, rel.xz) * u_haze.w;
-	float t = max(u_cloud.z - h, 0.0) / max(sy, 0.05);
+	if (h > u_cloud.z) return 1.0; // выше облаков — тени нет
+	float t = (u_cloud.z - h) / max(sy, 0.05);
 	vec3 q = u_cloud_q0 + u_cloud_jq * (rel + u_sun_dir * t);
 	float a = cloud_alpha(cloud_density(q, 0.0, 3)) * smoothstep(0.0, 1.0, sy / 0.1);
 	return 1.0 - 0.55 * a;
@@ -187,6 +188,9 @@ void main() {
 	vec4 c = texture(u_atlas, v_uvl);
 	if (c.a < u_alpha_cutoff) discard;
 	vec3 col = apply_light(c.rgb * v_light * cloud_shadow(v_rel));
+	// под водой свет гаснет с глубиной: ниже ~200 м почти темно
+	float depth = -(u_haze.z + v_rel.y);
+	if (depth > 0.0) col *= exp(-depth / 60.0);
 	float fog = clamp((length(v_rel.xz) - u_fog.x) / (u_fog.y - u_fog.x), 0.0, 1.0);
 	col = mix(col, sky_color(normalize(v_rel)), fog);
 	col = apply_haze(col, v_rel);
@@ -420,13 +424,13 @@ layout(location = 0) in vec2 a_tp;
 uniform mat4 u_view_proj;
 uniform mat3 u_jinv; // оси планеты -> кадр
 uniform mat3 u_e;    // местные оси камеры (касательная, вверх, касательная) -> оси планеты
-uniform vec4 u_geom; // x — облака над камерой (м), y — радиус слоя (м), z — угол от зенита до края купола
+uniform vec4 u_geom; // x — облака над камерой (м, < 0 — под ней), y — радиус слоя (м), z — угол до края купола, w — 1: смотрим сверху
 out vec3 v_rel;
 out vec3 v_v;
 out float v_t;
 ` + LOGDEPTH_GLSL + `
 void main() {
-	float s = u_geom.x * tan(a_tp.x * u_geom.z); // путь вдоль слоя
+	float s = abs(u_geom.x) * tan(a_tp.x * u_geom.z); // путь вдоль слоя
 	float psi = s / u_geom.y;
 	float sh = sin(0.5 * psi);
 	vec3 loc = vec3(u_geom.y * sin(psi) * cos(a_tp.y), u_geom.x - 2.0 * u_geom.y * sh * sh, u_geom.y * sin(psi) * sin(a_tp.y));
@@ -448,6 +452,7 @@ in vec3 v_v;
 in float v_t;
 uniform vec3 u_pcs;  // камера в координатах шума
 uniform float u_px;  // угловой размер пикселя, рад
+uniform vec4 u_geom; // w — 1: смотрим на облака сверху
 out vec4 o_color;
 ` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
 void main() {
@@ -460,10 +465,16 @@ void main() {
 	if (a < 0.003) discard;
 	float mu = dot(view, u_sun_dir);
 	float sun_up = smoothstep(-0.05, 0.1, u_sun_dir.y);
-	// низ облака освещён небом (серо-голубой), тонкие края пропускают солнце
-	vec3 shadow = vec3(0.64, 0.68, 0.78);
-	vec3 col = mix(vec3(1.0, 0.99, 0.97), shadow, d * (0.55 + 0.25 * sun_up));
-	col += vec3(1.0, 0.97, 0.9) * sun_up * pow(max(mu, 0.0), 6.0) * (1.0 - d) * 1.2;
+	vec3 col;
+	if (u_geom.w > 0.5) {
+		// сверху: верх облаков освещён солнцем — плотные середины ярко-белые
+		col = vec3(mix(0.84, 1.02, d)) * (0.75 + 0.25 * sun_up);
+	} else {
+		// низ облака освещён небом (серо-голубой), тонкие края пропускают солнце
+		vec3 shadow = vec3(0.64, 0.68, 0.78);
+		col = mix(vec3(1.0, 0.99, 0.97), shadow, d * (0.55 + 0.25 * sun_up));
+		col += vec3(1.0, 0.97, 0.9) * sun_up * pow(max(mu, 0.0), 6.0) * (1.0 - d) * 1.2;
+	}
 	col = apply_light(col);
 	// заря подсвечивает тонкие края и низ со стороны солнца
 	col += u_glow.rgb * u_glow.a * pow(max(mu, 0.0) * 0.5 + 0.5, 3.0) * (1.0 - 0.6 * d) * 0.7;

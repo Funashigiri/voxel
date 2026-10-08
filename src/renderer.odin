@@ -43,6 +43,7 @@ Renderer :: struct {
 	cloud_q0:       [3]f32, // облака для шейдеров (CLOUD_GLSL)
 	cloud_jq:       matrix[3, 3]f32,
 	cloud:          [4]f32,
+	seed:           u32,
 	off_far:        bool, // отладка (-off:...): выключенные части — для замеров
 	off_clouds:     bool,
 	off_shadows:    bool,
@@ -76,6 +77,8 @@ Frame_Params :: struct {
 	landing:     ^Landing,
 	globe:       ^Globe,
 	far:         ^Far_Terrain, // рельеф до горизонта
+	interior:    ^Planet_Interior, // строение планеты (F3)
+	around:      [2]f64, // самая высокая и самая низкая точка в 40 км вокруг, м
 	clouds:      ^Clouds,
 	cloud_shade: f32, // тень облака там, где стоит игрок (1 — нет)
 	cloud_over:  f64, // облачность прямо над головой, 0..1
@@ -195,7 +198,9 @@ set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
 	eng.set_vec3(eng.uniform_loc(prog, "u_sun_dir"), r.sun_dir)
 	eng.set_vec4(eng.uniform_loc(prog, "u_glow"), r.glow)
 	eng.set_vec4(eng.uniform_loc(prog, "u_light"), r.light)
-	water := WATER_FOG_COLOR * [4]f32{r.light_k, r.light_k, r.light_k, 1} // ночью под водой черно
+	// ночью под водой черно; в глубине — тоже (свет гаснет с глубиной)
+	deep := f32(math.exp(-max(-r.pv.cam_h, 0) / 60))
+	water := WATER_FOG_COLOR * [4]f32{r.light_k * deep, r.light_k * deep, r.light_k * deep, 1}
 	eng.set_vec4(eng.uniform_loc(prog, "u_fog_override"), r.underwater ? water : {})
 	eng.set_vec4(eng.uniform_loc(prog, "u_anomaly"), r.anomaly)
 	eng.set_vec4(eng.uniform_loc(prog, "u_haze"), r.haze)
@@ -261,8 +266,9 @@ sky_uniforms_sun :: proc(r: ^Renderer, fp: ^Frame_Params) {
 @(private = "file")
 update_anomaly :: proc(r: ^Renderer) {
 	pv := &r.pv
-	_, cd := nearest_anomaly(pv.up)
-	centre := cd * (pv.radius + ANOMALY_Y - Y_SEA)
+	corner, cd := nearest_anomaly(pv.up)
+	ground := f64(anomaly_ground(r.seed, pv.radius, corner))
+	centre := cd * (pv.radius + ground + 2 - Y_SEA) // туман — над землёй у вершины
 	r.anomaly = {}
 	if len3(centre - pv.pc) < 80_000 {
 		rel := planet_rel(pv, centre)
@@ -379,16 +385,16 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	frustum := frustum_from(cam.view_proj)
 	visible := make([dynamic]Visible_Chunk, 0, len(fp.world.chunks), context.temp_allocator)
 	for _, c in fp.world.chunks {
-		if !c.meshed do continue
-		// чанк соседней грани лежит в кадре повёрнутым на 90°·k
+		if !c.meshed || (c.opaque_mesh.quads == 0 && c.water_mesh.quads == 0) do continue
+		// секция соседней грани лежит в кадре повёрнутой на 90°·k
 		m, placed := geo_frame_of(&fp.world.geo, c.key.face)
 		if !placed do continue
 		fx, fz := xform_pos(m, f64(c.key.x * CHUNK_SIZE), f64(c.key.z * CHUNK_SIZE))
-		origin := [3]f32{f32(fx - cam.pos.x), f32(-cam.pos.y), f32(fz - cam.pos.z)}
+		origin := [3]f32{f32(fx - cam.pos.x), f32(f64(c.key.y * CHUNK_SIZE) - cam.pos.y), f32(fz - cam.pos.z)}
 		rot := [4]f32{f32(m.r[0][0]), f32(m.r[1][0]), f32(m.r[0][1]), f32(m.r[1][1])}
 		far := [2]f32{rot.x + rot.z, rot.y + rot.w} * CHUNK_SIZE // образ угла (16, 16)
 		mn := [3]f32{origin.x + min(0, far.x), origin.y, origin.z + min(0, far.y)}
-		mx := [3]f32{origin.x + max(0, far.x), origin.y + f32(c.max_y + 1), origin.z + max(0, far.y)}
+		mx := [3]f32{origin.x + max(0, far.x), origin.y + CHUNK_SIZE, origin.z + max(0, far.y)}
 		if !aabb_visible(&frustum, mn, mx) do continue
 		centre := (mn + mx) / 2
 		append(&visible, Visible_Chunk{c, origin, rot, centre.x * centre.x + centre.z * centre.z})

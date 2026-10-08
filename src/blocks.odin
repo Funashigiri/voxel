@@ -20,6 +20,38 @@ Block :: enum u8 {
 	Poppy,
 	Scorched, // выжженная земля (место посадки капсулы)
 	Monolith, // неразрушимый столп в вершине куба-планеты (аномалия)
+	// недра (0.012): осадочные слои, кора материков и океанов, мантия
+	Sandstone,
+	Limestone,
+	Granite,
+	Basalt,
+	Peridotite,
+}
+
+// Русские названия (F3: что под ногами).
+BLOCK_NAMES := [Block]string {
+	.Air          = "воздух",
+	.Stone        = "камень",
+	.Dirt         = "земля",
+	.Grass        = "трава",
+	.Sand         = "песок",
+	.Gravel       = "гравий",
+	.Bedrock      = "коренная порода",
+	.Water        = "вода",
+	.Oak_Log      = "дуб",
+	.Oak_Leaves   = "листва дуба",
+	.Birch_Log    = "берёза",
+	.Birch_Leaves = "листва берёзы",
+	.Tall_Grass   = "высокая трава",
+	.Dandelion    = "одуванчик",
+	.Poppy        = "мак",
+	.Scorched     = "выжженная земля",
+	.Monolith     = "столп аномалии",
+	.Sandstone    = "песчаник",
+	.Limestone    = "известняк",
+	.Granite      = "гранит",
+	.Basalt       = "базальт",
+	.Peridotite   = "перидотит (мантия)",
 }
 
 Render_Kind :: enum u8 {
@@ -82,6 +114,11 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Bedrock] = cube(all_faces(.Bedrock))
 	BLOCK_INFO[.Scorched] = cube(all_faces(.Scorched))
 	BLOCK_INFO[.Monolith] = cube(all_faces(.Monolith))
+	BLOCK_INFO[.Sandstone] = cube(all_faces(.Sandstone))
+	BLOCK_INFO[.Limestone] = cube(all_faces(.Limestone))
+	BLOCK_INFO[.Granite] = cube(all_faces(.Granite))
+	BLOCK_INFO[.Basalt] = cube(all_faces(.Basalt))
+	BLOCK_INFO[.Peridotite] = cube(all_faces(.Peridotite))
 	BLOCK_INFO[.Oak_Log] = cube(column_faces(.Oak_Log, .Oak_Log_Top, .Oak_Log_Top))
 	BLOCK_INFO[.Birch_Log] = cube(column_faces(.Birch_Log, .Birch_Log_Top, .Birch_Log_Top))
 	BLOCK_INFO[.Water] = {

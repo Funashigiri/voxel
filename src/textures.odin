@@ -30,6 +30,11 @@ Tex :: enum u8 {
 	Poppy,
 	Scorched,
 	Monolith,
+	Sandstone,
+	Limestone,
+	Granite,
+	Basalt,
+	Peridotite,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -300,6 +305,77 @@ gen_monolith :: proc() -> (img: Pixels) {
 	return
 }
 
+// Песчаник: тёпло-жёлтый, с тонкими горизонтальными прослойками.
+@(private = "file")
+gen_sandstone :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(176, 140, 92), rgb(190, 153, 101), rgb(201, 164, 110), rgb(210, 174, 119), rgb(219, 185, 129)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		layer := h(0, y, 130) * 0.5 + 0.5 * h(1, y / 2, 131)
+		n := 0.45 * layer + 0.35 * h(x, y, 132) + 0.2 * vn(x, y, 4, 133)
+		c := pick(pal, stretch(n, 0.15, 0.85))
+		if y % 5 == 0 && h(x, y, 134) < 0.7 do c = mix_rgb(c, rgb(150, 112, 70), 0.45)
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Известняк: светлый серо-кремовый, с редкими ракушками.
+@(private = "file")
+gen_limestone :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(170, 166, 150), rgb(182, 178, 162), rgb(192, 188, 172), rgb(200, 196, 181), rgb(208, 205, 190)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.55 * vn(x, y, 4, 140) + 0.45 * h(x, y, 141)
+		c := pick(pal, stretch(n, 0.15, 0.85))
+		if h(x, y, 142) < 0.04 do c = rgb(150, 144, 126) // ракушка
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Гранит: серо-розовый, в крапинку — светлые и тёмные кристаллы.
+@(private = "file")
+gen_granite :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(138, 118, 112), rgb(152, 130, 122), rgb(164, 141, 132), rgb(176, 152, 141)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.4 * vn(x, y, 4, 150) + 0.6 * h(x, y, 151)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		s := h(x, y, 152)
+		if s < 0.12 {
+			c = rgb(44, 40, 40) // тёмная слюда
+		} else if s > 0.9 {
+			c = rgb(222, 214, 206) // кварц
+		}
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Базальт: тёмно-серый, мелкозернистый (застывшая лава, кора океанов).
+@(private = "file")
+gen_basalt :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(40, 40, 43), rgb(48, 48, 51), rgb(56, 56, 60), rgb(64, 64, 68), rgb(72, 72, 76)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.6 * h(x, y, 160) + 0.4 * vn(x, y, 2, 161)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		if h(x, y, 162) < 0.03 do c = rgb(30, 30, 32) // пора
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Перидотит (порода мантии): тёмно-оливковый с зелёными кристаллами оливина.
+@(private = "file")
+gen_peridotite :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(58, 66, 44), rgb(68, 77, 50), rgb(78, 88, 56), rgb(88, 99, 62)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.5 * vn(x, y, 4, 170) + 0.5 * h(x, y, 171)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		if h(x, y, 172) > 0.88 do c = rgb(118, 150, 70) // оливин
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
 @(private = "file")
 gen_water :: proc(frame: int) -> (img: Pixels) {
 	pal := []RGBA{{38, 76, 184, 168}, {50, 94, 206, 168}, {66, 114, 222, 172}, {94, 142, 236, 178}}
@@ -373,6 +449,16 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_scorched()
 	case .Monolith:
 		return gen_monolith()
+	case .Sandstone:
+		return gen_sandstone()
+	case .Limestone:
+		return gen_limestone()
+	case .Granite:
+		return gen_granite()
+	case .Basalt:
+		return gen_basalt()
+	case .Peridotite:
+		return gen_peridotite()
 	case .Water:
 		return gen_water(0)
 	}

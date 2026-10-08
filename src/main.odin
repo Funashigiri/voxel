@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.011"
+VERSION :: "0.012"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -39,6 +39,7 @@ Options :: struct {
 	select:        int, // 1, 2 или 3 (оба)
 	water_spawn:   bool, // появиться над водой
 	mountain_spawn: bool, // появиться над горами
+	cliff_spawn:   bool, // у самого крутого обрыва (слои пород)
 	has_latlon:    bool, // высадка в заданной точке планеты
 	lat, lon:      f64,
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
@@ -125,7 +126,7 @@ parse_options :: proc() -> (o: Options) {
 		case "-nointro":
 			o.no_intro = true
 		case "-f3":
-			o.debug_page = val == "" ? 1 : clamp(strconv.parse_int(val) or_else 1, 1, 4)
+			o.debug_page = val == "" ? 1 : clamp(strconv.parse_int(val) or_else 1, 1, F3_PAGES)
 		case "-hours":
 			o.start_hours = max(0, strconv.parse_f64(val) or_else 0)
 		case "-sky":
@@ -141,6 +142,7 @@ parse_options :: proc() -> (o: Options) {
 		case "-spawn":
 			o.water_spawn = val == "water"
 			o.mountain_spawn = val == "mountain"
+			o.cliff_spawn = val == "cliff"
 		case "-latlon":
 			las, _, los := strings.partition(val, ",")
 			o.lat = strconv.parse_f64(las) or_else 40
@@ -197,8 +199,8 @@ spawn_area_ready :: proc(w: ^World, pos: [3]f64, radius: i32) -> bool {
 	cz := eng.floor_div(i32(math.floor(pos.z)), CHUNK_SIZE)
 	for dz in -radius ..= radius do for dx in -radius ..= radius {
 		if _, _, _, ok := world_resolve(w, (cx + dx) * CHUNK_SIZE, (cz + dz) * CHUNK_SIZE); !ok do continue // пустота у вершины
-		c := world_frame_chunk(w, cx + dx, cz + dz)
-		if c == nil || !c.meshed do return false
+		col := world_frame_column(w, cx + dx, cz + dz)
+		if col == nil || !col.covered do return false
 	}
 	return true
 }
@@ -264,6 +266,11 @@ main :: proc() {
 
 	// планета-шар реального размера: выбираем грань и точку высадки
 	geo := geo_make(home_planet(&system).radius_km)
+	// рельеф настоящего масштаба: доля океана мира, высота гор по силе тяжести
+	relief_init(opts.seed, geo.radius, system.home.gravity_g)
+	// строение планеты (кора, мантия, ядро) — по массе, радиусу и свету звезды
+	interior := interior_make(home_planet(&system).radius_km, home_planet(&system).mass_earth, system.home.gravity_g,
+		system.star.luminosity / (home_planet(&system).orbit_au * home_planet(&system).orbit_au))
 	lat, lon := system.home.latitude_deg, system.home.longitude_deg
 	if opts.has_latlon do lat, lon = opts.lat, opts.lon
 	site_x, site_z: f64
@@ -272,9 +279,13 @@ main :: proc() {
 	if opts.selftest {
 		checked, errors := frame_selftest(geo)
 		fmt.printfln("selftest: рёбра %d ошибок; смена кадра: %d точек, %d ошибок", geo_check_links(&geo), checked, errors)
-		ridge, diff, diff_max := far_selftest(opts.seed, &geo)
-		fmt.printfln("дальний рельеф: гребни (1−|шум|)² в среднем %.3f (заложено %.2f); от верха блоков в среднем %.2f м, наибольшее %.2f м",
-			ridge, RIDGE_MEAN, diff, diff_max)
+		ridge, diff, diff_max, ocean, h_lo, h_hi := far_selftest(opts.seed, &geo)
+		fmt.printfln("дальний рельеф: гребень одной октавы (1−|шум|)² в среднем %.3f (заложено %.2f); от верха блоков в среднем %.2f м, наибольшее %.2f м",
+			ridge, RIDGE1_MEAN, diff, diff_max)
+		fmt.printfln("рельеф: океан %.0f%% (задано %.0f%%), высоты от %.0f до %.0f м, горы ×%.2f (тяжесть %.2f g)",
+			ocean * 100, relief.ocean_frac * 100, h_lo, h_hi, relief.mountain_k, system.home.gravity_g)
+		fmt.printfln("недра: плотность %.2f г/см³, ядро %.0f км, в центре %.0f °C и %.0f ГПа, магнитное поле: %v",
+			interior.density, interior.core_km, interior.center_t, interior.center_p, interior.magnetic)
 		return
 	}
 	// тесты: высадка у ребра или у вершины; взгляд — в их сторону
@@ -338,6 +349,7 @@ main :: proc() {
 	clouds: Clouds
 	if !clouds_init(&clouds, opts.seed, system.home.gravity_g) do os.exit(1)
 	r.haze_height = f32(clamp(HAZE_HEIGHT / max(system.home.gravity_g, 0.1), 400, 6000))
+	r.seed = opts.seed
 	r.off_far = strings.contains(opts.off, "far")
 	r.off_clouds = strings.contains(opts.off, "clouds")
 	r.off_shadows = strings.contains(opts.off, "shadows")
@@ -347,6 +359,10 @@ main :: proc() {
 	spawn := find_spawn(&world, sx, sz)
 	if opts.water_spawn do spawn = find_water_spawn(&world, sx, sz)
 	if opts.mountain_spawn do spawn = find_mountain_spawn(&world, sx, sz)
+	if opts.cliff_spawn {
+		spawn, test_yaw = find_cliff_spawn(&world, sx, sz)
+		has_test_yaw = true
+	}
 	if opts.anomaly_dist > 0 || opts.edge_dist > 0 do spawn = spawn_at(&world, sx, sz)
 	for !spawn_area_ready(&world, spawn, 2) {
 		world_update(&world, spawn, 0.1)
@@ -436,6 +452,8 @@ main :: proc() {
 	last_fps: f64
 	bench_frames, bench_time: f64 // замер для отчёта: кадры после 3-й секунды
 	frame_ms: f64 = 16
+	around_time: f64 = -10
+	around: [2]f64
 
 	for !eng.window_should_close() {
 		eng.window_begin_frame()
@@ -457,7 +475,7 @@ main :: proc() {
 		}
 		if playing && eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
 		if eng.key_pressed(glfw.KEY_F2) do screenshot_requested = true
-		if eng.key_pressed(glfw.KEY_F3) do debug_page = (debug_page + 1) % 5 // страницы F3 по кругу, 0 — выкл
+		if eng.key_pressed(glfw.KEY_F3) do debug_page = (debug_page + 1) % (F3_PAGES + 1) // страницы F3 по кругу, 0 — выкл
 		if !star_sky.ready && sync.atomic_load(&star_sky.done) {
 			starsky_upload(&star_sky) // небо досчиталось
 			if opts.look_at == "core" {
@@ -561,6 +579,24 @@ main :: proc() {
 			cloud_over = cloud_alpha(cloud_density(&clouds, cloud_q(&clouds, up * (world.geo.radius + clouds.height))))
 		}
 		frame_ms += (dt * 1000 - frame_ms) * 0.05
+		// окрестности для F3: самая высокая и самая низкая точка в 40 км (раз в пару секунд)
+		if now - around_time > 2 {
+			around_time = now
+			around = {-1e9, 1e9}
+			up := geo_frame_dir(&world.geo, player.pos.x, player.pos.z)
+			t1 := [3]f64{-up.z, 0, up.x}
+			if t1.x * t1.x + t1.z * t1.z < 1e-6 do t1 = {1, 0, 0}
+			t1 /= math.sqrt(t1.x * t1.x + t1.y * t1.y + t1.z * t1.z)
+			t2 := [3]f64{up.y * t1.z - up.z * t1.y, up.z * t1.x - up.x * t1.z, up.x * t1.y - up.y * t1.x}
+			for ring in 0 ..< 8 do for k in 0 ..< 16 {
+				a := f64(k) / 16 * math.TAU
+				dist := f64(ring + 1) * 5000
+				d := up + (t1 * math.cos(a) + t2 * math.sin(a)) * (dist / world.geo.radius)
+				d /= math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
+				e := elevation(i64(opts.seed), d * world.geo.radius, 300)
+				around = {max(around.x, e), min(around.y, e)}
+			}
+		}
 
 		fbw, fbh := eng.win.fb_width, eng.win.fb_height
 		if fbw > 0 && fbh > 0 {
@@ -587,6 +623,8 @@ main :: proc() {
 				landing = &landing,
 				globe = &globe,
 				far = &far,
+				interior = &interior,
+				around = around,
 				clouds = &clouds,
 				cloud_shade = f32(cloud_shade),
 				cloud_over = cloud_over,

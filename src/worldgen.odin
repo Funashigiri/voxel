@@ -1,10 +1,11 @@
 package main
 
-// Генерация ландшафта: холмы, горы, пляжи, озёра, леса и трава.
+// Генерация мира: колонки (высоты, поверхность, деревья, свет неба, слои
+// пород) и секции 16×16×16 по ним. Рельеф — relief.odin.
 // Шум берётся в точке на шаре планеты (3D), а не на плоскости, поэтому рельеф
 // один и тот же, смотришь ли ты на него с земли или с орбиты.
 // Всё детерминировано от (seed, точки), поэтому деревья на границах
-// чанков совпадают без обмена данными между чанками.
+// секций и колонок совпадают без обмена данными.
 
 import "core:math"
 import "core:math/noise"
@@ -43,94 +44,29 @@ fbm_lod :: proc(seed: i64, p: [3]f64, scale: f64, octaves: int, cell: f64) -> f3
 	return sum / norm
 }
 
-// Доля амплитуды fbm, отброшенная при клетке cell (0 — все детали на месте).
-@(private = "file")
-fbm_lost :: proc(scale: f64, octaves: int, cell: f64) -> f32 {
-	lost, amp, norm: f32 = 0, 1, 0
-	wave := scale
-	for _ in 0 ..< octaves {
-		lost += amp * (1 - f32(clamp(wave / cell - 2, 0, 1)))
-		norm += amp
-		amp *= 0.5
-		wave *= 0.5
-	}
-	return lost / norm
-}
-
-// Крупный рельеф планеты: материки и океаны (тысячи км) и горные пояса (сотни км).
-// offset — сдвиг средней высоты (океан — сильно ниже уровня моря),
-// belt — насколько здесь горный край (0.3..1).
-planet_relief :: proc(seed: i64, p: [3]f64) -> (offset, belt: f32) {
-	macro := fbm(seed + 201, p, 1_800_000, 5)
-	regional := fbm(seed + 202, p, 160_000, 4)
-	land := macro + regional * 0.22 + 0.08
-	offset = clamp(land * 70, -38, 12)
-	belt = 0.3 + 0.7 * eng.smoothstep(0.05, 0.45, fbm(seed + 203, p, 400_000, 3))
-	return
-}
-
-// Высота поверхности в точке шара p (блоки от центра планеты).
-terrain_height :: proc(seed: i64, p: [3]f64) -> i32 {
-	offset, belt := planet_relief(seed, p)
-	cont := fbm(seed, p, 600, 3)
-	base := 66 + offset + cont * 14
-	hills := fbm(seed + 11, p, 140, 4) * (5 + 10 * clamp(cont + 0.3, 0, 1))
-	detail := fbm(seed + 23, p, 36, 2) * 1.8
-	mask := eng.smoothstep(0.2, 0.6, fbm(seed + 37, p, 420, 2)) * belt
-	ridge := 1 - abs(fbm(seed + 41, p, 110, 4))
-	mountains := mask * ridge * ridge * 46
-	return clamp(i32(math.floor(base + hills + detail + mountains)), 4, CHUNK_HEIGHT - 12)
-}
-
-// Высота поверхности для дальнего рельефа: непрерывная (без округления до
-// блока) и без деталей мельче клетки cell, м. Блоки — floor(v), их верх в
-// среднем на v + 0,5.
-terrain_height_lod :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
-	macro := fbm_lod(seed + 201, p, 1_800_000, 5, cell)
-	regional := fbm_lod(seed + 202, p, 160_000, 4, cell)
-	land := macro + regional * 0.22 + 0.08
-	offset := clamp(land * 70, -38, 12)
-	belt := 0.3 + 0.7 * eng.smoothstep(0.05, 0.45, fbm_lod(seed + 203, p, 400_000, 3, cell))
-	cont := fbm_lod(seed, p, 600, 3, cell)
-	base := 66 + offset + cont * 14
-	hills := fbm_lod(seed + 11, p, 140, 4, cell) * (5 + 10 * clamp(cont + 0.3, 0, 1))
-	detail := fbm_lod(seed + 23, p, 36, 2, cell) * 1.8
-	mask := eng.smoothstep(0.2, 0.6, fbm_lod(seed + 37, p, 420, 2, cell)) * belt
-	ridge := 1 - abs(fbm_lod(seed + 41, p, 110, 4, cell))
-	// гребни нелинейны: без мелких октав (1 − |x|)² ближе к 1, чем в среднем
-	// по настоящим гребням, — отброшенную часть заменяем средним значением
-	ridge2 := math.lerp(ridge * ridge, RIDGE_MEAN, fbm_lost(110, 4, cell))
-	mountains := mask * ridge2 * 46
-	return clamp(f64(base + hills + detail + mountains), 4, CHUNK_HEIGHT - 12)
-}
-
-// Среднее (1 − |шум|)² по горному гребню (проверяется в -selftest).
-RIDGE_MEAN :: 0.67
-
-// Самопроверка дальнего рельефа: среднее (1 − |шум|)² гребней и насколько
-// поверхность дальнего рельефа у границы с блоками (клетка 1,5 м) расходится
-// с верхом блоков.
-far_selftest :: proc(seed: u32, g: ^Planet_Geo) -> (ridge_mean, diff_mean, diff_max: f64) {
+// Самопроверка рельефа: среднее (1 − |шум|)² одной октавы, расхождение
+// дальнего рельефа (клетка 1,5 м) с верхом блоков, доля океана, крайние высоты.
+far_selftest :: proc(seed: u32, g: ^Planet_Geo) -> (ridge_mean, diff_mean, diff_max, ocean, h_lo, h_hi: f64) {
 	r := eng.rng_make(u64(seed) + 4242)
 	N :: 4000
 	s := i64(seed)
+	h_lo, h_hi = 1e9, -1e9
 	for _ in 0 ..< N {
 		d := [3]f64{eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1)}
 		d /= math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
 		p := d * g.radius
-		ridge := 1 - abs(f64(fbm(s + 41, p, 110, 4)))
-		ridge_mean += ridge * ridge
-		block_top := f64(terrain_height(s, p)) + 1
-		diff := abs(terrain_height_lod(s, p, 1.5) + 0.5 - block_top)
+		n := 1 - abs(f64(noise.noise_3d_improve_xz(s + 41, p / 110)))
+		ridge_mean += n * n
+		th := terrain_height(s, p)
+		diff := abs(terrain_height_lod(s, p, 1.5) + 0.5 - f64(th + 1))
 		diff_mean += diff
 		diff_max = max(diff_max, diff)
+		e := f64(th) + 1 - Y_SEA
+		if th < SEA_LEVEL do ocean += 1
+		h_lo = min(h_lo, e)
+		h_hi = max(h_hi, e)
 	}
-	return ridge_mean / N, diff_mean / N, diff_max
-}
-
-forest_density_lod :: proc(seed: i64, p: [3]f64, cell: f64) -> f32 {
-	f := fbm_lod(seed + 88, p, 220, 3, cell)
-	return 0.03 + 0.9 * eng.smoothstep(0.02, 0.35, f)
+	return ridge_mean / N, diff_mean / N, diff_max, ocean / N, h_lo, h_hi
 }
 
 surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32) -> (surface, filler: Block) {
@@ -141,56 +77,14 @@ surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32) -> (surface, filler: Bl
 		return .Dirt, .Dirt
 	}
 	if h <= SEA_LEVEL + 1 do return .Sand, .Sand
-	peak := 102 + i32(fbm(seed + 151, p, 30, 2) * 8)
-	if slope >= 4 || h >= peak do return .Stone, .Stone
+	// круто или выше границы скал — почвы нет, наружу выходят пласты (.Stone — метка, см. column_block)
+	if slope >= 3 || f64(h) + 1 - Y_SEA >= rock_line(seed, p, 0.5) do return .Stone, .Stone
 	return .Grass, .Dirt
-}
-
-forest_density :: proc(seed: i64, p: [3]f64) -> f32 {
-	f := fbm(seed + 88, p, 220, 3)
-	return 0.03 + 0.9 * eng.smoothstep(0.02, 0.35, f)
 }
 
 PAD :: 3
 @(private = "file")
 N :: CHUNK_SIZE + 2 * PAD
-
-@(private = "file")
-chunk_set :: proc(c: ^Chunk, x0, z0, wx, y, wz: i32, b: Block, force: bool) {
-	lx := wx - x0
-	lz := wz - z0
-	if lx < 0 || lz < 0 || lx >= CHUNK_SIZE || lz >= CHUNK_SIZE || y < 0 || y >= CHUNK_HEIGHT do return
-	i := block_index(lx, y, lz)
-	cur := c.blocks[i]
-	if force {
-		if cur == .Air || is_plant(cur) || BLOCK_INFO[cur].render == .Leaves do c.blocks[i] = b
-	} else if cur == .Air || is_plant(cur) {
-		c.blocks[i] = b
-	}
-}
-
-@(private = "file")
-place_tree :: proc(c: ^Chunk, x0, z0, tx, base, tz: i32, log, leaves: Block, height: i32, seed: u32) {
-	for dy in height - 3 ..= height {
-		y := base + dy
-		r: i32 = dy >= height - 1 ? 1 : 2
-		for dz in -r ..= r do for dx in -r ..= r {
-			if abs(dx) == r && abs(dz) == r {
-				if dy == height do continue
-				if eng.hash3f(tx + dx, y, tz + dz, seed) < 0.5 do continue
-			}
-			chunk_set(c, x0, z0, tx + dx, y, tz + dz, leaves, false)
-		}
-	}
-	for dy in 0 ..< height {
-		chunk_set(c, x0, z0, tx, base + dy, tz, log, true)
-	}
-	// под деревом трава превращается в землю
-	lx, lz := tx - x0, tz - z0
-	if lx >= 0 && lz >= 0 && lx < CHUNK_SIZE && lz < CHUNK_SIZE {
-		c.blocks[block_index(lx, base - 1, lz)] = .Dirt
-	}
-}
 
 MONOLITH_RADIUS :: 7.0 // столп в вершине куба-планеты
 
@@ -202,15 +96,23 @@ corner_dist :: proc(n, x, z: i32) -> f64 {
 	return math.sqrt(dx * dx + dz * dz)
 }
 
-generate_chunk :: proc(w: ^World, c: ^Chunk) {
+@(private = "file")
+smooth :: proc(e0, e1, x: f64) -> f64 {
+	t := clamp((x - e0) / (e1 - e0), 0, 1)
+	return t * t * (3 - 2 * t)
+}
+
+// Колонка: высоты с запасом PAD вокруг (уклоны, деревья соседей), поверхность,
+// деревья, свет неба, полоса поверхности и слои пород.
+generate_column :: proc(w: ^World, col: ^Column) {
 	seed := i64(w.seed)
 	useed := w.seed
-	face := c.key.face
+	face := col.key.face
 	n := w.geo.n
-	x0 := c.key.x * CHUNK_SIZE
-	z0 := c.key.z * CHUNK_SIZE
+	x0 := col.key.x * CHUNK_SIZE
+	z0 := col.key.z * CHUNK_SIZE
 
-	points: [N * N][3]f64 // точки шара для колонок (с запасом PAD вокруг чанка)
+	points: [N * N][3]f64
 	heights: [N * N]i32
 	for j in 0 ..< N do for i in 0 ..< N {
 		points[j * N + i] = geo_point(&w.geo, face, x0 + i32(i) - PAD, z0 + i32(j) - PAD)
@@ -225,55 +127,34 @@ generate_chunk :: proc(w: ^World, c: ^Chunk) {
 		return s
 	}
 
-	// колонки
-	for lz in 0 ..< i32(CHUNK_SIZE) do for lx in 0 ..< i32(CHUNK_SIZE) {
-		i := int(lx) + PAD
-		j := int(lz) + PAD
-		wx, wz := x0 + lx, z0 + lz
-		if corner_dist(n, wx, wz) < MONOLITH_RADIUS {
-			// вершина куба: столп сквозь всю планету
-			for y in i32(0) ..< CHUNK_HEIGHT do c.blocks[block_index(lx, y, lz)] = .Monolith
-			continue
-		}
-		p := points[j * N + i]
-		h := heights[j * N + i]
-		surface, filler := surface_for(seed, p, h, slope_at(&heights, i, j))
-		for y in 0 ..= h {
-			b := Block.Stone
-			if y == 0 {
-				b = .Bedrock
-			} else if y < 4 && eng.hash3f(wx, y, wz, useed ~ 0xBED) < 0.55 - f32(y) * 0.15 {
-				b = .Bedrock
-			} else if y == h {
-				b = surface
-			} else if y >= h - 3 {
-				b = filler
-			}
-			c.blocks[block_index(lx, y, lz)] = b
-		}
-		for y in h + 1 ..= SEA_LEVEL {
-			c.blocks[block_index(lx, y, lz)] = .Water
-		}
+	// столп в вершине куба — над землёй у вершины
+	corner, _ := nearest_anomaly(points[(PAD + 8) * N + PAD + 8] / w.geo.radius)
+	pillar_top := anomaly_ground(w.seed, w.geo.radius, corner) + MONOLITH_ABOVE
 
-		// трава и цветы
-		if surface == .Grass {
-			r := eng.hash2f(wx, wz, useed + 101)
-			grassy := 0.5 + 0.5 * fbm(seed + 55, p, 48, 2)
-			plant := Block.Air
-			if r < 0.03 + 0.32 * grassy {
-				plant = .Tall_Grass
-			} else {
-				patch := fbm(seed + 66, p, 20, 1)
-				f := eng.hash2f(wx, wz, useed + 102)
-				if (patch > 0.55 && f < 0.12) || f < 0.003 {
-					plant = fbm(seed + 77, p, 60, 1) > 0 ? .Dandelion : .Poppy
-				}
-			}
-			if plant != .Air do c.blocks[block_index(lx, h + 1, lz)] = plant
+	col.lo, col.hi = max(i32), min(i32)
+	for lz in 0 ..< i32(CHUNK_SIZE) do for lx in 0 ..< i32(CHUNK_SIZE) {
+		i := int(lz * CHUNK_SIZE + lx)
+		pi, pj := int(lx) + PAD, int(lz) + PAD
+		h := heights[pj * N + pi]
+		col.points[i] = points[pj * N + pi]
+		if corner_dist(n, x0 + lx, z0 + lz) < MONOLITH_RADIUS {
+			col.monolith[i] = true
+			col.height[i] = pillar_top
+			col.surface[i], col.filler[i] = .Monolith, .Monolith
+		} else {
+			col.height[i] = h
+			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj))
 		}
+		col.sky[i] = col.height[i] + 1
+		if col.height[i] < SEA_LEVEL {
+			col.water = true
+			col.sky[i] = SEA_LEVEL + 1 // вода гасит свет неба
+		}
+		col.lo = min(col.lo, col.height[i] - 4)
+		col.hi = max(col.hi, col.height[i] + 1) // +1 — трава и цветы
 	}
 
-	// деревья (в том числе из соседних чанков, чья листва заходит сюда)
+	// деревья (в том числе из соседних колонок, чья листва заходит сюда)
 	TREE_CELL :: 5
 	gx0 := eng.floor_div(x0 - PAD, TREE_CELL)
 	gx1 := eng.floor_div(x0 + CHUNK_SIZE + PAD - 1, TREE_CELL)
@@ -290,42 +171,161 @@ generate_chunk :: proc(w: ^World, c: ^Chunk) {
 		if tx < 3 || tz < 3 || tx > n - 4 || tz > n - 4 do continue
 		if corner_dist(n, tx, tz) < MONOLITH_RADIUS + 4 do continue
 		tp := points[j * N + i]
-		if eng.hash2f(gx, gz, useed + 501) > forest_density(seed, tp) do continue
 		h := heights[j * N + i]
+		if eng.hash2f(gx, gz, useed + 501) > forest_density(seed, tp, f64(h) + 1 - Y_SEA) do continue
 		slope := slope_at(&heights, i, j)
 		surface, _ := surface_for(seed, tp, h, slope)
 		if surface != .Grass || slope > 2 do continue
-
+		if col.tree_n >= MAX_COL_TREES do break
 		birch := fbm(seed + 99, tp, 160, 2) > 0.2 || eng.hash2f(gx, gz, useed + 502) < 0.12
-		height := i32(4 + (hsh >> 16) % 3)
-		if birch {
-			place_tree(c, x0, z0, tx, h + 1, tz, .Birch_Log, .Birch_Leaves, height + 1, useed + 503)
-		} else {
-			place_tree(c, x0, z0, tx, h + 1, tz, .Oak_Log, .Oak_Leaves, height, useed + 503)
-		}
+		height := i32(4 + (hsh >> 16) % 3) + (birch ? 1 : 0)
+		col.trees[col.tree_n] = {tx, tz, h + 1, height, birch}
+		col.tree_n += 1
+	}
+	// свет неба и полоса поверхности — с листвой и стволами
+	for t in col.trees[:col.tree_n] {
+		tree_blocks(t, useed, col, proc(col: ^Column, wx, y, wz: i32, b: Block, x0, z0: i32) {
+			lx, lz := wx - x0, wz - z0
+			if lx < 0 || lz < 0 || lx >= CHUNK_SIZE || lz >= CHUNK_SIZE do return
+			i := lz * CHUNK_SIZE + lx
+			col.sky[i] = max(col.sky[i], y + 1)
+			col.hi = max(col.hi, y)
+		}, x0, z0)
 	}
 
-	chunk_update_light(c)
+	// недра: осадочные слои (толще в низинах и под морем, тоньше в горах),
+	// под ними кора — гранит материков или базальт океанов, глубже — мантия
+	alt_c := f64(heights[(PAD + 8) * N + PAD + 8]) + 1 - Y_SEA
+	col.oceanic = alt_c < -300
+	crust := col.oceanic ? 7000 * relief.depth_k : 35000 * relief.depth_k + 5.6 * max(alt_c, 0)
+	col.moho = SEA_LEVEL - i32(crust)
+	// толщина и сдвиг слоёв — по углам колонки, между ними плавно (без ступенек на стыках)
+	corner_sed, corner_warp: [2][2]f64
+	for b in 0 ..= 1 do for a in 0 ..= 1 {
+		k := (PAD + b * (CHUNK_SIZE - 1)) * N + PAD + a * (CHUNK_SIZE - 1)
+		p := points[k]
+		alt := f64(heights[k]) + 1 - Y_SEA
+		v := 0.5 + 0.5 * f64(fbm(seed + 341, p, 40_000, 2))
+		// высокие горы — без осадочных слоёв (смыты): наружу выходит гранит
+		corner_sed[b][a] = alt < -300 ? 250 + 150 * v : (30 + 450 * (1 - smooth(200, 1500, alt))) * (0.4 + 0.6 * v) * (1 - smooth(1500, 2500, alt))
+		corner_warp[b][a] = f64(fbm(seed + 340, p, 20_000, 2)) * 40
+	}
+	for lz in 0 ..< CHUNK_SIZE do for lx in 0 ..< CHUNK_SIZE {
+		u, v := f64(lx) / (CHUNK_SIZE - 1), f64(lz) / (CHUNK_SIZE - 1)
+		bil :: proc(c: [2][2]f64, u, v: f64) -> f64 {
+			return (c[0][0] * (1 - u) + c[0][1] * u) * (1 - v) + (c[1][0] * (1 - u) + c[1][1] * u) * v
+		}
+		col.sed[lz * CHUNK_SIZE + lx] = f32(bil(corner_sed, u, v))
+		col.warp[lz * CHUNK_SIZE + lx] = f32(bil(corner_warp, u, v))
+	}
 }
 
-// Карта высот для небесного света + верхняя граница непустых блоков.
-chunk_update_light :: proc(c: ^Chunk) {
-	c.max_y = 0
-	for lz in 0 ..< i32(CHUNK_SIZE) do for lx in 0 ..< i32(CHUNK_SIZE) {
-		lh: i32 = 0
-		top: i32 = 0
-		for y := i32(CHUNK_HEIGHT - 1); y >= 0; y -= 1 {
-			b := c.blocks[block_index(lx, y, lz)]
-			if b == .Air do continue
-			if top == 0 do top = y
-			if BLOCK_INFO[b].blocks_light {
-				lh = y + 1
-				break
+// Блоки дерева (ствол и листва) — для света неба (колонка) и для секций.
+tree_blocks :: proc(t: Tree, seed: u32, data: ^$T, put: proc(data: ^T, wx, y, wz: i32, b: Block, x0, z0: i32), x0, z0: i32) {
+	log: Block = t.birch ? .Birch_Log : .Oak_Log
+	leaves: Block = t.birch ? .Birch_Leaves : .Oak_Leaves
+	for dy in t.height - 3 ..= t.height {
+		y := t.base + dy
+		r: i32 = dy >= t.height - 1 ? 1 : 2
+		for dz in -r ..= r do for dx in -r ..= r {
+			if abs(dx) == r && abs(dz) == r {
+				if dy == t.height do continue
+				if eng.hash3f(t.x + dx, y, t.z + dz, seed + 503) < 0.5 do continue
+			}
+			put(data, t.x + dx, y, t.z + dz, leaves, x0, z0)
+		}
+	}
+	for dy in 0 ..< t.height do put(data, t.x, t.base + dy, t.z, log, x0, z0)
+}
+
+// Порода на глубине: осадочные слои полосами, под ними кора, глубже мантия.
+@(private = "file")
+strata :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
+	depth := f32(col.height[i] - y)
+	if depth < col.sed[i] {
+		// пласты горизонтальны (слегка наклонены): полосы песчаника и известняка
+		band := i32(math.floor((f32(y) + col.warp[i]) / 7))
+		return eng.hash2(band, 0, seed + 77) % 3 == 0 ? .Limestone : .Sandstone
+	}
+	if y < col.moho do return .Peridotite
+	return col.oceanic ? .Basalt : .Granite
+}
+
+// Блок колонки на высоте y (без деревьев и растений).
+column_block :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
+	h := col.height[i]
+	if y > h do return y <= SEA_LEVEL ? .Water : .Air
+	if col.monolith[i] do return .Monolith
+	if col.surface[i] == .Stone do return strata(col, i, y, seed) // голая скала: сразу пласты
+	if y == h do return col.surface[i]
+	if y >= h - 3 do return col.filler[i]
+	return strata(col, i, y, seed)
+}
+
+@(private = "file")
+Section_Gen :: struct {
+	c:      ^Chunk,
+	y0:     i32,
+}
+
+generate_section :: proc(w: ^World, col: ^Column, c: ^Chunk) {
+	useed := w.seed
+	seed := i64(w.seed)
+	y0 := c.key.y * CHUNK_SIZE
+	x0 := c.key.x * CHUNK_SIZE
+	z0 := c.key.z * CHUNK_SIZE
+	c.blocks = new([CHUNK_VOLUME]Block)
+	for lz in i32(0) ..< CHUNK_SIZE do for lx in i32(0) ..< CHUNK_SIZE {
+		i := int(lz * CHUNK_SIZE + lx)
+		for ly in i32(0) ..< CHUNK_SIZE {
+			c.blocks[block_index(lx, ly, lz)] = column_block(col, i, y0 + ly, useed)
+		}
+		// трава и цветы
+		h := col.height[i]
+		if col.surface[i] != .Grass || h + 1 < y0 || h + 1 >= y0 + CHUNK_SIZE do continue
+		wx, wz := x0 + lx, z0 + lz
+		p := col.points[i]
+		r := eng.hash2f(wx, wz, useed + 101)
+		grassy := 0.5 + 0.5 * fbm(seed + 55, p, 48, 2)
+		plant := Block.Air
+		if r < 0.03 + 0.32 * grassy {
+			plant = .Tall_Grass
+		} else {
+			patch := fbm(seed + 66, p, 20, 1)
+			f := eng.hash2f(wx, wz, useed + 102)
+			if (patch > 0.55 && f < 0.12) || f < 0.003 {
+				plant = fbm(seed + 77, p, 60, 1) > 0 ? .Dandelion : .Poppy
 			}
 		}
-		c.light_height[lz * CHUNK_SIZE + lx] = u8(lh)
-		c.max_y = max(c.max_y, top)
+		if plant != .Air do c.blocks[block_index(lx, h + 1 - y0, lz)] = plant
 	}
+
+	// деревья (обрезаны по высоте секции и границам колонки)
+	gen := Section_Gen{c, y0}
+	for t in col.trees[:col.tree_n] {
+		if t.base + t.height < y0 || t.base > y0 + CHUNK_SIZE do continue
+		tree_blocks(t, useed, &gen, proc(g: ^Section_Gen, wx, y, wz: i32, b: Block, x0, z0: i32) {
+			lx, ly, lz := wx - x0, y - g.y0, wz - z0
+			if lx < 0 || lz < 0 || ly < 0 || lx >= CHUNK_SIZE || lz >= CHUNK_SIZE || ly >= CHUNK_SIZE do return
+			i := block_index(lx, ly, lz)
+			cur := g.c.blocks[i]
+			is_log := b == .Oak_Log || b == .Birch_Log
+			if cur == .Air || is_plant(cur) || (is_log && BLOCK_INFO[cur].render == .Leaves) do g.c.blocks[i] = b
+		}, x0, z0)
+		// под деревом трава превращается в землю
+		lx, lz := t.x - x0, t.z - z0
+		ly := t.base - 1 - y0
+		if lx >= 0 && lz >= 0 && lx < CHUNK_SIZE && lz < CHUNK_SIZE && ly >= 0 && ly < CHUNK_SIZE {
+			c.blocks[block_index(lx, ly, lz)] = .Dirt
+		}
+	}
+
+	// однородная секция (воздух, вода, сплошная порода) — без массива
+	first := c.blocks[0]
+	for b in c.blocks do if b != first do return
+	free(c.blocks)
+	c.blocks = nil
+	c.fill = first
 }
 
 // Высота и уклон колонки (для поиска места появления).
@@ -382,16 +382,51 @@ find_water_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
 	return find_spawn(w, cx, cz)
 }
 
-// Отладка: точка в горах недалеко от (cx, cz) — для проверки посадки на склоны.
-find_mountain_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
-	for r := i32(0); r < 2000; r += 6 {
-		for dz := -r; dz <= r; dz += 6 {
-			for dx := -r; dx <= r; dx += 6 {
-				if max(abs(dx), abs(dz)) != r do continue
-				h := terrain_height(i64(w.seed), geo_point(&w.geo, w.geo.face, cx + dx, cz + dz))
-				if h >= 92 do return {f64(cx + dx) + 0.5, f64(h) + 1, f64(cz + dz) + 0.5}
+// Отладка: самый крутой обрыв в радиусе 3 км от (cx, cz) — встаём у подножия
+// в 14 блоках от него и смотрим на него (слои пород в стене).
+find_cliff_spawn :: proc(w: ^World, cx, cz: i32) -> (pos: [3]f64, yaw: f32) {
+	s := i64(w.seed)
+	h_at :: proc(w: ^World, s: i64, x, z: i32) -> i32 {
+		return terrain_height(s, geo_point(&w.geo, w.geo.face, x, z))
+	}
+	best := i32(-1)
+	at: [2]i32
+	dir: [2]i32
+	for dz := i32(-3000); dz <= 3000; dz += 12 do for dx := i32(-3000); dx <= 3000; dx += 12 {
+		x, z := cx + dx, cz + dz
+		if _, _, _, ok := world_resolve(w, x, z); !ok do continue
+		h := h_at(w, s, x, z)
+		if h < SEA_LEVEL + 2 || h > SEA_LEVEL + 1500 do continue // до 1,5 км — там пласты осадочных пород
+		for d in ([4][2]i32{{8, 0}, {-8, 0}, {0, 8}, {0, -8}}) {
+			if diff := h_at(w, s, x + d.x, z + d.y) - h; diff > best {
+				best, at, dir = diff, {x, z}, d / 8
 			}
 		}
 	}
-	return find_spawn(w, cx, cz)
+	if best < 0 do return find_spawn(w, cx, cz), 0 // обрывов нет — обычная точка
+	foot := at - dir * 14
+	pos = {f64(foot.x) + 0.5, f64(h_at(w, s, foot.x, foot.y)) + 1, f64(foot.y) + 0.5}
+	return pos, f32(math.atan2(-f64(dir.x), f64(dir.y)))
+}
+
+// Отладка: самая высокая точка в радиусе 30 км от (cx, cz) — вид с горы.
+find_mountain_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
+	best_h := min(i32)
+	best: [2]i32 = {cx, cz}
+	search :: proc(w: ^World, best: ^[2]i32, best_h: ^i32, cx, cz, r, step: i32) {
+		for dz := -r; dz <= r; dz += step do for dx := -r; dx <= r; dx += step {
+			if dx * dx + dz * dz > r * r do continue
+			if _, _, _, ok := world_resolve(w, cx + dx, cz + dz); !ok do continue
+			h := terrain_height(i64(w.seed), geo_point(&w.geo, w.geo.face, cx + dx, cz + dz))
+			if h > best_h^ {
+				best_h^ = h
+				best^ = {cx + dx, cz + dz}
+			}
+		}
+	}
+	search(w, &best, &best_h, cx, cz, 30_000, 200)
+	// уточняем вершину вокруг лучшей точки
+	search(w, &best, &best_h, best.x, best.y, 300, 10)
+	search(w, &best, &best_h, best.x, best.y, 16, 1)
+	return {f64(best.x) + 0.5, f64(best_h) + 1, f64(best.y) + 0.5}
 }

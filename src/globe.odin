@@ -62,18 +62,18 @@ mix3 :: proc(a, b: [3]f32, t: f32) -> [3]f32 {return a + (b - a) * clamp(t, 0, 1
 // Цвет точки планеты по крупному рельефу (мелкий рельеф с орбиты не виден).
 @(private = "file")
 globe_color :: proc(seed: i64, g: ^Planet_Geo, dir: [3]f64) -> [3]f32 {
-	p := dir * g.radius
-	offset, belt := planet_relief(seed, p)
-	level := 66 + offset
+	alt := f32(elevation(seed, dir * g.radius, 150_000))
 	lat := abs(math.to_degrees(math.asin(clamp(dir.y, -1, 1))))
 	wobble := f32(math.sin(dir.x * 9 + dir.z * 5) * 3)
 	if f32(lat) > 68 + wobble do return {0.9, 0.94, 1.0} // полярная шапка
-	if level < SEA_LEVEL - 1 {
-		return mix3({0.2, 0.45, 0.78}, {0.06, 0.15, 0.4}, (SEA_LEVEL - level) / 30)
+	if alt < 0 {
+		// мелководье светлее, глубины — тёмно-синие
+		return mix3({0.22, 0.5, 0.8}, {0.04, 0.12, 0.36}, -alt / 4000)
 	}
-	if level < SEA_LEVEL + 2 do return {0.72, 0.7, 0.5}
+	if alt < 40 do return {0.72, 0.7, 0.5}
 	green := mix3({0.36, 0.58, 0.24}, {0.2, 0.4, 0.15}, f32(lat) / 60)
-	return mix3(green, {0.5, 0.46, 0.42}, (belt - 0.55) * 2.2) // горы — серо-коричневые
+	c := mix3(green, {0.5, 0.46, 0.42}, (alt - 800) / 1800) // горы — серо-коричневые
+	return mix3(c, {0.66, 0.64, 0.62}, (alt - 3000) / 2000) // высокие — светлее
 }
 
 globe_create :: proc(g: ^Planet_Geo, seed: u32) -> (gl_: Globe, ok: bool) {

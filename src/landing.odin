@@ -121,25 +121,27 @@ is_foliage :: proc(b: Block) -> bool {
 
 // Верх земли под точкой (без листвы, брёвен, травы и воды), ищем от y вниз.
 @(private = "file")
-terrain_top :: proc(w: ^World, x, z: i32, from_y: i32) -> i32 {
-	for y := min(from_y, CHUNK_HEIGHT - 1); y > 0; y -= 1 {
+// stop_at_water — над водой вернуть её поверхность (высота полёта над морем, а не над дном).
+terrain_top :: proc(w: ^World, x, z: i32, from_y: i32, stop_at_water := false) -> i32 {
+	for y := from_y; y > from_y - 12000; y -= 1 {
 		b, loaded := world_get_block(w, x, y, z)
 		if !loaded do return y // незагруженное — считаем землёй
+		if b == .Water && stop_at_water do return y
 		if b == .Air || b == .Water || is_foliage(b) do continue
 		return y
 	}
-	return 0
+	return from_y - 12000
 }
 
 // Уровень земли под капсулой (самая высокая точка под её основанием).
 @(private = "file")
-ground_under :: proc(w: ^World, pos: [3]f64) -> f64 {
-	top: i32 = 0
+ground_under :: proc(w: ^World, pos: [3]f64, stop_at_water := false) -> f64 {
+	top := min(i32) / 2
 	from := i32(math.floor(pos.y))
 	for dz in ([2]f64{-0.8, 0.8}) do for dx in ([2]f64{-0.8, 0.8}) {
-		top = max(top, terrain_top(w, i32(math.floor(pos.x + dx)), i32(math.floor(pos.z + dz)), from))
+		top = max(top, terrain_top(w, i32(math.floor(pos.x + dx)), i32(math.floor(pos.z + dz)), from, stop_at_water))
 	}
-	top = max(top, terrain_top(w, i32(math.floor(pos.x)), i32(math.floor(pos.z)), from))
+	top = max(top, terrain_top(w, i32(math.floor(pos.x)), i32(math.floor(pos.z)), from, stop_at_water))
 	return f64(top + 1)
 }
 
@@ -415,7 +417,7 @@ update_pod :: proc(l: ^Landing, pod: ^Pod, i: int, w: ^World, drift: [3]f64, cam
 			}
 		}
 
-		pod.ground_y = ground_under(w, pod.pos)
+		pod.ground_y = ground_under(w, pod.pos, !pod.splashed) // до воды — над её поверхностью, в воде — до дна
 		alt := pod.pos.y - pod.ground_y
 
 		// парашют: пытается раскрыться, держит пару секунд — и его срывает

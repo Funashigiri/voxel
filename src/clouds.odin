@@ -177,8 +177,8 @@ cloud_alpha :: proc(d: f64) -> f64 {
 // над уровнем моря) при солнце в направлении sun (как cloud_shadow в шейдерах).
 cloud_shadow_at :: proc(c: ^Clouds, p, up, sun: [3]f64, h: f64) -> f64 {
 	sy := sun.x * up.x + sun.y * up.y + sun.z * up.z
-	if sy <= 0 do return 1
-	t := max(c.height - h, 0) / max(sy, 0.05) // до слоя облаков по лучу к солнцу
+	if sy <= 0 || h > c.height do return 1 // выше облаков — тени нет
+	t := (c.height - h) / max(sy, 0.05) // до слоя облаков по лучу к солнцу
 	a := cloud_alpha(cloud_density(c, cloud_q(c, p + sun * t), 3)) * smooth01(sy / 0.1)
 	return 1 - CLOUD_SHADOW * a
 }
@@ -191,15 +191,16 @@ smooth01 :: proc(x: f64) -> f64 {
 
 // ---- отрисовка
 
-// Купол облаков вокруг камеры (в дальнем проходе, после рельефа).
+// Купол облаков вокруг камеры (в дальнем проходе, после рельефа). Камера
+// под облаками — купол над ней до горизонта облаков; над облаками (высокая
+// гора) — море облаков внизу, до их горизонта.
 clouds_draw :: proc(c: ^Clouds, pv: ^Planet_View, view_proj: eng.Mat4) {
 	R := pv.radius
 	rc := R + pv.cam_h
 	Rc := R + c.height
-	above := Rc - rc // облака над камерой, м
-	if above < 20 do return // над облаками (полёты — позже)
-	// край купола — горизонт облаков, видимый с высоты камеры
-	s_max := math.sqrt(max(rc * rc - R * R, 0)) + math.sqrt(Rc * Rc - R * R)
+	above := Rc - rc // облака над камерой, м (меньше нуля — под ней)
+	if abs(above) < 20 do return // внутри слоя
+	s_max := above > 0 ? math.sqrt(max(rc * rc - R * R, 0)) + math.sqrt(Rc * Rc - R * R) : math.sqrt(rc * rc - Rc * Rc)
 	gl.UseProgram(c.prog)
 	eng.set_mat4(c.u.view_proj, view_proj)
 	jinv: matrix[3, 3]f32
@@ -213,8 +214,8 @@ clouds_draw :: proc(c: ^Clouds, pv: ^Planet_View, view_proj: eng.Mat4) {
 	}
 	gl.UniformMatrix3fv(c.u.e, 1, false, &e[0, 0])
 	eng.set_f32(c.u.logk, f32(2 / math.log2(FAR_LOG_FAR + 1)))
-	theta_max := math.atan2(s_max, above)
-	eng.set_vec4(c.u.geom, {f32(above), f32(Rc), f32(theta_max), 0})
+	theta_max := math.atan2(s_max, abs(above))
+	eng.set_vec4(c.u.geom, {f32(above), f32(Rc), f32(theta_max), above > 0 ? 0 : 1})
 	q := cloud_q(c, pv.pc)
 	eng.set_vec3(c.u.pcs, {f32(q.x), f32(q.y), f32(q.z)})
 	gl.BindVertexArray(c.vao)

@@ -107,13 +107,14 @@ lon_text :: proc(lon: f64) -> string {
 	return lon <= 180 ? fmt.tprintf("%.1f° в.д.", lon) : fmt.tprintf("%.1f° з.д.", 360 - lon)
 }
 
-PAGE_TITLES := [5]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо"}
+PAGE_TITLES := [F3_PAGES + 1]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо", "строение планеты"}
+F3_PAGES :: 5
 
 // Шапка любой страницы F3.
 @(private = "file")
 page_header :: proc(p: ^Panel, fp: ^Frame_Params) {
 	panel_line(p, WHITE, fmt.tprintf("Voxel %s  —  %d FPS", VERSION, int(fp.fps + 0.5)))
-	panel_line(p, GRAY, fmt.tprintf("F3: страница %d/4 — %s", fp.debug_page, PAGE_TITLES[fp.debug_page]))
+	panel_line(p, GRAY, fmt.tprintf("F3: страница %d/%d — %s", fp.debug_page, F3_PAGES, PAGE_TITLES[fp.debug_page]))
 	panel_gap(p)
 }
 
@@ -128,7 +129,7 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 	home := &s.home
 
 	panel_line(p, WHITE, fmt.tprintf("XYZ: %.2f / %.2f / %.2f", player.pos.x, player.pos.y, player.pos.z))
-	panel_line(p, WHITE, fmt.tprintf("Чанков: %d видно, %d загружено", fp.chunks_drawn, len(w.chunks)))
+	panel_line(p, WHITE, fmt.tprintf("Секций 16³: %d видно, %d загружено; колонок %d", fp.chunks_drawn, len(w.chunks), len(w.columns)))
 	panel_line(p, WHITE, fmt.tprintf("Зерно мира: %d", s.seed))
 	panel_gap(p)
 
@@ -175,7 +176,10 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 	panel_line(p, WHITE, fmt.tprintf("грань куба: %s, до ребра %s", FACE_NAMES[geo.face], dist_text(geo_edge_dist(geo, player.pos.x, player.pos.z))))
 	_, _, anomaly := geo_nearest_corner(geo, player.pos.x, player.pos.z)
 	panel_line(p, anomaly < ANOMALY_RADIUS ? VIOLET : WHITE, fmt.tprintf("до аномалии (вершины куба): %s", dist_text(anomaly)))
-	panel_line(p, WHITE, fmt.tprintf("над уровнем моря: %.0f м; окружность планеты %.0f км", player.pos.y - (SEA_LEVEL + 1), 2 * 3.14159265 * geo.radius / 1000))
+	panel_line(p, WHITE, fmt.tprintf("над уровнем моря: %.0f м; окружность планеты %.0f км", player.pos.y - Y_SEA, 2 * 3.14159265 * geo.radius / 1000))
+	around := fp.around.y < 0 ? fmt.tprintf(", самое глубокое место %.0f м", -fp.around.y) : ""
+	panel_line(p, WHITE, fmt.tprintf("вокруг (до 40 км): самая высокая точка %.0f м%s; океан мира — %.0f%% поверхности",
+		fp.around.x, around, relief.ocean_frac * 100))
 }
 
 // Страница 2: звезда, планеты, луны.
@@ -329,6 +333,63 @@ page_sky :: proc(p: ^Panel, fp: ^Frame_Params) {
 	p.cols = nil
 }
 
+@(private = "file")
+INTERIOR_COLS := [?]f32{0, 96, 168, 262, 344}
+
+// Температура целыми градусами, без «−0».
+@(private = "file")
+celsius :: proc(t: f64) -> string {
+	r := math.round(t)
+	return fmt.tprintf("%.0f", r == 0 ? 0 : r)
+}
+
+// Страница 5: строение планеты — слои, температуры, давление; что под ногами.
+@(private = "file")
+page_interior :: proc(p: ^Panel, fp: ^Frame_Params) {
+	pi := fp.interior
+	if pi == nil do return
+	hp := home_planet(fp.system)
+	panel_line(p, GOLD, fmt.tprintf("Строение планеты %s", hp.name))
+	panel_line(p, WHITE, fmt.tprintf("средняя плотность %.2f г/см³ (Земля — %.2f): ядро из железа радиусом %.0f км (%.0f%% радиуса)",
+		pi.density, EARTH_DENSITY, pi.core_km, pi.core_km / hp.radius_km * 100))
+	panel_gap(p)
+	p.cols = INTERIOR_COLS[:]
+	panel_line(p, GRAY, "слой", "глубина, км", "температура, °C", "давление, ГПа", "состояние")
+	gpa :: proc(p: f64) -> string {return p < 10 ? fmt.tprintf("%.1f", p) : fmt.tprintf("%.0f", p)}
+	for l in pi.layers[:pi.n] {
+		state := l.liquid ? "жидкое" : l.name == "мантия" ? "твёрдая, текучая" : "твёрдое"
+		if l.name == "кора материков" || l.name == "кора океанов" do state = "твёрдая"
+		panel_line(p, l.liquid ? GOLD : WHITE, l.name, fmt.tprintf("%.0f–%.0f", l.top_km, l.bottom_km),
+			fmt.tprintf("%s → %s", celsius(l.t_top), celsius(l.t_bottom)), fmt.tprintf("%s → %s", gpa(l.p_top), gpa(l.p_bottom)), state)
+	}
+	p.cols = nil
+	if pi.magnetic {
+		panel_line(p, WHITE, "магнитное поле: есть (жидкое внешнее ядро вокруг твёрдого — динамо)")
+	} else {
+		panel_line(p, WHITE, "магнитного поля нет (ядро не даёт динамо)")
+	}
+	panel_line(p, GRAY, fmt.tprintf("кора под горами толще (корни гор); в центре %.0f °C и %.0f ГПа", pi.center_t, pi.center_p))
+	panel_gap(p)
+
+	// здесь: высота, порода, прогрев вглубь
+	player := fp.player
+	alt := player.pos.y - Y_SEA
+	px, pz := i32(math.floor(player.pos.x)), i32(math.floor(player.pos.z))
+	under: Block = .Air
+	for y := i32(math.floor(player.pos.y)) - 1; y > i32(math.floor(player.pos.y)) - 8; y -= 1 {
+		b, _ := world_get_block(fp.world, px, y, pz)
+		if BLOCK_INFO[b].solid || b == .Water {
+			under = b
+			break
+		}
+	}
+	panel_line(p, GOLD, fmt.tprintf("Здесь: %s над уровнем моря %.0f м, под ногами — %s", alt >= 0 ? "высота" : "глубина", abs(alt), BLOCK_NAMES[under]))
+	panel_line(p, WHITE, fmt.tprintf("порода прогрета: в шахте на 100 м — %s °C, на 1 км — %s °C, на 10 км — %s °C",
+		celsius(rock_temperature(pi, alt, 100)), celsius(rock_temperature(pi, alt, 1000)), celsius(rock_temperature(pi, alt, 10000))))
+	panel_line(p, WHITE, fmt.tprintf("средняя температура поверхности планеты (по свету звезды): ~%s °C", celsius(pi.surface_c)))
+	panel_line(p, GRAY, "блоками мир идёт сквозь кору на сотни км вглубь; глубже — только эта модель")
+}
+
 // Рисует весь текстовый интерфейс (вызывать с включённым смешиванием).
 hud_draw :: proc(fp: ^Frame_Params) {
 	ortho := linalg.matrix_ortho3d_f32(0, f32(fp.width), f32(fp.height), 0, -1, 1)
@@ -346,6 +407,8 @@ hud_draw :: proc(fp: ^Frame_Params) {
 			page_universe(&p, fp)
 		case 4:
 			page_sky(&p, fp)
+		case 5:
+			page_interior(&p, fp)
 		}
 	}
 	eng.imm_flush(ortho)

@@ -29,11 +29,11 @@ Chunk_Mesh :: struct {
 @(private = "file")
 P :: CHUNK_SIZE + 2
 
-// Блоки чанка с бортиком в 1 блок из соседних чанков.
+// Блоки секции с бортиком в 1 блок из соседних секций (сверху и снизу тоже).
 @(private = "file")
 Padded :: struct {
-	blocks:  [P * P * CHUNK_HEIGHT]Block,
-	light_h: [P * P]u8,
+	blocks:  [P * P * P]Block,
+	light_h: [P * P]i32, // свет неба: первый y (от низа секции), куда он достаёт
 }
 
 @(private = "file")
@@ -73,13 +73,11 @@ QUAD_UV := [4][2]u8{{0, 16}, {16, 16}, {16, 0}, {0, 0}}
 
 @(private = "file")
 pidx :: #force_inline proc "contextless" (x, y, z: i32) -> i32 {
-	return (y * P + (z + 1)) * P + (x + 1)
+	return ((y + 1) * P + (z + 1)) * P + (x + 1)
 }
 
 @(private = "file")
 pb :: #force_inline proc "contextless" (p: ^Padded, x, y, z: i32) -> Block {
-	if y < 0 do return .Bedrock
-	if y >= CHUNK_HEIGHT do return .Air
 	return p.blocks[pidx(x, y, z)]
 }
 
@@ -89,8 +87,7 @@ cell :: proc "contextless" (p: ^Padded, x, y, z: i32) -> (v: f32, caster: bool) 
 	b := pb(p, x, y, z)
 	info := &BLOCK_INFO[b]
 	if info.opaque || info.render == .Leaves do return AO_CASTER_LIGHT, true
-	if y >= CHUNK_HEIGHT do return 1, false
-	if y >= i32(p.light_h[(z + 1) * P + (x + 1)]) do return 1, false
+	if y >= p.light_h[(z + 1) * P + (x + 1)] do return 1, false
 	return SHADOW_LIGHT, false
 }
 
@@ -170,48 +167,60 @@ emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer:
 fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 	// колонки бортика берём через рёбра граней (сетка соседа может быть повёрнута)
 	x0 := c.key.x * CHUNK_SIZE
+	y0 := c.key.y * CHUNK_SIZE
 	z0 := c.key.z * CHUNK_SIZE
-	last_key: Chunk_Key
-	last: ^Chunk
 	for pz in i32(-1) ..= CHUNK_SIZE do for px in i32(-1) ..= CHUNK_SIZE {
-		n: ^Chunk
-		lx, lz: i32
-		if px >= 0 && pz >= 0 && px < CHUNK_SIZE && pz < CHUNK_SIZE {
-			n, lx, lz = c, px, pz
-		} else if face, gx, gz, ok := geo_resolve(&w.geo, c.key.face, x0 + px, z0 + pz); ok {
-			key := chunk_key_of(face, gx, gz)
-			if last == nil || key != last_key {
-				last_key = key
-				last = world_chunk(w, key)
-			}
-			n = last
-			lx = eng.floor_mod(gx, CHUNK_SIZE)
-			lz = eng.floor_mod(gz, CHUNK_SIZE)
+		face := c.key.face
+		gx, gz := x0 + px, z0 + pz
+		ok := true
+		if px < 0 || pz < 0 || px >= CHUNK_SIZE || pz >= CHUNK_SIZE {
+			face, gx, gz, ok = geo_resolve(&w.geo, c.key.face, gx, gz)
 		}
-		if n == nil {
+		col: ^Column
+		if ok do col = world_column(w, column_key_of(face, gx, gz))
+		if col == nil {
 			// пустота у вершины куба: со стороны столпа — как камень
-			fill: Block = .Air
-			if _, _, _, ok := geo_resolve(&w.geo, c.key.face, x0 + px, z0 + pz); !ok do fill = .Monolith
-			for y in i32(0) ..< CHUNK_HEIGHT do p.blocks[pidx(px, y, pz)] = fill
-			p.light_h[(pz + 1) * P + (px + 1)] = 0
+			fill: Block = ok ? .Air : .Monolith
+			for y in i32(-1) ..= CHUNK_SIZE do p.blocks[pidx(px, y, pz)] = fill
+			p.light_h[(pz + 1) * P + (px + 1)] = min(i32)
 			continue
 		}
-		for y in i32(0) ..< CHUNK_HEIGHT {
-			p.blocks[pidx(px, y, pz)] = n.blocks[block_index(lx, y, lz)]
+		ci := column_index(gx, gz)
+		lx, lz := eng.floor_mod(gx, CHUNK_SIZE), eng.floor_mod(gz, CHUNK_SIZE)
+		// по секциям: та же, ниже, выше; непостроенные — ответ по колонке
+		same := px >= 0 && pz >= 0 && px < CHUNK_SIZE && pz < CHUNK_SIZE
+		mid := same ? c : world_chunk(w, chunk_key_of(face, gx, y0, gz))
+		below := world_chunk(w, chunk_key_of(face, gx, y0 - 1, gz))
+		above := world_chunk(w, chunk_key_of(face, gx, y0 + CHUNK_SIZE, gz))
+		for y in i32(-1) ..= CHUNK_SIZE {
+			wy := y0 + y
+			n := y < 0 ? below : y >= CHUNK_SIZE ? above : mid
+			if n != nil {
+				p.blocks[pidx(px, y, pz)] = chunk_block(n, block_index(lx, eng.floor_mod(wy, CHUNK_SIZE), lz))
+			} else {
+				p.blocks[pidx(px, y, pz)] = column_guess(col, ci, wy)
+			}
 		}
-		p.light_h[(pz + 1) * P + (px + 1)] = n.light_height[lz * CHUNK_SIZE + lx]
+		p.light_h[(pz + 1) * P + (px + 1)] = col.sky[ci] - y0
 	}
 }
 
 chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
-	p := &scratch
-	fill_padded(w, c, p)
 	clear(&opaque_verts)
 	clear(&water_verts)
+	if c.blocks == nil && c.fill == .Air {
+		// пустой воздух — сетки нет
+		chunk_mesh_upload(&c.opaque_mesh, opaque_verts[:])
+		chunk_mesh_upload(&c.water_mesh, water_verts[:])
+		c.meshed = true
+		return
+	}
+	p := &scratch
+	fill_padded(w, c, p)
 
 	x0 := c.key.x * CHUNK_SIZE
 	z0 := c.key.z * CHUNK_SIZE
-	for y in i32(0) ..= c.max_y do for z in i32(0) ..< CHUNK_SIZE do for x in i32(0) ..< CHUNK_SIZE {
+	for y in i32(0) ..< CHUNK_SIZE do for z in i32(0) ..< CHUNK_SIZE do for x in i32(0) ..< CHUNK_SIZE {
 		b := p.blocks[pidx(x, y, z)]
 		if b == .Air do continue
 		info := &BLOCK_INFO[b]
