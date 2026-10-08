@@ -11,7 +11,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.005"
+VERSION :: "0.006"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -38,6 +38,8 @@ Options :: struct {
 	select:        int, // 1, 2 или 3 (оба)
 	water_spawn:   bool, // появиться над водой
 	mountain_spawn: bool, // появиться над горами
+	has_latlon:    bool, // высадка в заданной точке планеты
+	lat, lon:      f64,
 	debug_panel:   bool, // сразу открыть панель F3
 	no_intro:      bool, // без высадки в капсулах (сразу на земле)
 	has_look:      bool, // заданы -yaw / -pitch
@@ -111,6 +113,11 @@ parse_options :: proc() -> (o: Options) {
 		case "-spawn":
 			o.water_spawn = val == "water"
 			o.mountain_spawn = val == "mountain"
+		case "-latlon":
+			las, _, los := strings.partition(val, ",")
+			o.lat = strconv.parse_f64(las) or_else 40
+			o.lon = strconv.parse_f64(los) or_else 0
+			o.has_latlon = true
 		case "-orbit":
 			o.orbit = f32(strconv.parse_f64(val) or_else 0)
 		case "-interval":
@@ -187,13 +194,27 @@ main :: proc() {
 	sky: Sky
 	sky_init(&sky, opts.seed)
 
+	// планета-шар реального размера: выбираем грань и точку высадки
+	geo := geo_make(home_planet(&system).radius_km)
+	lat, lon := system.home.latitude_deg, system.home.longitude_deg
+	if opts.has_latlon do lat, lon = opts.lat, opts.lon
+	site_x, site_z: f64
+	site_x, site_z, lat, lon = geo_choose_site(&geo, lat, lon, opts.seed, opts.has_latlon)
+	system.home.latitude_deg, system.home.longitude_deg = lat, lon
+	fmt.printfln("Высадка: широта %.2f, долгота %.2f, грань %s, до ребра %.0f км",
+		lat, lon, FACE_NAMES[geo.face], geo_edge_dist(&geo, site_x, site_z) / 1000)
+
 	world: World
-	world_init(&world, opts.seed, VIEW_RADIUS)
+	world_init(&world, opts.seed, VIEW_RADIUS, geo)
 	defer world_destroy(&world)
 
-	spawn := find_spawn(opts.seed)
-	if opts.water_spawn do spawn = find_water_spawn(opts.seed)
-	if opts.mountain_spawn do spawn = find_mountain_spawn(opts.seed)
+	globe, globe_ok := globe_create(&world.geo, opts.seed)
+	if !globe_ok do os.exit(1)
+
+	sx, sz := i32(site_x), i32(site_z)
+	spawn := find_spawn(&world, sx, sz)
+	if opts.water_spawn do spawn = find_water_spawn(&world, sx, sz)
+	if opts.mountain_spawn do spawn = find_mountain_spawn(&world, sx, sz)
 	for !spawn_area_ready(&world, spawn, 2) {
 		world_update(&world, spawn, 0.1)
 		free_all(context.temp_allocator)
@@ -362,6 +383,7 @@ main :: proc() {
 				player_skin = player_skin_tex,
 				capsule = &capsule,
 				landing = &landing,
+				globe = &globe,
 				squad = &squad,
 				clock = &clock,
 				system = &system,

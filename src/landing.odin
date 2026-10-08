@@ -170,7 +170,11 @@ landing_create :: proc(w: ^World, player: ^Character, s: ^Squad, site: [3]f64, s
 
 // Мгновенно в конечное состояние (флаг -nointro, отладка).
 landing_skip :: proc(l: ^Landing, s: ^Squad, player: ^Character) {
-	for &pod in l.pods do pod.state = .Gone
+	for &pod in l.pods {
+		pod.state = .Gone
+		pod.rider_out = true
+		pod.released = true
+	}
 	for &c in s.members do c.held = false
 	player.interp_look = false
 	l.active = false

@@ -53,6 +53,7 @@ Frame_Params :: struct {
 	player_skin: u32,
 	capsule:     ^Capsule_Model,
 	landing:     ^Landing,
+	globe:       ^Globe,
 	squad:       ^Squad,
 	clock:       ^Game_Clock,
 	system:      ^Star_System,

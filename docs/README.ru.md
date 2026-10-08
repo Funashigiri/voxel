@@ -71,6 +71,8 @@ src/
   capsule.odin   модель капсулы и парашюта
   black_hole.odin эффект чёрной дыры (линза, ядро, кольцо)
   particles.odin частицы (дым, пыль, искры, вихрь)
+  planet.odin    планета-шар: грани куба, широта/долгота
+  globe.odin     глобус планеты для F3
   camera.odin    камеры 1-го/3-го лица, покачивание при ходьбе
   sky.odin       небо, солнце, облака
   renderer.odin  отрисовка кадра
@@ -93,6 +95,12 @@ docs/            референсы и скриншоты версий
 случайно. Время идёт по суткам планеты: 1 стандартный час = 100 секунд.
 Сведения о мире — на F3. Повторить мир можно флагом `-seed:число`.
 
+## Планета
+
+Мир — планета-шар реального размера. Широта, долгота и маленький глобус
+с отметкой «мы здесь» — на F3. Высадка в умеренных широтах; флаг
+`-latlon:40,120` — высадиться в заданной точке.
+
 ## Свой скин
 
 Положите PNG 64×64 со стандартной раскладкой Minecraft в `assets/skin.png` —
@@ -100,5 +108,5 @@ docs/            референсы и скриншоты версий
 
 ## Отладочные параметры
 
-`bin\voxel.exe -shot:out.png -delay:3 -cam:back|fp|front -yaw:0 -pitch:15 -walk -sprint -jump -sneak -strafe -orbit:90 -burst:6 -interval:0.1 -seed:123 -time:21:30 -f3 -nointro -size:1280x720 -select:1|2|3 -order:follow|hold|go -order_at:0.5 -spawn:water`
+`bin\voxel.exe -shot:out.png -delay:3 -cam:back|fp|front -yaw:0 -pitch:15 -walk -sprint -jump -sneak -strafe -orbit:90 -burst:6 -interval:0.1 -seed:123 -time:21:30 -f3 -nointro -latlon:40,120 -size:1280x720 -select:1|2|3 -order:follow|hold|go -order_at:0.5 -spawn:water`
 — автоматический скриншот (или серия) и выход. `-dump-textures:tex.png` сохраняет все текстуры блоков.

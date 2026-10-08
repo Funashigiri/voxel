@@ -27,6 +27,7 @@ Chunk :: struct {
 
 World :: struct {
 	seed:        u32,
+	geo:         Planet_Geo, // планета и грань, на которой идёт игра
 	chunks:      map[Chunk_Key]^Chunk,
 	view_radius: i32,
 	load_order:  [dynamic]Chunk_Key, // смещения чанков, отсортированные по расстоянию
@@ -44,8 +45,9 @@ block_index :: #force_inline proc "contextless" (x, y, z: i32) -> i32 {
 	return (y * CHUNK_SIZE + z) * CHUNK_SIZE + x
 }
 
-world_init :: proc(w: ^World, seed: u32, view_radius: i32) {
+world_init :: proc(w: ^World, seed: u32, view_radius: i32, geo: Planet_Geo) {
 	w.seed = seed
+	w.geo = geo
 	w.view_radius = view_radius
 	r := view_radius
 	for dz in -r ..= r do for dx in -r ..= r {
