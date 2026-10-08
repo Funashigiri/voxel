@@ -226,3 +226,19 @@ find_spawn :: proc(seed: u32) -> [3]f64 {
 	}
 	return {0.5, f64(terrain_height(s, 0, 0)) + 1, 0.5}
 }
+
+// Отладка: точка на поверхности глубокой воды недалеко от (0, 0).
+find_water_spawn :: proc(seed: u32) -> [3]f64 {
+	s := i64(seed)
+	for r := i32(0); r < 600; r += 4 {
+		for dz := -r; dz <= r; dz += 4 {
+			for dx := -r; dx <= r; dx += 4 {
+				if max(abs(dx), abs(dz)) != r do continue
+				if terrain_height(s, f64(dx), f64(dz)) < SEA_LEVEL - 5 {
+					return {f64(dx) + 0.5, SEA_LEVEL - 0.4, f64(dz) + 0.5}
+				}
+			}
+		}
+	}
+	return find_spawn(seed)
+}

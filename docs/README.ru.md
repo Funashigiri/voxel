@@ -31,6 +31,8 @@ build.bat debug      :: отладочная сборка с проверкам�
 |---|---|
 | W A S D | ходьба |
 | Space | прыжок (в воде — всплыть) |
+| Ctrl в воде | плыть (лёжа, по направлению взгляда) |
+| Shift в воде | нырнуть |
 | Ctrl или двойное W | бег |
 | Shift | присесть (не даёт упасть с края) |
 | Мышь | обзор |
@@ -75,5 +77,5 @@ docs/            референсы и скриншоты версий
 
 ## Отладочные параметры
 
-`bin\voxel.exe -shot:out.png -delay:3 -cam:back|fp|front -yaw:0 -pitch:15 -walk -sprint -jump -sneak -strafe -orbit:90 -burst:6 -interval:0.1 -seed:123 -size:1280x720 -select:1|2|3 -order:follow|hold|go -order_at:0.5`
+`bin\voxel.exe -shot:out.png -delay:3 -cam:back|fp|front -yaw:0 -pitch:15 -walk -sprint -jump -sneak -strafe -orbit:90 -burst:6 -interval:0.1 -seed:123 -size:1280x720 -select:1|2|3 -order:follow|hold|go -order_at:0.5 -spawn:water`
 — автоматический скриншот (или серия) и выход. `-dump-textures:tex.png` сохраняет все текстуры блоков.

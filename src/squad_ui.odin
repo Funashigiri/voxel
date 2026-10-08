@@ -121,8 +121,8 @@ squad_draw_world :: proc(s: ^Squad, cam: ^Camera, t: f32, time: f64) {
 	for &c, i in s.members {
 		b := &c.body
 		feet := rel(character_render_pos(b, t), cam)
-		crouch := math.lerp(b.prev_crouch, b.crouch, t)
-		head := feet + [3]f32{0, 2.25 - 0.3 * crouch, 0}
+		eye := math.lerp(b.prev_eye_h, b.eye_h, t)
+		head := feet + [3]f32{0, eye + 0.63, 0}
 		icon_world(&ORDER_ICONS[c.order], head, right, up, 0.055, 235, s.selected[i])
 
 		if c.marker <= 0 do continue

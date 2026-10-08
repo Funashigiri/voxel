@@ -12,22 +12,22 @@ import gl "vendor:OpenGL"
 Chunk_Shader :: struct {
 	prog:                                                 u32,
 	u_view_proj, u_origin, u_time, u_atlas, u_alpha_cutoff: i32,
-	u_fog, u_sky_top, u_sky_horizon:                      i32,
+	u_fog:                                                i32,
 }
 
 Entity_Shader :: struct {
 	prog:                                                         u32,
-	u_mvp, u_model, u_skin, u_light, u_fog, u_sky_top, u_sky_horizon: i32,
+	u_mvp, u_model, u_skin, u_light, u_fog: i32,
 }
 
 Sky_Shader :: struct {
 	prog:                                                   u32,
-	u_inv_view_proj, u_sun_dir, u_sky_top, u_sky_horizon: i32,
+	u_inv_view_proj, u_sun_dir: i32,
 }
 
 Cloud_Shader :: struct {
 	prog:                                                  u32,
-	u_view_proj, u_origin, u_fog, u_sky_top, u_sky_horizon: i32,
+	u_view_proj, u_origin, u_fog: i32,
 }
 
 Renderer :: struct {
@@ -36,7 +36,8 @@ Renderer :: struct {
 	sky:            Sky_Shader,
 	cloud:          Cloud_Shader,
 	atlas:          u32,
-	fog:            [2]f32,
+	fog:            [2]f32, // туман над водой (из дальности прорисовки)
+	underwater:     bool, // камера под водой в этом кадре
 	player_light:   f32,
 	chunks_drawn:   int,
 }
@@ -68,8 +69,6 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_atlas        = loc(p, "u_atlas"),
 			u_alpha_cutoff = loc(p, "u_alpha_cutoff"),
 			u_fog          = loc(p, "u_fog"),
-			u_sky_top      = loc(p, "u_sky_top"),
-			u_sky_horizon  = loc(p, "u_sky_horizon"),
 		}
 	}
 	{
@@ -81,8 +80,6 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_skin        = loc(p, "u_skin"),
 			u_light       = loc(p, "u_light"),
 			u_fog         = loc(p, "u_fog"),
-			u_sky_top     = loc(p, "u_sky_top"),
-			u_sky_horizon = loc(p, "u_sky_horizon"),
 		}
 	}
 	{
@@ -91,8 +88,6 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			prog            = p,
 			u_inv_view_proj = loc(p, "u_inv_view_proj"),
 			u_sun_dir       = loc(p, "u_sun_dir"),
-			u_sky_top       = loc(p, "u_sky_top"),
-			u_sky_horizon   = loc(p, "u_sky_horizon"),
 		}
 	}
 	{
@@ -102,8 +97,6 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_view_proj   = loc(p, "u_view_proj"),
 			u_origin      = loc(p, "u_origin"),
 			u_fog         = loc(p, "u_fog"),
-			u_sky_top     = loc(p, "u_sky_top"),
-			u_sky_horizon = loc(p, "u_sky_horizon"),
 		}
 	}
 	eng.imm_init() or_return
@@ -116,6 +109,9 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 	r.player_light = 1
 	return true
 }
+
+WATER_FOG_COLOR :: [4]f32{0.12, 0.24, 0.55, 1}
+WATER_FOG :: [2]f32{1, 34}
 
 @(private = "file")
 Frustum :: [6][4]f32
@@ -144,10 +140,12 @@ Visible_Chunk :: struct {
 	dist2:  f32,
 }
 
+// Цвета неба и тумана. Под водой туман синий и густой (как в Minecraft).
 @(private = "file")
-set_sky_uniforms :: proc(top, horizon: i32) {
-	eng.set_vec3(top, SKY_TOP)
-	eng.set_vec3(horizon, SKY_HORIZON)
+set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
+	eng.set_vec3(eng.uniform_loc(prog, "u_sky_top"), SKY_TOP)
+	eng.set_vec3(eng.uniform_loc(prog, "u_sky_horizon"), SKY_HORIZON)
+	eng.set_vec4(eng.uniform_loc(prog, "u_fog_override"), r.underwater ? WATER_FOG_COLOR : {})
 }
 
 // Плавно подстраивает яркость персонажа под свет в его клетке (тень деревьев и т.п.).
@@ -174,6 +172,11 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	cam := fp.cam
 	p := fp.player
 	gl.Viewport(0, 0, fp.width, fp.height)
+	{
+		b, _ := world_get_block(fp.world, i32(math.floor(cam.pos.x)), i32(math.floor(cam.pos.y)), i32(math.floor(cam.pos.z)))
+		r.underwater = b == .Water
+	}
+	fog := r.underwater ? WATER_FOG : r.fog
 	gl.ClearColor(SKY_HORIZON.r, SKY_HORIZON.g, SKY_HORIZON.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 
@@ -183,7 +186,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.UseProgram(r.sky.prog)
 	eng.set_mat4(r.sky.u_inv_view_proj, linalg.matrix4_inverse_f32(cam.view_proj))
 	eng.set_vec3(r.sky.u_sun_dir, fp.sky.sun_dir)
-	set_sky_uniforms(r.sky.u_sky_top, r.sky.u_sky_horizon)
+	set_sky_uniforms(r, r.sky.prog)
 	gl.BindVertexArray(fp.sky.empty_vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, 3)
 	gl.Enable(gl.DEPTH_TEST)
@@ -197,10 +200,10 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.UseProgram(r.chunk.prog)
 	eng.set_mat4(r.chunk.u_view_proj, cam.view_proj)
 	eng.set_f32(r.chunk.u_time, f32(fp.time))
-	eng.set_vec2(r.chunk.u_fog, r.fog)
+	eng.set_vec2(r.chunk.u_fog, fog)
 	eng.set_i32(r.chunk.u_atlas, 0)
 	eng.set_f32(r.chunk.u_alpha_cutoff, 0.5)
-	set_sky_uniforms(r.chunk.u_sky_top, r.chunk.u_sky_horizon)
+	set_sky_uniforms(r, r.chunk.prog)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.atlas)
 
@@ -229,8 +232,8 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	// ---- персонажи: игрок (от третьего лица) и отряд
 	gl.UseProgram(r.entity.prog)
 	eng.set_i32(r.entity.u_skin, 0)
-	eng.set_vec2(r.entity.u_fog, r.fog)
-	set_sky_uniforms(r.entity.u_sky_top, r.entity.u_sky_horizon)
+	eng.set_vec2(r.entity.u_fog, fog)
+	set_sky_uniforms(r, r.entity.prog)
 	update_light(&r.player_light, fp.world, p, fp.t, fp.dt)
 	if cam.mode != .First_Person do draw_character(r, &fp, p, fp.player_skin, r.player_light)
 	for &c in fp.squad.members {
@@ -266,8 +269,8 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		eng.set_mat4(r.cloud.u_view_proj, cam.view_proj)
 		eng.set_vec3(r.cloud.u_origin, cloud_origin)
 		cloud_far := f32(CLOUD_RADIUS * CLOUD_CELL)
-		eng.set_vec2(r.cloud.u_fog, {cloud_far * 0.45, cloud_far * 0.95})
-		set_sky_uniforms(r.cloud.u_sky_top, r.cloud.u_sky_horizon)
+		eng.set_vec2(r.cloud.u_fog, r.underwater ? WATER_FOG : [2]f32{cloud_far * 0.45, cloud_far * 0.95})
+		set_sky_uniforms(r, r.cloud.prog)
 		gl.BindVertexArray(fp.sky.cloud_vao)
 		gl.ColorMask(false, false, false, false)
 		gl.DrawArrays(gl.TRIANGLES, 0, fp.sky.cloud_verts)

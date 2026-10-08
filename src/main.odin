@@ -11,7 +11,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.002"
+VERSION :: "0.003"
 VIEW_RADIUS :: 10 // чанков
 DEFAULT_SEED :: 20261007
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
@@ -35,6 +35,7 @@ Options :: struct {
 	order:         string, // follow | hold | go — отдать приказ автоматически
 	order_at:      f64, // через сколько секунд
 	select:        int, // 1, 2 или 3 (оба)
+	water_spawn:   bool, // появиться в воде
 	dump_textures: string,
 }
 
@@ -90,6 +91,8 @@ parse_options :: proc() -> (o: Options) {
 			o.order_at = strconv.parse_f64(val) or_else 0.3
 		case "-select":
 			o.select = strconv.parse_int(val) or_else 3
+		case "-spawn":
+			o.water_spawn = val == "water"
 		case "-orbit":
 			o.orbit = f32(strconv.parse_f64(val) or_else 0)
 		case "-interval":
@@ -159,7 +162,7 @@ main :: proc() {
 	world_init(&world, opts.seed, VIEW_RADIUS)
 	defer world_destroy(&world)
 
-	spawn := find_spawn(opts.seed)
+	spawn := opts.water_spawn ? find_water_spawn(opts.seed) : find_spawn(opts.seed)
 	for !spawn_area_ready(&world, spawn, 2) {
 		world_update(&world, spawn, 0.1)
 		free_all(context.temp_allocator)

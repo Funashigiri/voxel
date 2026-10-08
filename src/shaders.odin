@@ -7,7 +7,9 @@ package main
 SKY_GLSL :: `
 uniform vec3 u_sky_top;
 uniform vec3 u_sky_horizon;
+uniform vec4 u_fog_override; // rgb + флаг (1 — камера под водой)
 vec3 sky_color(vec3 dir) {
+	if (u_fog_override.w > 0.5) return u_fog_override.rgb;
 	float t = max(dir.y, 0.0);
 	return mix(u_sky_horizon, u_sky_top, 1.0 - exp(-t * 5.0));
 }
@@ -80,7 +82,7 @@ void main() {
 
 	// квадратное пиксельное солнце с ореолом
 	float sd = dot(dir, u_sun_dir);
-	if (sd > 0.0) {
+	if (sd > 0.0 && u_fog_override.w < 0.5) {
 		vec3 right = normalize(cross(u_sun_dir, vec3(0.0, 0.0, 1.0)));
 		vec3 up = cross(right, u_sun_dir);
 		vec2 q = vec2(dot(dir, right), dot(dir, up)) / sd;

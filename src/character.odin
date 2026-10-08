@@ -11,6 +11,8 @@ CHAR_HALF_WIDTH :: 0.3
 CHAR_HEIGHT :: 1.8
 EYE_HEIGHT :: 1.62
 SNEAK_EYE_HEIGHT :: 1.27
+SWIM_HEIGHT :: 0.6 // в позе плавания хитбокс 0.6 x 0.6, как в Minecraft
+SWIM_EYE_HEIGHT :: 0.4
 TICK_RATE :: 20.0
 TICK_DT :: 1.0 / TICK_RATE
 
@@ -29,6 +31,9 @@ Character :: struct {
 	on_ground, in_water:        bool,
 	h_collision:                bool,
 	sprinting, sneaking:        bool,
+	swimming:                   bool, // плывёт лёжа (бег в воде)
+	prev_yaw, prev_pitch:       f32, // для плавного поворота головы у NPC
+	interp_look:                bool,
 
 	// анимация (обновляется каждый тик, интерполируется при отрисовке)
 	limb_pos:                   f32,
@@ -44,17 +49,29 @@ Character :: struct {
 	fov_mod, prev_fov_mod:      f32,
 	wave, prev_wave:            f32, // 0..1 — машет рукой (ответ на приказ)
 	wave_ticks:                 i32,
+	swim, prev_swim:            f32, // 0..1 — поза плавания
+	tread, prev_tread:          f32, // 0..1 — "бултыхание" на месте в воде
 }
 
 AABB :: struct {
 	min, max: [3]f64,
 }
 
-character_box :: proc(pos: [3]f64) -> AABB {
+character_box :: proc(pos: [3]f64, height: f64 = CHAR_HEIGHT) -> AABB {
 	return {
 		{pos.x - CHAR_HALF_WIDTH, pos.y, pos.z - CHAR_HALF_WIDTH},
-		{pos.x + CHAR_HALF_WIDTH, pos.y + CHAR_HEIGHT, pos.z + CHAR_HALF_WIDTH},
+		{pos.x + CHAR_HALF_WIDTH, pos.y + height, pos.z + CHAR_HALF_WIDTH},
 	}
+}
+
+character_height :: proc(p: ^Character) -> f64 {
+	return p.swimming ? SWIM_HEIGHT : CHAR_HEIGHT
+}
+
+@(private = "file")
+water_at :: proc(w: ^World, pos: [3]f64) -> bool {
+	b, _ := world_get_block(w, i32(math.floor(pos.x)), i32(math.floor(pos.y)), i32(math.floor(pos.z)))
+	return b == .Water
 }
 
 box_offset :: proc(b: AABB, d: [3]f64) -> AABB {
@@ -110,10 +127,11 @@ clip_axis :: proc(w: ^World, b: AABB, d: f64, axis: int) -> f64 {
 }
 
 @(private = "file")
-in_water_check :: proc(w: ^World, pos: [3]f64) -> bool {
-	b := character_box(pos)
-	b.min += {0.001, 0.4, 0.001}
-	b.max -= {0.001, 0.4, 0.001}
+in_water_check :: proc(w: ^World, pos: [3]f64, height: f64) -> bool {
+	b := character_box(pos, height)
+	shrink := min(0.4, height * 0.3)
+	b.min += {0.001, shrink, 0.001}
+	b.max -= {0.001, shrink, 0.001}
 	x0, x1 := cell_range(b.min.x, b.max.x)
 	y0, y1 := cell_range(b.min.y, b.max.y)
 	z0, z1 := cell_range(b.min.z, b.max.z)
@@ -141,7 +159,7 @@ move_relative :: proc(p: ^Character, strafe, forward: f32, accel: f64) {
 @(private = "file")
 character_move :: proc(p: ^Character, w: ^World) {
 	d := p.vel
-	box := character_box(p.pos)
+	box := character_box(p.pos, character_height(p))
 
 	// присед: не даём сойти с края блока
 	if p.sneaking && p.on_ground {
@@ -198,23 +216,47 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 	p.prev_eye_h = p.eye_h
 	p.prev_fov_mod = p.fov_mod
 	p.prev_wave = p.wave
+	p.prev_swim = p.swim
+	p.prev_tread = p.tread
 
 	forward := input.forward * 0.98
 	strafe := input.strafe * 0.98
 	p.sneaking = input.sneak
-	if p.sneaking {
+	crawling := p.swimming && !p.in_water // вылез лёжа туда, где не встать
+	if p.sneaking || crawling {
 		forward *= 0.3
 		strafe *= 0.3
 	}
 
-	if input.sprint && input.forward > 0 && !p.sneaking do p.sprinting = true
-	if input.forward <= 0 || p.sneaking || p.h_collision do p.sprinting = false
+	if input.sprint && input.forward > 0 && !p.sneaking && !crawling do p.sprinting = true
+	if input.forward <= 0 || p.sneaking || (p.h_collision && !p.swimming) do p.sprinting = false
+
+	// плавание: бег в воде укладывает персонажа горизонтально
+	if p.swimming {
+		if !(p.sprinting && p.in_water) && !box_collides(w, character_box(p.pos)) do p.swimming = false
+	} else if p.sprinting && p.in_water && water_at(w, p.pos + {0, 0.2, 0}) {
+		eyes_wet := water_at(w, p.pos + {0, EYE_HEIGHT, 0})
+		deep := water_at(w, p.pos - {0, 0.8, 0})
+		if eyes_wet || deep do p.swimming = true
+	}
 
 	was_on_ground := p.on_ground
 	vy_before := p.vel.y
 
-	if p.in_water {
+	if p.in_water && p.swimming {
+		// вертикальная скорость тянется к направлению взгляда, гравитации нет
+		look := f64(look_dir(p.yaw, p.pitch).y)
+		k: f64 = look < -0.2 ? 0.085 : 0.06
+		if look <= 0 || input.jump || water_at(w, p.pos + {0, 0.9, 0}) do p.vel.y += (look - p.vel.y) * k
+		move_relative(p, strafe, forward, 0.02)
+		character_move(p, w)
+		p.vel.x *= 0.9
+		p.vel.z *= 0.9
+		p.vel.y *= 0.8
+		if p.h_collision && input.jump do p.vel.y = 0.3
+	} else if p.in_water {
 		if input.jump do p.vel.y += 0.04
+		if p.sneaking do p.vel.y -= 0.04 // нырнуть
 		move_relative(p, strafe, forward, 0.02)
 		character_move(p, w)
 		p.vel *= 0.8
@@ -246,14 +288,16 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 	}
 	for &v in p.vel do if abs(v) < 0.003 do v = 0
 
-	p.in_water = in_water_check(w, p.pos)
+	p.in_water = in_water_check(w, p.pos, character_height(p))
 
 	// --- анимация ---
 	dx := f32(p.pos.x - p.prev_pos.x)
+	dy := f32(p.pos.y - p.prev_pos.y)
 	dz := f32(p.pos.z - p.prev_pos.z)
 	dist := math.sqrt(dx * dx + dz * dz)
+	stroke := p.swimming ? math.sqrt(dx * dx + dy * dy + dz * dz) : dist // при плавании считается и вертикаль
 
-	p.limb_speed += (min(dist * 4, 1) - p.limb_speed) * 0.4
+	p.limb_speed += (min(stroke * 4, 1) - p.limb_speed) * 0.4
 	p.limb_pos += p.limb_speed
 
 	// корпус поворачивается в сторону движения, голова — куда смотрит камера
@@ -271,12 +315,17 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 	p.walk_dist += dist * 0.6
 	p.bob += ((p.on_ground ? min(0.1, dist) : 0) - p.bob) * 0.4
 	p.air += ((!p.on_ground && !p.in_water ? f32(1) : 0) - p.air) * 0.5
-	p.crouch += ((p.sneaking ? f32(1) : 0) - p.crouch) * 0.5
+	p.crouch += ((p.sneaking && !p.in_water && !p.swimming ? f32(1) : 0) - p.crouch) * 0.5
 	p.land *= 0.55
 	if p.on_ground && !was_on_ground && vy_before < -0.25 {
 		p.land = min(1, f32(-vy_before) / 0.7)
 	}
-	p.eye_h += ((p.sneaking ? f32(SNEAK_EYE_HEIGHT) : EYE_HEIGHT) - p.eye_h) * 0.5
+	eye_target: f32 = EYE_HEIGHT
+	if p.sneaking do eye_target = SNEAK_EYE_HEIGHT
+	if p.swimming do eye_target = SWIM_EYE_HEIGHT
+	p.eye_h += (eye_target - p.eye_h) * 0.5
+	p.swim = p.swimming ? min(1, p.swim + 0.09) : max(0, p.swim - 0.09)
+	p.tread += ((p.in_water && !p.swimming ? f32(1) : 0) - p.tread) * 0.25
 	p.fov_mod += ((p.sprinting ? f32(1.15) : 1) - p.fov_mod) * 0.5
 	p.wave += ((p.wave_ticks > 0 ? f32(1) : 0) - p.wave) * 0.35
 	if p.wave_ticks > 0 do p.wave_ticks -= 1
@@ -286,7 +335,7 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 // Персонажи мягко расталкивают друг друга, если их коробки пересеклись
 // (та же формула, что у сущностей в Minecraft).
 character_push_apart :: proc(a, b: ^Character) {
-	ba, bb := character_box(a.pos), character_box(b.pos)
+	ba, bb := character_box(a.pos, character_height(a)), character_box(b.pos, character_height(b))
 	for i in 0 ..< 3 {
 		if ba.max[i] <= bb.min[i] || ba.min[i] >= bb.max[i] do return
 	}

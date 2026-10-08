@@ -147,9 +147,11 @@ squad_init :: proc(s: ^Squad, w: ^World, player: ^Character, seed: u32) {
 		cell, ok := find_stand_cell(w, near, 3)
 		if !ok do cell = cell_of(player.pos)
 		character_spawn(&c.body, w, cell_center(cell))
+		c.body.interp_look = true
 		// смотрят на игрока
 		to := player.pos - c.body.pos
 		c.body.yaw = math.atan2(f32(-to.x), f32(to.z))
+		c.body.prev_yaw = c.body.yaw
 		c.body.body_yaw = c.body.yaw
 		c.body.prev_body_yaw = c.body.yaw
 		c.look_yaw = c.body.yaw
@@ -245,6 +247,17 @@ follow_path :: proc(c: ^Companion, w: ^World, input: ^Move_Input, sprint: bool) 
 		// на длинном прямом участке — бег с прыжками, как делают игроки
 		if input.sprint && hd > 4 && b.on_ground && off < 0.3 do input.jump = true
 
+		// глубокая вода — плывут (бег в воде), держась у поверхности
+		deep := b.in_water && (is_water_at(w, b.pos - {0, 0.8, 0}) || is_water_at(w, b.pos + {0, EYE_HEIGHT, 0}))
+		if (deep || b.swimming) && hd > 1.5 && !c.stroll do input.sprint = true
+		if b.swimming {
+			want_y := tgt.y + (is_water_at(w, tgt + {0, 0.2, 0}) ? 0.45 : 0)
+			aim := -math.atan2(f32(want_y - b.pos.y), f32(max(hd, 1)))
+			b.pitch = turn_towards(b.pitch, clamp(aim, -0.4, 0.4), math.to_radians(f32(8)))
+			input.jump = b.h_collision && tgt.y > b.pos.y // выбраться на берег
+			return false
+		}
+
 		if tgt.y > b.pos.y + 0.5 && hd < 1.8 do input.jump = true
 		if b.h_collision && b.on_ground do input.jump = true
 		if b.in_water && tgt.y >= b.pos.y - 0.6 do input.jump = true
@@ -294,8 +307,16 @@ idle :: proc(c: ^Companion, w: ^World, player: ^Character) {
 }
 
 @(private = "file")
+is_water_at :: proc(w: ^World, pos: [3]f64) -> bool {
+	b, _ := world_get_block(w, i32(math.floor(pos.x)), i32(math.floor(pos.y)), i32(math.floor(pos.z)))
+	return b == .Water
+}
+
+@(private = "file")
 companion_tick :: proc(c: ^Companion, w: ^World, player: ^Character) {
 	b := &c.body
+	b.prev_yaw = b.yaw
+	b.prev_pitch = b.pitch
 	// чанк выгружен — спутник "замирает", как сущности в Minecraft
 	if world_get_chunk(w, eng.floor_div(i32(math.floor(b.pos.x)), CHUNK_SIZE), eng.floor_div(i32(math.floor(b.pos.z)), CHUNK_SIZE)) == nil {
 		b.prev_pos = b.pos

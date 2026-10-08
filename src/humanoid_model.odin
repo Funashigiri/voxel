@@ -3,7 +3,8 @@ package main
 // Модель персонажа из 6 коробок (голова, тело, руки, ноги) + слои одежды.
 // Анимация ходьбы повторяет формулы Minecraft (ModelBiped): руки и ноги
 // качаются по cos(limbSwing * 0.6662) с амплитудой limbSwingAmount.
-// Сверху добавлены позы прыжка, приземления и приседа.
+// Плавание — тоже по формулам Minecraft. Сверху добавлены позы прыжка,
+// приземления, приседа и "бултыхание" в воде.
 
 import "core:math"
 import "core:math/linalg"
@@ -55,7 +56,9 @@ Humanoid_Model :: struct {
 Pose :: struct {
 	rot:    [Model_Part][3]f32,
 	offset: [Model_Part][3]f32, // сдвиг pivot (пиксели)
-	root_y: f32, // сдвиг всей модели (пиксели)
+	root_y:      f32, // сдвиг всей модели (пиксели)
+	swim_angle:  f32, // наклон всего тела при плавании (вокруг X)
+	swim_offset: [3]f32, // сдвиг тела при плавании (блоки, до масштаба)
 }
 
 @(private = "file")
@@ -120,8 +123,13 @@ character_pose :: proc(p: ^Character, t: f32) -> (pose: Pose, body_yaw: f32) {
 	body_yaw = eng.lerp_angle(p.prev_body_yaw, p.body_yaw, t)
 
 	// голова смотрит туда же, куда камера
-	head_yaw := clamp(eng.wrap_angle(p.yaw - body_yaw), -math.to_radians(f32(75)), math.to_radians(f32(75)))
-	pose.rot[.Head] = {p.pitch, head_yaw, 0}
+	look_yaw, look_pitch := p.yaw, p.pitch
+	if p.interp_look {
+		look_yaw = eng.lerp_angle(p.prev_yaw, p.yaw, t)
+		look_pitch = lerp(p.prev_pitch, p.pitch, t)
+	}
+	head_yaw := clamp(eng.wrap_angle(look_yaw - body_yaw), -math.to_radians(f32(75)), math.to_radians(f32(75)))
+	pose.rot[.Head] = {look_pitch, head_yaw, 0}
 
 	// ходьба / бег (формулы Minecraft)
 	phase := swing * 0.6662
@@ -148,6 +156,23 @@ character_pose :: proc(p: ^Character, t: f32) -> (pose: Pose, body_yaw: f32) {
 	pose.rot[.Right_Leg].z += 0.06 * air
 	pose.rot[.Left_Leg].z -= 0.06 * air
 
+	// в воде на месте — лёгкое "бултыхание": руки в стороны и мелкие гребки
+	// попеременно, ноги медленно крутят "велосипед", тело покачивается
+	tread := lerp(p.prev_tread, p.tread, t)
+	if tread > 0.001 {
+		ph := age * 0.32
+		k := tread * (1 - speed * 0.6)
+		pose.rot[.Right_Arm].z += (0.55 + 0.15 * math.cos(ph * 2)) * k
+		pose.rot[.Left_Arm].z -= (0.55 + 0.15 * math.cos(ph * 2 + 1)) * k
+		pose.rot[.Right_Arm].x += (math.sin(ph) * 0.45 - 0.2) * k
+		pose.rot[.Left_Arm].x += (math.sin(ph + math.PI) * 0.45 - 0.2) * k
+		pose.rot[.Right_Leg].x += math.sin(ph * 1.3) * 0.35 * k
+		pose.rot[.Left_Leg].x += math.sin(ph * 1.3 + math.PI) * 0.35 * k
+		pose.rot[.Right_Leg].z += 0.05 * k
+		pose.rot[.Left_Leg].z -= 0.05 * k
+		pose.root_y += math.sin(ph * 2) * 0.5 * tread
+	}
+
 	// присед (и короткое "проседание" при приземлении)
 	pose.rot[.Body].x += 0.5 * crouch
 	pose.rot[.Right_Arm].x += 0.4 * crouch
@@ -159,6 +184,41 @@ character_pose :: proc(p: ^Character, t: f32) -> (pose: Pose, body_yaw: f32) {
 	pose.offset[.Right_Leg] = {0, -0.2 * crouch, -4 * crouch}
 	pose.offset[.Left_Leg] = {0, -0.2 * crouch, -4 * crouch}
 	pose.root_y = -0.125 / MODEL_SCALE * crouch
+
+	// плавание (формулы HumanoidModel из Minecraft): руки гребут над головой,
+	// ноги делают частые махи, голова поднята, всё тело наклонено по взгляду
+	swim := lerp(p.prev_swim, p.swim, t)
+	if swim > 0.001 {
+		q :: proc(f: f32) -> f32 {return -65 * f + f * f}
+		PI :: math.PI
+		f5 := math.mod(swing, 26)
+		tr, tl: [3]f32
+		if f5 < 14 {
+			k := q(f5) / q(14)
+			tr = {0, PI, PI - 1.8707964 * k}
+			tl = {0, PI, PI + 1.8707964 * k}
+		} else if f5 < 22 {
+			f6 := (f5 - 14) / 8
+			tr = {PI / 2 * f6, PI, 1.2707963 + 1.8707964 * f6}
+			tl = {PI / 2 * f6, PI, 5.012389 - 1.8707964 * f6}
+		} else {
+			f3 := (f5 - 22) / 4
+			tr = {PI / 2 - PI / 2 * f3, PI, PI}
+			tl = {PI / 2 - PI / 2 * f3, PI, PI}
+		}
+		ra := &pose.rot[.Right_Arm]
+		la := &pose.rot[.Left_Arm]
+		for i in 0 ..< 3 {
+			ra[i] = lerp(ra[i], tr[i], swim)
+			la[i] = eng.lerp_angle(la[i], tl[i], swim)
+		}
+		pose.rot[.Right_Leg].x = lerp(pose.rot[.Right_Leg].x, 0.3 * math.cos(swing * 0.33333334), swim)
+		pose.rot[.Left_Leg].x = lerp(pose.rot[.Left_Leg].x, 0.3 * math.cos(swing * 0.33333334 + PI), swim)
+		pose.rot[.Head].x = eng.lerp_angle(pose.rot[.Head].x, -PI / 4, swim)
+		tilt := p.in_water ? look_pitch : 0 // ползком на суше — просто лёжа
+		pose.swim_angle = (PI / 2 + tilt) * swim
+		pose.swim_offset = [3]f32{0, -0.9, -0.3} * swim
+	}
 
 	// взмах рукой — ответ на приказ
 	wave := lerp(p.prev_wave, p.wave, t)
@@ -184,6 +244,8 @@ humanoid_model_draw :: proc(m: ^Humanoid_Model, sh: ^Entity_Shader, view_proj: e
 	root :=
 		linalg.matrix4_translate_f32(rel_pos) *
 		linalg.matrix4_rotate_f32(-body_yaw, {0, 1, 0}) *
+		linalg.matrix4_rotate_f32(pose.swim_angle, {1, 0, 0}) *
+		linalg.matrix4_translate_f32(pose.swim_offset) *
 		linalg.matrix4_scale_f32({MODEL_SCALE, MODEL_SCALE, MODEL_SCALE}) *
 		linalg.matrix4_translate_f32({0, pose.root_y, 0})
 	gl.BindVertexArray(m.vao)
