@@ -50,6 +50,11 @@ Frame_Params :: struct {
 	model:       ^Humanoid_Model,
 	player_skin: u32,
 	squad:       ^Squad,
+	clock:       ^Game_Clock,
+	system:      ^Star_System,
+	show_debug:  bool, // панель F3
+	fps:         f64,
+	chunks_drawn: int,
 	t:           f32, // доля между тиками
 	time:        f64,
 	dt:          f32,
@@ -100,6 +105,7 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 		}
 	}
 	eng.imm_init() or_return
+	eng.text_init()
 
 	pixels := build_block_textures(context.temp_allocator)
 	r.atlas = eng.texture_array_create(TEX_SIZE, TEX_SIZE, i32(TEX_LAYER_COUNT), pixels)
@@ -314,6 +320,8 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	}
 	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 	squad_draw_hud(fp.squad, fp.width, fp.height)
+	fp.chunks_drawn = r.chunks_drawn
+	hud_draw(&fp)
 	gl.Disable(gl.BLEND)
 	gl.Enable(gl.DEPTH_TEST)
 	gl.Enable(gl.CULL_FACE)

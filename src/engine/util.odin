@@ -77,3 +77,34 @@ smoothstep :: proc "contextless" (e0, e1, x: f32) -> f32 {
 	t := clamp((x - e0) / (e1 - e0), 0, 1)
 	return t * t * (3 - 2 * t)
 }
+
+// Детерминированный генератор случайных чисел (splitmix64).
+Rng :: struct {
+	state: u64,
+}
+
+rng_make :: proc "contextless" (seed: u64) -> Rng {
+	return {state = seed ~ 0x9E3779B97F4A7C15}
+}
+
+rng_u64 :: proc "contextless" (r: ^Rng) -> u64 {
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ~ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ~ (z >> 27)) * 0x94D049BB133111EB
+	return z ~ (z >> 31)
+}
+
+// [0, 1)
+rng_f64 :: proc "contextless" (r: ^Rng) -> f64 {
+	return f64(rng_u64(r) >> 11) / f64(u64(1) << 53)
+}
+
+rng_range :: proc "contextless" (r: ^Rng, lo, hi: f64) -> f64 {
+	return lo + (hi - lo) * rng_f64(r)
+}
+
+// [lo, hi] включительно
+rng_int :: proc "contextless" (r: ^Rng, lo, hi: int) -> int {
+	return lo + int(rng_u64(r) % u64(hi - lo + 1))
+}

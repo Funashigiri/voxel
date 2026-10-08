@@ -11,9 +11,8 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.003"
+VERSION :: "0.004"
 VIEW_RADIUS :: 10 // чанков
-DEFAULT_SEED :: 20261007
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
 ORDER_RANGE :: 128.0 // дальность приказа «Иди туда», блоков
@@ -21,6 +20,8 @@ ORDER_RANGE :: 128.0 // дальность приказа «Иди туда», �
 Options :: struct {
 	width, height: i32,
 	seed:          u32,
+	has_seed:      bool, // иначе зерно случайное — каждый запуск новый мир
+	start_hour:    f64, // местное время появления
 	cam_mode:      Camera_Mode,
 	yaw, pitch:    f32, // градусы
 	// отладка / автоматические скриншоты
@@ -36,12 +37,13 @@ Options :: struct {
 	order_at:      f64, // через сколько секунд
 	select:        int, // 1, 2 или 3 (оба)
 	water_spawn:   bool, // появиться в воде
+	debug_panel:   bool, // сразу открыть панель F3
 	dump_textures: string,
 }
 
 parse_options :: proc() -> (o: Options) {
 	o.width, o.height = 1280, 720
-	o.seed = DEFAULT_SEED
+	o.start_hour = 7
 	o.cam_mode = .Third_Back
 	o.shot_delay = 1.0
 	o.burst = 1
@@ -68,7 +70,13 @@ parse_options :: proc() -> (o: Options) {
 		case "-pitch":
 			o.pitch = f32(strconv.parse_f64(val) or_else 0)
 		case "-seed":
-			o.seed = u32(strconv.parse_u64(val) or_else DEFAULT_SEED)
+			if v, ok := strconv.parse_u64(val); ok {
+				o.seed = u32(v)
+				o.has_seed = true
+			}
+		case "-time":
+			hs, _, ms := strings.partition(val, ":")
+			o.start_hour = f64(strconv.parse_int(hs) or_else 7) + f64(strconv.parse_int(ms) or_else 0) / 60
 		case "-size":
 			ws, _, hs := strings.partition(val, "x")
 			o.width = i32(strconv.parse_int(ws) or_else 1280)
@@ -91,6 +99,8 @@ parse_options :: proc() -> (o: Options) {
 			o.order_at = strconv.parse_f64(val) or_else 0.3
 		case "-select":
 			o.select = strconv.parse_int(val) or_else 3
+		case "-f3":
+			o.debug_panel = true
 		case "-spawn":
 			o.water_spawn = val == "water"
 		case "-orbit":
@@ -148,6 +158,16 @@ main :: proc() {
 	if !eng.window_create(fmt.tprintf("Voxel %s", VERSION), opts.width, opts.height) do os.exit(1)
 	defer eng.window_destroy()
 
+	if !opts.has_seed {
+		opts.seed = eng.hash_u32(u32(time.time_to_unix_nano(time.now())) ~ u32(time.time_to_unix_nano(time.now()) >> 32))
+	}
+	system := star_system_generate(opts.seed)
+	defer star_system_destroy(&system)
+	clock := clock_init(system.home.day_hours, opts.start_hour)
+	fmt.printfln("Мир %d: звезда %s (%s), планета %s, сутки %.1f ч, гравитация %.2f g",
+		opts.seed, system.star.name, STAR_CLASS_NAMES[system.star.class], home_planet(&system).name,
+		system.home.day_hours, system.home.gravity_g)
+
 	r: Renderer
 	if !renderer_init(&r, VIEW_RADIUS) do os.exit(1)
 
@@ -197,6 +217,7 @@ main :: proc() {
 	sprint_latch := false
 	last_w_press: f64 = -10
 	screenshot_requested := false
+	show_debug := opts.debug_panel
 	fps_timer: f64
 	fps_frames: int
 	shots_taken := 0
@@ -221,6 +242,7 @@ main :: proc() {
 		}
 		if eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
 		if eng.key_pressed(glfw.KEY_F2) do screenshot_requested = true
+		if eng.key_pressed(glfw.KEY_F3) do show_debug = !show_debug
 		if eng.win.focused do handle_squad_keys(&squad, &world, &player)
 		if !auto_order_done && now - start > opts.order_at {
 			auto_order_done = true
@@ -270,6 +292,7 @@ main :: proc() {
 		for accumulator >= TICK_DT && ticks < 10 {
 			character_tick(&player, &world, input)
 			squad_tick(&squad, &world, &player)
+			clock_tick(&clock)
 			accumulator -= TICK_DT
 			ticks += 1
 		}
@@ -288,6 +311,10 @@ main :: proc() {
 				model = &model,
 				player_skin = player_skin_tex,
 				squad = &squad,
+				clock = &clock,
+				system = &system,
+				show_debug = show_debug,
+				fps = last_fps,
 				t = t,
 				time = now - start,
 				dt = f32(dt),
