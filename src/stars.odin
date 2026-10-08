@@ -53,24 +53,27 @@ Star :: struct {
 	seed:        u64,
 }
 
-// frac — доля среди всех звёзд, cell — размер клетки сетки, св. лет.
+// frac — доля среди звёзд в плоскости диска, cell — размер клетки сетки, св. лет,
+// z — толщина их слоя относительно диска (молодые горячие — тонким слоем у
+// плоскости, как в нашей галактике: голубые ~60 пк, белые ~120 пк).
 Star_Tier :: struct {
 	frac: f64,
 	cell: i64,
+	z:    f64,
 }
 
 STAR_TIERS := [Star_Class]Star_Tier {
-	.M           = {0.7082, 8},
-	.K           = {0.12, 16},
-	.G           = {0.075, 16},
-	.F           = {0.03, 32},
-	.A           = {0.006, 64},
-	.B           = {0.0013, 128},
-	.O           = {3e-7, 1024},
-	.Red_Giant   = {0.005, 64},
-	.White_Dwarf = {0.05, 16},
-	.Neutron     = {0.004, 64},
-	.Black_Hole  = {0.0005, 128},
+	.M           = {0.7082, 8, 1},
+	.K           = {0.12, 16, 1},
+	.G           = {0.075, 16, 1},
+	.F           = {0.03, 32, 1},
+	.A           = {0.006, 64, 0.5},
+	.B           = {0.0013, 128, 0.2},
+	.O           = {3e-7, 1024, 0.15},
+	.Red_Giant   = {0.003, 64, 1},
+	.White_Dwarf = {0.05, 16, 1},
+	.Neutron     = {0.004, 64, 1},
+	.Black_Hole  = {0.0005, 128, 1},
 }
 
 ALL_STARS :: bit_set[Star_Class]{.M, .K, .G, .F, .A, .B, .O, .Red_Giant, .White_Dwarf, .Neutron, .Black_Hole}
@@ -93,7 +96,7 @@ star_pop_mult :: proc "contextless" (g: ^Galaxy, class: Star_Class) -> f64 {
 		return math.sqrt(g.young)
 	case .F:
 		return 0.5 + 0.5 * y
-	case .Red_Giant, .White_Dwarf:
+	case .White_Dwarf:
 		return 2 - y
 	}
 	return 1
@@ -134,15 +137,27 @@ star_params :: proc(s: ^Star, r: ^eng.Rng) {
 	case .F:
 		ms(s, r, 1.1, 1.4, 6000, 7500, 1)
 	case .A:
-		ms(s, r, 1.4, 2.1, 7500, 10000, 1.3)
+		ms(s, r, 1.4, 2.5, 7500, 10000, 1.3)
 	case .B:
-		ms(s, r, 2.1, 16, 10000, 30000, 2)
+		ms(s, r, 2.5, 16, 10000, 30000, 4) // больше всего поздних, неярких
 	case .O:
 		ms(s, r, 16, 90, 30000, 50000, 2)
 	case .Red_Giant:
 		s.mass = 0.8 + 2.2 * math.pow(eng.rng_f64(r), 2)
-		s.radius = 10 * math.pow(10, eng.rng_f64(r))
-		s.temperature = eng.rng_range(r, 3300, 5000)
+		// ветви гигантов: нижняя (3–9 радиусов Солнца) — 30%, «красное сгущение»
+		// (9–12) — 63%, верхняя (12–35) — 6,3%, яркие гиганты (35–90) — 0,7%
+		roll := eng.rng_f64(r)
+		switch {
+		case roll < 0.30:
+			s.radius = eng.rng_range(r, 3, 9)
+		case roll < 0.93:
+			s.radius = eng.rng_range(r, 9, 12)
+		case roll < 0.993:
+			s.radius = eng.rng_range(r, 12, 35)
+		case:
+			s.radius = eng.rng_range(r, 35, 90)
+		}
+		s.temperature = s.radius > 35 ? eng.rng_range(r, 3400, 4300) : eng.rng_range(r, 3800, 5100)
 		s.luminosity = s.radius * s.radius * math.pow(s.temperature / 5772, 4)
 	case .White_Dwarf:
 		s.mass = 0.55 + 0.5 * math.pow(eng.rng_f64(r), 3)
@@ -174,9 +189,9 @@ Cell_Galaxy :: struct {
 }
 
 @(private = "file")
-cell_density :: proc(act: []Cell_Galaxy, local: [3]f64, arm_power: f64) -> f64 {
+cell_density :: proc(act: []Cell_Galaxy, local: [3]f64, arm_power, z_scale: f64) -> f64 {
 	rho := 0.0
-	for &a in act do rho += galaxy_density(a.g, a.rel + local, arm_power) * a.mult
+	for &a in act do rho += galaxy_density(a.g, a.rel + local, arm_power, z_scale) * a.mult
 	return rho
 }
 
@@ -198,10 +213,11 @@ star_cell :: proc(u: ^Universe, class: Star_Class, c: [3]Big, gals: []Galaxy, ou
 
 	// средняя и наибольшая плотность по центру и углам клетки
 	power := arm_power_of(class)
-	mean := cell_density(act[:], {S / 2, S / 2, S / 2}, power)
+	zs := tier.z
+	mean := cell_density(act[:], {S / 2, S / 2, S / 2}, power, zs)
 	peak := mean
 	for corner in 0 ..< 8 {
-		rho := cell_density(act[:], {f64(corner & 1) * S, f64((corner >> 1) & 1) * S, f64((corner >> 2) & 1) * S}, power)
+		rho := cell_density(act[:], {f64(corner & 1) * S, f64((corner >> 1) & 1) * S, f64((corner >> 2) & 1) * S}, power, zs)
 		mean += rho
 		peak = max(peak, rho)
 	}
@@ -219,7 +235,7 @@ star_cell :: proc(u: ^Universe, class: Star_Class, c: [3]Big, gals: []Galaxy, ou
 		local: [3]f64
 		for _ in 0 ..< 12 {
 			local = {eng.rng_f64(&sr) * S, eng.rng_f64(&sr) * S, eng.rng_f64(&sr) * S}
-			if eng.rng_f64(&sr) * peak * 1.3 <= cell_density(act[:], local, power) do break
+			if eng.rng_f64(&sr) * peak * 1.3 <= cell_density(act[:], local, power, zs) do break
 		}
 		s.pos = upos_at(origin, local)
 		star_params(&s, &sr)

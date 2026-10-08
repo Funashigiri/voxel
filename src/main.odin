@@ -7,11 +7,12 @@ import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.009"
+VERSION :: "0.010"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -120,7 +121,7 @@ parse_options :: proc() -> (o: Options) {
 		case "-nointro":
 			o.no_intro = true
 		case "-f3":
-			o.debug_page = val == "" ? 1 : clamp(strconv.parse_int(val) or_else 1, 1, 3)
+			o.debug_page = val == "" ? 1 : clamp(strconv.parse_int(val) or_else 1, 1, 4)
 		case "-hours":
 			o.start_hours = max(0, strconv.parse_f64(val) or_else 0)
 		case "-sky":
@@ -216,6 +217,10 @@ main :: proc() {
 	defer star_system_destroy(&system)
 	uinfo := universe_info_build(&universe, home)
 	defer universe_info_destroy(&uinfo)
+	// звёздное небо считается в фоне, пока грузится мир (для -sky — сразу, в отчёте)
+	star_sky: Star_Sky
+	defer starsky_destroy(&star_sky)
+	if !opts.sky_report && !opts.universe_report do starsky_start(&star_sky, opts.seed, home)
 	t3 := time.now()
 	fmt.printfln("Мир %d: галактика %s (%s), звезда %s (%s), планета %s, сутки %.1f ч, гравитация %.2f g",
 		opts.seed, uinfo.galaxy_name, GALAXY_KIND_NAMES[home.galaxy.kind], system.star.name, STAR_CLASS_NAMES[system.star.class],
@@ -234,6 +239,7 @@ main :: proc() {
 
 	r: Renderer
 	if !renderer_init(&r, VIEW_RADIUS) do os.exit(1)
+	if !starsky_gl_init(&star_sky) do os.exit(1)
 
 	player_skin := skin_load_or_generate("assets/skin.png", PALETTE_PLAYER)
 	player_skin_tex := skin_texture_create(&player_skin)
@@ -296,6 +302,9 @@ main :: proc() {
 	astro: Astro
 	astro_init(&astro, &system, opts.start_hour, opts.start_day, lon, opts.seed)
 	if opts.sky_report {
+		star_sky.world_seed, star_sky.home = opts.seed, home
+		starsky_build(&star_sky)
+		starsky_report(&star_sky, &astro)
 		if astro_report(&astro, &system, geo_dir(&world.geo, world.geo.face, site_x, site_z)) > 0 do os.exit(1)
 		return
 	}
@@ -350,6 +359,12 @@ main :: proc() {
 		if opts.look_at != "" {
 			st := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours)
 			d := opts.look_at == "moon" && st.moon_n > 0 ? st.moons[0].frame : st.sun_frame
+			if opts.look_at == "pole" {
+				// небесный полюс над горизонтом (северный — в северном полушарии)
+				pole := st.latitude >= 0 ? astro.axis : -astro.axis
+				f := st.inert_to_frame * pole
+				d = {f32(f.x), f32(f.y), f32(f.z)}
+			}
 			player.yaw = math.atan2(-d.x, d.z)
 			player.pitch = -math.asin(clamp(d.y, -1, 1)) + math.to_radians(f32(4)) // цель — чуть выше прицела
 			player.body_yaw, player.prev_body_yaw = player.yaw, player.yaw
@@ -398,7 +413,18 @@ main :: proc() {
 		}
 		if playing && eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
 		if eng.key_pressed(glfw.KEY_F2) do screenshot_requested = true
-		if eng.key_pressed(glfw.KEY_F3) do debug_page = (debug_page + 1) % 4 // страницы F3 по кругу, 0 — выкл
+		if eng.key_pressed(glfw.KEY_F3) do debug_page = (debug_page + 1) % 5 // страницы F3 по кругу, 0 — выкл
+		if !star_sky.ready && sync.atomic_load(&star_sky.done) {
+			starsky_upload(&star_sky) // небо досчиталось
+			if opts.look_at == "core" {
+				// отладка: взгляд на центр галактики
+				st := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours)
+				f := st.uni_to_frame * star_sky.core_dir
+				player.yaw = math.atan2(f32(-f.x), f32(f.z))
+				player.pitch = -math.asin(clamp(f32(f.y), -1, 1)) + math.to_radians(f32(4))
+				player.body_yaw, player.prev_body_yaw = player.yaw, player.yaw
+			}
+		}
 		if playing && eng.win.focused do handle_squad_keys(&squad, &world, &player)
 		if playing && !auto_order_done && now - start > opts.order_at {
 			auto_order_done = true
@@ -479,7 +505,7 @@ main :: proc() {
 		world_update(&world, player.pos, WORLD_BUDGET)
 
 		// небо этого кадра: солнце, луны, свет — по положению планеты и игрока на ней
-		sky_state := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours + f64(t) * clock_tick_hours(&clock))
+		sky_state := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours + f64(t) * clock_tick_hours(&clock), &star_sky)
 
 		fbw, fbh := eng.win.fb_width, eng.win.fb_height
 		if fbw > 0 && fbh > 0 {
@@ -494,6 +520,7 @@ main :: proc() {
 				cam = &cam,
 				sky = &sky,
 				sky_state = &sky_state,
+				star_sky = &star_sky,
 				model = &model,
 				player_skin = player_skin_tex,
 				capsule = &capsule,
@@ -518,7 +545,8 @@ main :: proc() {
 				path := fmt.tprintf("screenshots/%d.png", time.time_to_unix(time.now()))
 				if eng.save_screenshot(path, fbw, fbh) do fmt.println("Скриншот:", path)
 			}
-			if auto_mode && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
+			// автоснимок ждёт, пока досчитается звёздное небо
+			if auto_mode && (star_sky.ready || star_sky.worker == nil) && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
 				path := opts.shot_path
 				if opts.burst > 1 {
 					base := strings.trim_suffix(path, ".png")

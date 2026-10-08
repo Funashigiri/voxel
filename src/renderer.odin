@@ -25,6 +25,7 @@ Sky_Shader :: struct {
 	prog:                                                   u32,
 	u_inv_view_proj, u_sun_size, u_sun_color, u_px: i32,
 	u_moon, u_moon_light:                 i32,
+	u_band, u_u2f, u_band_k:              i32,
 }
 
 Cloud_Shader :: struct {
@@ -64,6 +65,7 @@ Frame_Params :: struct {
 	cam:         ^Camera,
 	sky:         ^Sky,
 	sky_state:   ^Sky_State, // солнце, луны, свет (astro.odin)
+	star_sky:    ^Star_Sky, // звёзды и свечение неба (starsky.odin)
 	model:       ^Humanoid_Model,
 	player_skin: u32,
 	capsule:     ^Capsule_Model,
@@ -123,6 +125,9 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_px            = loc(p, "u_px"),
 			u_moon          = loc(p, "u_moon"),
 			u_moon_light    = loc(p, "u_moon_light"),
+			u_band          = loc(p, "u_band"),
+			u_u2f           = loc(p, "u_u2f"),
+			u_band_k        = loc(p, "u_band_k"),
 		}
 	}
 	{
@@ -211,6 +216,19 @@ sky_uniforms_sun :: proc(r: ^Renderer, fp: ^Frame_Params) {
 	}
 	gl.Uniform4fv(r.sky.u_moon, MAX_MOONS, &moon[0][0])
 	gl.Uniform4fv(r.sky.u_moon_light, MAX_MOONS, &moon_light[0][0])
+	// свечение неба (полоса галактики) — когда фоновый расчёт готов
+	band_k: f32 = 0
+	if ss := fp.star_sky; ss != nil && ss.ready {
+		band_k = st.band_vis
+		gl.ActiveTexture(gl.TEXTURE1)
+		gl.BindTexture(gl.TEXTURE_2D, ss.tex)
+		gl.ActiveTexture(gl.TEXTURE0)
+	}
+	eng.set_i32(r.sky.u_band, 1)
+	eng.set_f32(r.sky.u_band_k, band_k)
+	u2f: matrix[3, 3]f32
+	for i in 0 ..< 3 do for j in 0 ..< 3 do u2f[i, j] = f32(st.uni_to_frame[i, j])
+	gl.UniformMatrix3fv(r.sky.u_u2f, 1, false, &u2f[0, 0])
 }
 
 // Туман ближайшей аномалии (вершины куба) — в координатах относительно камеры.
@@ -270,6 +288,8 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	set_sky_uniforms(r, r.sky.prog)
 	gl.BindVertexArray(fp.sky.empty_vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, 3)
+	// звёзды и планеты — поверх неба, под землёй и облаками
+	if fp.star_sky != nil && !r.underwater do starsky_draw(fp.star_sky, fp.sky_state, cam.view_proj, fp.time, fp.height, r.anomaly)
 	gl.Enable(gl.DEPTH_TEST)
 	gl.DepthFunc(gl.LESS)
 	gl.DepthMask(true)

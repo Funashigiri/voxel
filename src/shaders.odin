@@ -137,6 +137,9 @@ uniform vec4 u_sun_color;     // цвет диска (rgb), не закрыта�
 uniform float u_px;           // угловой размер пикселя, рад
 uniform vec4 u_moon[3];       // направление (xyz) и угловой радиус (w; 0 — луны нет)
 uniform vec4 u_moon_light[3]; // освещённая часть: цвет и яркость (rgb); пепельный свет (a)
+uniform sampler2D u_band;     // свечение неба: полоса галактики, соседние галактики
+uniform mat3 u_u2f;           // оси вселенной -> оси кадра
+uniform float u_band_k;       // насколько оно видно сейчас (0 — днём, в сумерках, при луне)
 out vec4 o_color;
 ` + SKY_GLSL + ANOMALY_GLSL + `
 float hash12(vec2 p) {
@@ -160,6 +163,14 @@ void main() {
 		sun_disc = u_sun_color.rgb * 1.6 * k * limb;
 		col += u_sun_color.rgb * vis * (0.55 * exp(-sd / (r * 2.5 + 0.004)) + 0.12 * exp(-sd / 0.12));
 		if (vis < 0.03 && sd > r) col += u_sun_color.rgb * 0.35 * exp(-(sd - r) / (r * 0.9)); // корона
+	}
+
+	// свечение неба (у горизонта гаснет в толще воздуха)
+	if (u_band_k > 0.0 && !under && dir.y > -0.02) {
+		vec3 ud = transpose(u_u2f) * dir;
+		vec2 uv = vec2(atan(ud.x, ud.z) / 6.2831853 + 0.5, asin(clamp(ud.y, -1.0, 1.0)) / 3.1415927 + 0.5);
+		float air = exp(-0.25 * (1.0 / max(dir.y + 0.03, 0.03) - 1.0));
+		col += texture(u_band, uv).rgb * u_band_k * air;
 	}
 
 	// луны
@@ -277,5 +288,52 @@ void main() {
 	col = mix(col, sky_color(normalize(v_rel)), fog);
 	col = apply_anomaly(col, v_rel, length(v_rel));
 	o_color = vec4(col, 0.8 * (1.0 - fog));
+}
+`
+
+// ---------------------------------------------------------------- звёзды
+// Звёзды и планеты — точки на «небесной сфере». Яркость и размер — по
+// звёздной величине; у горизонта звёзды тусклее (толща воздуха) и сильнее
+// мерцают; слабее предела видимости (сумерки, луна) — не видны.
+STAR_VS :: `#version 330 core
+layout(location = 0) in vec3 a_dir;    // направление (оси вселенной или инерциальные)
+layout(location = 1) in vec4 a_col;    // цвет, звёздная величина
+layout(location = 2) in float a_phase; // фаза мерцания; < 0 — планета (не мерцает)
+uniform mat4 u_view_proj;
+uniform mat3 u_u2f;
+uniform float u_mlim;
+uniform float u_time;
+uniform float u_scale;
+uniform vec4 u_moon[3];
+out vec3 v_col;
+out vec3 v_dir;
+void main() {
+	vec3 d = normalize(u_u2f * a_dir);
+	v_dir = d;
+	float air = 1.0 / max(d.y + 0.03, 0.03);
+	float m = a_col.a + 0.2 * (air - 1.0);
+	float vis = smoothstep(u_mlim + 0.3, u_mlim - 0.7, m) * step(-0.005, d.y);
+	for (int i = 0; i < 3; i++) {
+		if (u_moon[i].w > 0.0 && length(d - u_moon[i].xyz) < u_moon[i].w) vis = 0.0; // за луной
+	}
+	float tw = 1.0;
+	if (a_phase >= 0.0) {
+		float amp = 0.12 + 0.3 * clamp((air - 1.0) / 6.0, 0.0, 1.0);
+		tw = 1.0 + amp * sin(u_time * (5.0 + a_phase * 11.0) + a_phase * 40.0) * sin(u_time * (3.1 + a_phase * 7.0));
+	}
+	v_col = a_col.rgb * (1.3 * pow(10.0, -0.17 * m) * tw * vis);
+	gl_PointSize = (m < 0.5 ? 3.5 : m < 2.0 ? 3.0 : m < 4.0 ? 2.5 : 2.0) * u_scale;
+	gl_Position = vis > 0.0 ? u_view_proj * vec4(d * 500.0, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);
+}
+`
+
+STAR_FS :: `#version 330 core
+in vec3 v_col;
+in vec3 v_dir;
+out vec4 o_color;
+` + ANOMALY_GLSL + `
+void main() {
+	float k = 1.0 - smoothstep(0.32, 0.55, length(gl_PointCoord - 0.5));
+	o_color = vec4(v_col * k * exp(-anomaly_depth(v_dir, 1e4)), 1.0);
 }
 `

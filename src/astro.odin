@@ -117,6 +117,24 @@ Astro :: struct {
 	star_r:     f64, // км
 	star_lum:   f64,
 	star_color: [3]f32,
+	// остальные планеты системы (видны на небе блуждающими точками)
+	others:     [MAX_PLANETS]Orbit,
+	other_d:    [MAX_PLANETS]f64, // диаметр, км
+	other_p:    [MAX_PLANETS]f64, // отражательная способность
+	other_kind: [MAX_PLANETS]Planet_Kind,
+	other_n:    int,
+	other_idx:  [MAX_PLANETS]int, // номер в системе
+	// как оси вселенной (галактики, звёзды) лежат относительно осей нашей системы
+	uni_to_inert: matrix[3, 3]f64,
+}
+
+// Другая планета системы на нашем небе.
+Sky_Planet :: struct {
+	dir:       [3]f32, // направление от нас (инерциальные оси)
+	color:     [3]f32,
+	mag:       f64, // видимая звёздная величина
+	elevation: f64, // градусы
+	index:     int, // номер в системе
 }
 
 Sky_Moon :: struct {
@@ -142,6 +160,15 @@ Sky_State :: struct {
 	sun_color:   [3]f32,
 	moons:       [MAX_MOONS]Sky_Moon,
 	moon_n:      int,
+	planets:     [MAX_PLANETS]Sky_Planet,
+	planet_n:    int,
+	// повороты для неба: оси вселенной и инерциальные оси -> оси кадра
+	uni_to_frame:   matrix[3, 3]f64,
+	inert_to_frame: matrix[3, 3]f64,
+	mag_limit:   f64, // самые слабые звёзды, видные сейчас (сумерки и луна мешают)
+	band_vis:    f32, // насколько видно свечение неба (0..1)
+	night_lux:   f64, // свет неба без луны: звёзды, полоса галактики, свечение воздуха
+	pole_uni:    [3]f64, // небесный полюс над горизонтом — в осях вселенной
 	// время
 	local_hours: f64, // 0..24, среднее местное время
 	day:         int, // день с высадки (с 1)
@@ -186,6 +213,34 @@ astro_init :: proc(a: ^Astro, s: ^Star_System, start_hour: f64, start_day: int, 
 	a.star_lum = s.star.luminosity
 	a.star_color = s.star.color
 
+	// остальные планеты — в той же плоскости, со своими эллипсами
+	for i in 0 ..< s.planet_count {
+		if i == home.index do continue
+		p := &s.planets[i]
+		k := a.other_n
+		a.others[k] = {a = p.orbit_au, e = p.ecc, peri = p.peri, mean0 = p.mean0, period = p.year_hours}
+		a.other_d[k] = 2 * p.radius_km
+		a.other_kind[k] = p.kind
+		a.other_idx[k] = i
+		a.other_p[k] = p.kind == .Rocky ? 0.25 : p.kind == .Gas_Giant ? 0.5 : 0.45
+		a.other_n += 1
+	}
+
+	// оси вселенной относительно осей системы — случайный поворот (кватернион Шумейка)
+	{
+		r := eng.rng_make(u64(seed) ~ 0x5C7_A1E5)
+		u1, u2, u3 := eng.rng_f64(&r), eng.rng_f64(&r), eng.rng_f64(&r)
+		qx := math.sqrt(1 - u1) * math.sin(2 * math.PI * u2)
+		qy := math.sqrt(1 - u1) * math.cos(2 * math.PI * u2)
+		qz := math.sqrt(u1) * math.sin(2 * math.PI * u3)
+		qw := math.sqrt(u1) * math.cos(2 * math.PI * u3)
+		a.uni_to_inert = {
+			1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw),
+			2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw),
+			2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy),
+		}
+	}
+
 	a.moon_n = home.moon_count
 	for i in 0 ..< a.moon_n {
 		m := &home.moons[i]
@@ -209,7 +264,7 @@ astro_init :: proc(a: ^Astro, s: ^Star_System, start_hour: f64, start_day: int, 
 	lam := wrap_pi(math.to_radians(lon))
 	a.theta0 = (start_hour - 12) / 24 * 2 * math.PI - lam + mean_sun_ra(a, 0)
 	h0 := lam - mean_sun_ra(a, 0) + a.theta0
-	a.day_base = math.floor((h0 + math.PI) / (2 * math.PI)) - 1
+	a.day_base = math.floor((h0 + math.PI) / (2 * math.PI) + 1e-6) - 1 // +eps: старт ровно в полночь — тоже день 1
 }
 
 // Прямое восхождение «среднего солнца» (равномерно идущего по небесному экватору).
@@ -255,7 +310,8 @@ angle_between :: proc(a, b: [3]f64) -> f64 {
 
 // Состояние неба в момент T для игрока в точке d (единичный вектор в осях
 // планеты). ex, ez — куда смотрят оси x и z кадра в этой точке (в осях планеты).
-astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64) -> (st: Sky_State) {
+// sky — звёздное небо (свет безлунной ночи); nil — пока не готово.
+astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64, sky: ^Star_Sky = nil) -> (st: Sky_State) {
 	theta := a.theta0 + 2 * math.PI * T / a.sidereal
 	xb := a.x0 * math.cos(theta) - a.z0 * math.sin(theta)
 	zb := a.z0 * math.cos(theta) + a.x0 * math.sin(theta)
@@ -265,6 +321,16 @@ astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64) -> (st: Sky_State) {
 		f /= len3(f)
 		return {f32(f.x), f32(f.y), f32(f.z)}
 	}
+	// оси кадра в инерциальных осях -> поворот «инерциальные -> кадр» (строки)
+	axes := [3][3]f64{ex, d, ez}
+	for k in 0 ..< 3 {
+		e := axes[k]
+		F := xb * e.x + a.axis * e.y + zb * e.z
+		F /= len3(F)
+		for c in 0 ..< 3 do st.inert_to_frame[k, c] = F[c]
+	}
+	st.uni_to_frame = st.inert_to_frame * a.uni_to_inert
+	st.pole_uni = mat_t_mul(a.uni_to_inert, d.y >= 0 ? a.axis : -a.axis)
 
 	// местный горизонт: восток, север, зенит
 	east := cross3({0, 1, 0}, d)
@@ -326,10 +392,42 @@ astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64) -> (st: Sky_State) {
 		}
 	}
 
+	// --- другие планеты системы: блуждающие яркие точки (свет звезды, отражённый их диском)
+	for i in 0 ..< a.other_n {
+		q := orbit_pos(&a.others[i], T)
+		rel := q - p
+		dl := len3(rel)
+		r := len3(q)
+		alpha := math.acos(clamp(dot3d(q, rel) / (r * dl), -1, 1)) // звезда — планета — мы
+		phase := max(((math.PI - alpha) * math.cos(alpha) + math.sin(alpha)) / math.PI, 1e-4)
+		H := 5 * math.log10(1329 / (a.other_d[i] * math.sqrt(a.other_p[i]))) // как у планет Солнечной системы
+		pl := &st.planets[i]
+		pl.mag = H + 5 * math.log10(r * dl) - 2.5 * math.log10(phase) - 2.5 * math.log10(max(a.star_lum, 1e-6))
+		dir := rel / dl
+		pl.dir = {f32(dir.x), f32(dir.y), f32(dir.z)}
+		pl.elevation = math.to_degrees(math.asin(clamp(dot3d(to_body(dir, xb, a.axis, zb), d), -1, 1)))
+		pl.index = a.other_idx[i]
+		switch a.other_kind[i] {
+		case .Rocky:
+			pl.color = {1.0, 0.86, 0.72}
+		case .Gas_Giant:
+			pl.color = {1.0, 0.95, 0.82}
+		case .Ice_Giant:
+			pl.color = {0.82, 0.95, 1.0}
+		}
+	}
+	st.planet_n = a.other_n
+
 	// --- свет: днём солнце, в сумерках рассеянный свет, ночью луны и звёзды
 	// при полном затмении светят корона и небо за краем тени — как в глубоких сумерках
 	sun_lux := sun_curve(st.sun_elev) * flux * max(st.sun_visible, 1e-5)
-	st.lux = sun_lux + moon_lux + NIGHT_LUX
+	// безлунная ночь: настоящие звёзды и полоса галактики (пока небо считается — средняя оценка)
+	st.night_lux = sky != nil && sky.ready ? starsky_night_lux(sky, st.uni_to_frame) : NIGHT_LUX
+	st.lux = sun_lux + moon_lux + st.night_lux
+	// предел видимости звёзд: сумерки и лунный свет засвечивают небо
+	scatter := sun_lux + 0.6 * moon_lux
+	st.mag_limit = MAG_LIMIT - 1.1 * math.log10(1 + scatter / NIGHT_LUX)
+	st.band_vis = f32(NIGHT_LUX / (NIGHT_LUX + scatter))
 	level := clamp((math.log10(st.lux) + 3.2) / 8.2, 0, 1)
 	bright := math.pow(level, 1.6)
 	st.brightness = f32(bright)
@@ -342,7 +440,7 @@ astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64) -> (st: Sky_State) {
 	twilight_c := [3]f64{0.62, 0.7, 1.0}
 	sun_w := st.sun_elev > 0 ? sun_lux : 0
 	tw_w := st.sun_elev > 0 ? 0 : sun_lux
-	col := sun_c * sun_w + twilight_c * tw_w + [3]f64{0.65, 0.75, 1.0} * moon_lux + [3]f64{0.55, 0.6, 0.85} * NIGHT_LUX
+	col := sun_c * sun_w + twilight_c * tw_w + [3]f64{0.65, 0.75, 1.0} * moon_lux + [3]f64{0.55, 0.6, 0.85} * st.night_lux
 	col /= max(col.r * 0.3 + col.g * 0.59 + col.b * 0.11, 1e-9)
 	for k in 0 ..< 3 do st.light[k] = f32(min(col[k] * bright, 1))
 	st.desat = f32(1 - smooth(0.03, 0.3, bright))
@@ -434,11 +532,11 @@ sun_decl_at :: proc(a: ^Astro, T: f64) -> f64 {
 }
 
 // Небо для точки pos кадра: направление от центра планеты и куда смотрят оси x, z кадра.
-astro_sky_at :: proc(a: ^Astro, g: ^Planet_Geo, pos: [3]f64, T: f64) -> Sky_State {
+astro_sky_at :: proc(a: ^Astro, g: ^Planet_Geo, pos: [3]f64, T: f64, sky: ^Star_Sky = nil) -> Sky_State {
 	d := geo_frame_dir(g, pos.x, pos.z)
 	ex := norm3(geo_frame_dir(g, pos.x + 8, pos.z) - d)
 	ez := norm3(geo_frame_dir(g, pos.x, pos.z + 8) - d)
-	return astro_update(a, T, d, ex, ez)
+	return astro_update(a, T, d, ex, ez, sky)
 }
 
 SEASON_NAMES := [4]string{"весна", "лето", "осень", "зима"}

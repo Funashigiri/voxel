@@ -29,11 +29,15 @@ Panel :: struct {
 
 // колонки таблиц: планеты, ближайшие звёзды, ближайшие галактики
 @(private = "file")
-PLANET_COLS := [?]f32{0, 16, 106, 156}
+PLANET_COLS := [?]f32{0, 16, 106, 170}
 @(private = "file")
 STAR_COLS := [?]f32{0, 50, 162, 250}
 @(private = "file")
 GALAXY_COLS := [?]f32{0, 62, 208, 318}
+@(private = "file")
+SKYSTAR_COLS := [?]f32{0, 62, 182, 274}
+@(private = "file")
+SKYGAL_COLS := [?]f32{0, 62, 214, 264}
 
 @(private = "file")
 panel_line :: proc(p: ^Panel, color: [4]u8, parts: ..string) {
@@ -103,13 +107,13 @@ lon_text :: proc(lon: f64) -> string {
 	return lon <= 180 ? fmt.tprintf("%.1f° в.д.", lon) : fmt.tprintf("%.1f° з.д.", 360 - lon)
 }
 
-PAGE_TITLES := [4]string{"", "мир и планета", "звёздная система", "галактика и вселенная"}
+PAGE_TITLES := [5]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо"}
 
 // Шапка любой страницы F3.
 @(private = "file")
 page_header :: proc(p: ^Panel, fp: ^Frame_Params) {
 	panel_line(p, WHITE, fmt.tprintf("Voxel %s  —  %d FPS", VERSION, int(fp.fps + 0.5)))
-	panel_line(p, GRAY, fmt.tprintf("F3: страница %d/3 — %s", fp.debug_page, PAGE_TITLES[fp.debug_page]))
+	panel_line(p, GRAY, fmt.tprintf("F3: страница %d/4 — %s", fp.debug_page, PAGE_TITLES[fp.debug_page]))
 	panel_gap(p)
 }
 
@@ -251,6 +255,69 @@ page_universe :: proc(p: ^Panel, fp: ^Frame_Params) {
 	p.cols = nil
 }
 
+
+// Страница 4: звёздное небо — звёзды, полярная звезда, пыль, планеты, галактики.
+@(private = "file")
+page_sky :: proc(p: ^Panel, fp: ^Frame_Params) {
+	ss := fp.star_sky
+	st := fp.sky_state
+	if ss == nil || !ss.ready {
+		panel_line(p, GOLD, "Звёздное небо ещё считается...")
+		return
+	}
+	up := [3]f64{st.uni_to_frame[1, 0], st.uni_to_frame[1, 1], st.uni_to_frame[1, 2]}
+	above, seen := 0, 0
+	for &s in ss.stars {
+		y := up.x * f64(s.dir.x) + up.y * f64(s.dir.y) + up.z * f64(s.dir.z)
+		if y <= 0 do continue
+		above += 1
+		if f64(s.mag) + 0.2 * (1 / max(y + 0.03, 0.03) - 1) <= st.mag_limit do seen += 1
+	}
+	panel_line(p, GOLD, fmt.tprintf("Звёздное небо: глазом видно %d звёзд (всё небо, до %.1f величины)", len(ss.stars), MAG_LIMIT))
+	if st.mag_limit < -1 {
+		panel_line(p, WHITE, fmt.tprintf("сейчас светло — звёзд не видно (над горизонтом %d)", above))
+	} else {
+		panel_line(p, WHITE, fmt.tprintf("сейчас видно до %.1f величины: %d звёзд из %d над горизонтом", st.mag_limit, seen, above))
+	}
+	if star, ang := starsky_pole_star(ss, st.pole_uni); star != nil {
+		panel_line(p, WHITE, fmt.tprintf("полярная звезда: %s, %.1f° от полюса мира, %.1f величины", star_name(star.seed, context.temp_allocator), ang, star.mag))
+	} else {
+		panel_line(p, WHITE, "полярной звезды нет — у полюса мира нет яркой звезды")
+	}
+	core := st.uni_to_frame * ss.core_dir
+	panel_line(p, WHITE, fmt.tprintf("центр галактики: %s, высота %.0f°; пыль ослабляет его свет на %.1f величины",
+		ly_text(ss.core_dist), math.to_degrees(math.asin(clamp(core.y, -1, 1))), ss.core_dust))
+	panel_line(p, WHITE, fmt.tprintf("свет безлунной ночи: %s (звёзды, полоса галактики, свечение воздуха)", lux_text(st.night_lux)))
+	panel_gap(p)
+
+	panel_line(p, GOLD, "Самые яркие звёзды:")
+	p.cols = SKYSTAR_COLS[:]
+	for s, i in ss.stars {
+		if i >= 7 do break
+		panel_line(p, WHITE, star_name(s.seed, context.temp_allocator), STAR_CLASS_NAMES[s.class], ly_text(f64(s.dist)), fmt.tprintf("%.1f вел.", s.mag))
+	}
+	p.cols = nil
+	panel_gap(p)
+
+	panel_line(p, GOLD, "Планеты на небе:")
+	p.cols = SKYSTAR_COLS[:]
+	for i in 0 ..< st.planet_n {
+		pl := &st.planets[i]
+		where_ := pl.elevation < 0 ? "за горизонтом" : pl.mag + 0.2 * (1 / max(math.sin(math.to_radians(pl.elevation)) + 0.03, 0.03) - 1) <= st.mag_limit ? fmt.tprintf("видна, высота %.0f°", pl.elevation) : "не видна — светло"
+		panel_line(p, WHITE, fp.system.planets[pl.index].name, PLANET_KIND_NAMES[fp.system.planets[pl.index].kind], fmt.tprintf("%.1f вел.", pl.mag), where_)
+	}
+	p.cols = nil
+	panel_gap(p)
+
+	panel_line(p, GOLD, fmt.tprintf("Галактики, видимые глазом: %d", len(ss.galaxies)))
+	p.cols = SKYGAL_COLS[:]
+	for g, i in ss.galaxies {
+		if i >= 3 do break
+		panel_line(p, WHITE, galaxy_name(g.seed, context.temp_allocator), GALAXY_KIND_NAMES[g.kind], fmt.tprintf("%.1f вел.", g.mag), fmt.tprintf("%.1f°, %s", g.size, ly_text(f64(g.dist))))
+	}
+	p.cols = nil
+}
+
 // Рисует весь текстовый интерфейс (вызывать с включённым смешиванием).
 hud_draw :: proc(fp: ^Frame_Params) {
 	ortho := linalg.matrix_ortho3d_f32(0, f32(fp.width), f32(fp.height), 0, -1, 1)
@@ -266,6 +333,8 @@ hud_draw :: proc(fp: ^Frame_Params) {
 			page_system(&p, fp)
 		case 3:
 			page_universe(&p, fp)
+		case 4:
+			page_sky(&p, fp)
 		}
 	}
 	eng.imm_flush(ortho)

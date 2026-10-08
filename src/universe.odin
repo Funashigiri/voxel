@@ -323,6 +323,7 @@ Galaxy :: struct {
 	n, e1, e2: [3]f64,
 	extent:    f64, // дальше звёзд нет, св. лет
 	young:     f64, // молодых горячих звёзд относительно нашей галактики
+	dust:      f64, // сколько пыли (1 — как в нашей)
 	disk_r, disk_h, disk_rho0: f64,
 	arms:      int,
 	arm_pitch, arm_phase, arm_amp: f64,
@@ -360,35 +361,74 @@ galaxy_arm :: proc "contextless" (g: ^Galaxy, x, y, R: f64) -> (factor, s: f64) 
 
 // Плотность звёзд галактики в точке rel (св. годы от центра), звёзд на св. год³.
 // arm_power — насколько звёзды собраны в рукава (молодым горячим — сильнее).
-galaxy_density :: proc "contextless" (g: ^Galaxy, rel: [3]f64, arm_power: f64 = 1) -> f64 {
+// z_scale < 1 — молодое население: живёт только в диске (и сгустках), слоем
+// тоньше обычного; доля звёзд задана в плоскости диска, поэтому всего их меньше.
+galaxy_density :: proc "contextless" (g: ^Galaxy, rel: [3]f64, arm_power: f64 = 1, z_scale: f64 = 1) -> f64 {
 	r2 := dot3d(rel, rel)
 	if r2 > g.extent * g.extent do return 0
 	x, y, z := dot3d(rel, g.e1), dot3d(rel, g.e2), dot3d(rel, g.n)
 	rho := 0.0
 	if g.disk_rho0 > 0 {
 		R := math.sqrt(x * x + y * y)
-		d := g.disk_rho0 * math.exp(-R / g.disk_r - abs(z) / g.disk_h)
+		d := g.disk_rho0 * math.exp(-R / g.disk_r - abs(z) / (g.disk_h * z_scale))
 		if g.arms > 0 && arm_power > 0 {
 			f, _ := galaxy_arm(g, x, y, R)
 			d *= arm_power == 1 ? f : math.pow(f, arm_power)
 		}
 		rho += d
 	}
-	if g.sph_rho0 > 0 {
+	young := z_scale < 1
+	if g.sph_rho0 > 0 && !young {
 		zq := z / g.sph_q
 		rho += g.sph_rho0 * plummer_shape((x * x + y * y + zq * zq) / (g.sph_a * g.sph_a))
 	}
-	if g.bar_rho0 > 0 {
+	if g.bar_rho0 > 0 && !young {
 		bx, by, bz := x / g.bar_a, y / g.bar_b, z / g.disk_h
 		rho += g.bar_rho0 * plummer_shape(bx * bx + by * by + bz * bz)
 	}
-	if g.halo_rho0 > 0 do rho += g.halo_rho0 * plummer_shape(r2 / (g.halo_a * g.halo_a))
+	if g.halo_rho0 > 0 && !young do rho += g.halo_rho0 * plummer_shape(r2 / (g.halo_a * g.halo_a))
 	for i in 0 ..< g.clump_n {
 		c := &g.clumps[i]
 		d := [3]f64{x, y, z} - c.pos
 		rho += c.rho0 * plummer_shape(dot3d(d, d) / (c.a * c.a))
 	}
 	return rho
+}
+
+// Свет галактики для свечения неба: старые звёзды (балдж, гало, перемычка,
+// основа диска) и молодые голубоватые (часть диска и сгустков), звёзд на св. год³.
+galaxy_light :: proc "contextless" (g: ^Galaxy, rel: [3]f64) -> (old, young: f64) {
+	total := galaxy_density(g, rel)
+	if total <= 0 do return
+	part := 0.0
+	if g.disk_rho0 > 0 || g.clump_n > 0 do part = galaxy_density(g, rel, 1, 0.999) * 0.3 * min(g.young, 1.5)
+	young = min(part, total)
+	return total - young, young
+}
+
+DUST_KAPPA :: 0.035 // поглощение пылью на звезду диска (у нас — ~0,55 звёздной величины на 1000 св. лет)
+
+// Пыль: насколько слабеет свет (звёздных величин в полосе V на световой год).
+// Слой пыли тоньше звёздного диска, шире его и гуще в рукавах.
+galaxy_dust :: proc "contextless" (g: ^Galaxy, rel: [3]f64) -> f64 {
+	if g.dust <= 0 do return 0
+	if dot3d(rel, rel) > g.extent * g.extent do return 0
+	x, y, z := dot3d(rel, g.e1), dot3d(rel, g.e2), dot3d(rel, g.n)
+	d := 0.0
+	if g.disk_rho0 > 0 {
+		R := math.sqrt(x * x + y * y)
+		d = g.disk_rho0 * math.exp(-R / (1.2 * g.disk_r) - abs(z) / (0.35 * g.disk_h))
+		if g.arms > 0 {
+			f, _ := galaxy_arm(g, x, y, R)
+			d *= f * math.sqrt(f)
+		}
+	}
+	for i in 0 ..< g.clump_n {
+		c := &g.clumps[i]
+		dd := [3]f64{x, y, z} - c.pos
+		d += c.rho0 * plummer_shape(dot3d(dd, dd) / (c.a * c.a))
+	}
+	return DUST_KAPPA * g.dust * d
 }
 
 @(private = "file")
@@ -488,6 +528,11 @@ galaxy_make :: proc(r: ^eng.Rng, seed: u64, center: U_Pos, n: f64, dense, satell
 		sph_stars = n * 0.1
 	}
 	g.bh_mass = max(1e4, sph_stars * 0.6 * 1e-3 * lognorm(r, 0.4))
+	DUST := [Galaxy_Kind]f64 {
+		.Spiral = 1, .Barred_Spiral = 1, .Lenticular = 0.15, .Elliptical = 0.02,
+		.Irregular = 0.6, .Dwarf_Elliptical = 0.01, .Dwarf_Irregular = 0.3,
+	}
+	g.dust = DUST[g.kind]
 	return
 }
 
