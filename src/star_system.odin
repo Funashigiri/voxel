@@ -1,8 +1,11 @@
 package main
 
-// Звёздная система, случайная для каждого мира (по зерну).
-// Физика упрощённая, но честная: светимость ~ масса^4, пригодная для жизни зона
-// по светимости, год по закону Кеплера, гравитация из массы и радиуса.
+// Звёздная система у звезды. Сама звезда — из вселенной (stars.odin), а
+// планеты генерируются по её зерну, когда понадобятся: систему может получить
+// любая звезда. У нашей звезды одна планета гарантированно каменная и в
+// пригодной для жизни зоне — на ней мы.
+// Физика упрощённая, но честная: зона жизни по светимости, год по закону
+// Кеплера, гравитация из массы и радиуса.
 
 import "core:fmt"
 import "core:math"
@@ -14,30 +17,6 @@ EARTH_YEAR_HOURS :: 8766.0 // 365.25 суток
 GM_EARTH :: 3.986004418e14 // м³/с²
 MAX_PLANETS :: 10
 MAX_MOONS :: 3
-
-Star_Class :: enum u8 {
-	M, // красный карлик
-	K, // оранжевый карлик
-	G, // жёлтый карлик (как Солнце)
-	F, // жёлто-белая звезда
-}
-
-STAR_CLASS_NAMES := [Star_Class]string {
-	.M = "красный карлик",
-	.K = "оранжевый карлик",
-	.G = "жёлтый карлик",
-	.F = "жёлто-белая звезда",
-}
-
-Star :: struct {
-	name:        string,
-	class:       Star_Class,
-	mass:        f64, // масс Солнца
-	luminosity:  f64, // светимостей Солнца
-	radius:      f64, // радиусов Солнца
-	temperature: f64, // К
-	color:       [3]f32,
-}
 
 Planet_Kind :: enum u8 {
 	Rocky,
@@ -81,23 +60,22 @@ Home_Planet :: struct {
 }
 
 Star_System :: struct {
-	seed:         u32,
+	seed:         u32, // зерно мира
 	star:         Star,
 	planets:      [MAX_PLANETS]Planet,
 	planet_count: int,
+	has_home:     bool,
 	home:         Home_Planet,
 }
 
 @(private = "file")
 SYLLABLES := [?]string{"ка", "ре", "ла", "ми", "то", "ва", "на", "ри", "со", "де", "лу", "ки", "мо", "та", "ше", "за", "ни", "ра", "ве", "ор", "ан", "ис", "ус", "ел", "ар", "ти", "го", "ди", "ке", "ну"}
 
-@(private = "file")
-make_name :: proc(r: ^eng.Rng) -> string {
-	b := strings.builder_make()
-	for _ in 0 ..< eng.rng_int(r, 2, 3) do strings.write_string(&b, SYLLABLES[eng.rng_int(r, 0, len(SYLLABLES) - 1)])
-	name := eng.capitalize(strings.to_string(b), context.allocator)
-	strings.builder_destroy(&b)
-	return name
+// Имя из lo..hi слогов.
+make_name :: proc(r: ^eng.Rng, lo, hi: int, allocator := context.allocator) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	for _ in 0 ..< eng.rng_int(r, lo, hi) do strings.write_string(&b, SYLLABLES[eng.rng_int(r, 0, len(SYLLABLES) - 1)])
+	return eng.capitalize(strings.to_string(b), allocator)
 }
 
 // Цвет абсолютно чёрного тела по температуре (приближение Таннера Хелланда).
@@ -127,58 +105,64 @@ year_hours :: proc(orbit_au, star_mass: f64) -> f64 {
 	return math.sqrt(orbit_au * orbit_au * orbit_au / star_mass) * EARTH_YEAR_HOURS
 }
 
-star_system_generate :: proc(seed: u32) -> (s: Star_System) {
-	r := eng.rng_make(u64(seed) * 0x2545F4914F6CDD1D + 1)
-	s.seed = seed
-
-	// --- звезда (чаще — похожие на Солнце, чтобы планеты были разнообразнее)
-	roll := eng.rng_f64(&r)
-	star := &s.star
-	switch {
-	case roll < 0.30:
-		star.class = .M
-		star.mass = eng.rng_range(&r, 0.35, 0.6)
-		star.temperature = eng.rng_range(&r, 3100, 3900)
-	case roll < 0.60:
-		star.class = .K
-		star.mass = eng.rng_range(&r, 0.6, 0.85)
-		star.temperature = eng.rng_range(&r, 3900, 5200)
-	case roll < 0.88:
-		star.class = .G
-		star.mass = eng.rng_range(&r, 0.85, 1.1)
-		star.temperature = eng.rng_range(&r, 5200, 6000)
-	case:
-		star.class = .F
-		star.mass = eng.rng_range(&r, 1.1, 1.4)
-		star.temperature = eng.rng_range(&r, 6000, 7200)
+// Сколько планет у звезды (у горячих гигантов и остатков звёзд — реже).
+@(private = "file")
+planet_count_for :: proc(class: Star_Class, r: ^eng.Rng) -> int {
+	none, most: f64
+	switch class {
+	case .M, .K, .G, .F:
+		none, most = 0.15, 10
+	case .A:
+		none, most = 0.3, 7
+	case .B, .O:
+		none, most = 0.6, 4
+	case .Red_Giant:
+		none, most = 0.4, 6
+	case .White_Dwarf:
+		none, most = 0.6, 4
+	case .Neutron:
+		none, most = 0.9, 3
+	case .Black_Hole:
+		none, most = 0.95, 1
 	}
-	star.luminosity = star.mass < 0.43 ? 0.23 * math.pow(star.mass, 2.3) : math.pow(star.mass, 4)
-	star.radius = math.pow(star.mass, 0.8)
-	star.color = star_color(star.temperature)
-	star.name = make_name(&r)
+	if eng.rng_f64(r) < none do return 0
+	return eng.rng_int(r, 1, int(most))
+}
 
-	// --- орбиты: наша планета в пригодной для жизни зоне, остальные — вокруг
-	sqrt_l := math.sqrt(star.luminosity)
-	home_orbit := eng.rng_range(&r, 0.95, 1.35) * sqrt_l
+// Система звезды star. home — наша звезда: одна планета каменная и в зоне жизни.
+star_system_generate :: proc(world_seed: u32, star: Star, home: bool) -> (s: Star_System) {
+	r := eng.rng_make(star.seed * 0x2545F4914F6CDD1D + 1)
+	s.seed = world_seed
+	s.star = star
+	s.star.name = star_name(star.seed)
+	s.has_home = home
+
+	// --- орбиты (у нашей звезды — наша планета в пригодной для жизни зоне)
+	sqrt_l := math.sqrt(max(star.luminosity, 1e-4))
 	frost_line := 2.7 * sqrt_l
-	n := eng.rng_int(&r, 2, MAX_PLANETS)
-	home_i := eng.rng_int(&r, 0, min(n - 1, 3))
-	s.planet_count = n
-	s.planets[home_i].orbit_au = home_orbit
-	for i := home_i - 1; i >= 0; i -= 1 {
-		s.planets[i].orbit_au = s.planets[i + 1].orbit_au / eng.rng_range(&r, 1.4, 2.0)
+	mass := max(star.mass, 0.08)
+	n, home_i := 0, -1
+	if home {
+		n = eng.rng_int(&r, 2, MAX_PLANETS)
+		home_i = eng.rng_int(&r, 0, min(n - 1, 3))
+		s.planets[home_i].orbit_au = eng.rng_range(&r, 0.95, 1.35) * sqrt_l
+		for i := home_i - 1; i >= 0; i -= 1 {
+			s.planets[i].orbit_au = s.planets[i + 1].orbit_au / eng.rng_range(&r, 1.4, 2.0)
+		}
+	} else {
+		n = planet_count_for(star.class, &r)
+		if n > 0 do s.planets[0].orbit_au = eng.rng_range(&r, 0.04, 0.5) * max(sqrt_l, 0.1)
 	}
-	for i in home_i + 1 ..< n {
+	for i in max(home_i + 1, 1) ..< n {
 		s.planets[i].orbit_au = s.planets[i - 1].orbit_au * eng.rng_range(&r, 1.4, 2.2)
 	}
+	s.planet_count = n
 
 	letters := "bcdefghijk"
 	for i in 0 ..< n {
 		p := &s.planets[i]
-		p.name = fmt.aprintf("%s %c", star.name, rune(letters[i]))
-		if i == home_i {
-			p.kind = .Rocky
-		} else if p.orbit_au < frost_line {
+		p.name = fmt.aprintf("%s %c", s.star.name, rune(letters[i]))
+		if i == home_i || p.orbit_au < frost_line {
 			p.kind = .Rocky
 		} else {
 			p.kind = eng.rng_f64(&r) < 0.6 ? .Gas_Giant : .Ice_Giant
@@ -195,30 +179,31 @@ star_system_generate :: proc(seed: u32) -> (s: Star_System) {
 			p.radius_km = eng.rng_range(&r, 8, 12.5) * EARTH_RADIUS_KM
 			p.mass_earth = eng.rng_range(&r, 30, 700)
 		}
-		p.year_hours = year_hours(p.orbit_au, star.mass)
+		p.year_hours = year_hours(p.orbit_au, mass)
 	}
+	if !home do return
 
 	// --- наша планета: размер, гравитация, сутки, наклон оси, луны
-	home := &s.home
-	home.index = home_i
+	h := &s.home
+	h.index = home_i
 	hp := &s.planets[home_i]
 	re := eng.rng_range(&r, 0.5, 1.6)
 	density := eng.rng_range(&r, 0.85, 1.15) // относительно Земли
-	home.gravity_g = clamp(density * re, 0.4, 1.8)
+	h.gravity_g = clamp(density * re, 0.4, 1.8)
 	hp.radius_km = re * EARTH_RADIUS_KM
-	hp.mass_earth = home.gravity_g * re * re // g = M / R²
-	home.day_hours = eng.rng_range(&r, 16, 40)
+	hp.mass_earth = h.gravity_g * re * re // g = M / R²
+	h.day_hours = eng.rng_range(&r, 16, 40)
 	// звёздные сутки: 1/звёздные = 1/солнечные + 1/год
-	home.sidereal_hours = 1 / (1 / home.day_hours + 1 / hp.year_hours)
-	home.axial_tilt_deg = eng.rng_range(&r, 0, 45)
-	home.year_days = hp.year_hours / home.day_hours
+	h.sidereal_hours = 1 / (1 / h.day_hours + 1 / hp.year_hours)
+	h.axial_tilt_deg = eng.rng_range(&r, 0, 45)
+	h.year_days = hp.year_hours / h.day_hours
 
 	moon_roll := eng.rng_f64(&r)
-	home.moon_count = moon_roll < 0.25 ? 0 : moon_roll < 0.65 ? 1 : moon_roll < 0.9 ? 2 : 3
+	h.moon_count = moon_roll < 0.25 ? 0 : moon_roll < 0.65 ? 1 : moon_roll < 0.9 ? 2 : 3
 	planet_gm := GM_EARTH * hp.mass_earth
 	orbit := hp.radius_km * eng.rng_range(&r, 12, 35)
-	for i in 0 ..< home.moon_count {
-		m := &home.moons[i]
+	for i in 0 ..< h.moon_count {
+		m := &h.moons[i]
 		m.radius_km = eng.rng_range(&r, 250, 1900)
 		m.orbit_km = orbit
 		orbit *= eng.rng_range(&r, 1.6, 2.6) // луны по порядку удаления
@@ -227,8 +212,8 @@ star_system_generate :: proc(seed: u32) -> (s: Star_System) {
 	}
 
 	sign: f64 = eng.rng_f64(&r) < 0.5 ? -1 : 1
-	home.latitude_deg = sign * eng.rng_range(&r, 25, 55)
-	home.longitude_deg = eng.rng_range(&r, 0, 360)
+	h.latitude_deg = sign * eng.rng_range(&r, 25, 55)
+	h.longitude_deg = eng.rng_range(&r, 0, 360)
 	return
 }
 

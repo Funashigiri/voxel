@@ -11,7 +11,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.007"
+VERSION :: "0.008"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -40,7 +40,8 @@ Options :: struct {
 	mountain_spawn: bool, // появиться над горами
 	has_latlon:    bool, // высадка в заданной точке планеты
 	lat, lon:      f64,
-	debug_panel:   bool, // сразу открыть панель F3
+	debug_page:    int, // сразу открыть страницу F3 (1..3)
+	universe_report: bool, // напечатать отчёт о вселенной с проверками и выйти
 	no_intro:      bool, // без высадки в капсулах (сразу на земле)
 	has_look:      bool, // заданы -yaw / -pitch
 	has_yaw:       bool,
@@ -113,7 +114,9 @@ parse_options :: proc() -> (o: Options) {
 		case "-nointro":
 			o.no_intro = true
 		case "-f3":
-			o.debug_panel = true
+			o.debug_page = val == "" ? 1 : clamp(strconv.parse_int(val) or_else 1, 1, 3)
+		case "-universe":
+			o.universe_report = true
 		case "-spawn":
 			o.water_spawn = val == "water"
 			o.mountain_spawn = val == "mountain"
@@ -181,18 +184,36 @@ main :: proc() {
 		return
 	}
 
-	if !eng.window_create(fmt.tprintf("Voxel %s", VERSION), opts.width, opts.height) do os.exit(1)
-	defer eng.window_destroy()
-
 	if !opts.has_seed {
 		opts.seed = eng.hash_u32(u32(time.time_to_unix_nano(time.now())) ~ u32(time.time_to_unix_nano(time.now()) >> 32))
 	}
-	system := star_system_generate(opts.seed)
+
+	// вселенная -> наша галактика и звезда -> её система планет
+	t0 := time.now()
+	universe: Universe
+	universe_init(&universe, opts.seed)
+	defer universe_destroy(&universe)
+	t1 := time.now()
+	home := universe_find_home(&universe)
+	t2 := time.now()
+	system := star_system_generate(opts.seed, home.star, true)
 	defer star_system_destroy(&system)
+	uinfo := universe_info_build(&universe, home)
+	defer universe_info_destroy(&uinfo)
+	t3 := time.now()
+	fmt.printfln("Мир %d: галактика %s (%s), звезда %s (%s), планета %s, сутки %.1f ч, гравитация %.2f g",
+		opts.seed, uinfo.galaxy_name, GALAXY_KIND_NAMES[home.galaxy.kind], system.star.name, STAR_CLASS_NAMES[system.star.class],
+		home_planet(&system).name, system.home.day_hours, system.home.gravity_g)
+	if opts.universe_report {
+		ms :: proc(a, b: time.Time) -> f64 {return time.duration_milliseconds(time.diff(a, b))}
+		if universe_report(&universe, &uinfo, opts.seed, ms(t0, t1), ms(t1, t2), ms(t2, t3)) > 0 do os.exit(1)
+		return
+	}
+
+	if !eng.window_create(fmt.tprintf("Voxel %s", VERSION), opts.width, opts.height) do os.exit(1)
+	defer eng.window_destroy()
+
 	clock := clock_init(system.home.day_hours, opts.start_hour)
-	fmt.printfln("Мир %d: звезда %s (%s), планета %s, сутки %.1f ч, гравитация %.2f g",
-		opts.seed, system.star.name, STAR_CLASS_NAMES[system.star.class], home_planet(&system).name,
-		system.home.day_hours, system.home.gravity_g)
 
 	r: Renderer
 	if !renderer_init(&r, VIEW_RADIUS) do os.exit(1)
@@ -317,7 +338,7 @@ main :: proc() {
 	sprint_latch := false
 	last_w_press: f64 = -10
 	screenshot_requested := false
-	show_debug := opts.debug_panel
+	debug_page := opts.debug_page
 	fps_timer: f64
 	fps_frames: int
 	shots_taken := 0
@@ -343,7 +364,7 @@ main :: proc() {
 		}
 		if playing && eng.key_pressed(glfw.KEY_F5) do camera_cycle_mode(&cam)
 		if eng.key_pressed(glfw.KEY_F2) do screenshot_requested = true
-		if eng.key_pressed(glfw.KEY_F3) do show_debug = !show_debug
+		if eng.key_pressed(glfw.KEY_F3) do debug_page = (debug_page + 1) % 4 // страницы F3 по кругу, 0 — выкл
 		if playing && eng.win.focused do handle_squad_keys(&squad, &world, &player)
 		if playing && !auto_order_done && now - start > opts.order_at {
 			auto_order_done = true
@@ -443,7 +464,8 @@ main :: proc() {
 				squad = &squad,
 				clock = &clock,
 				system = &system,
-				show_debug = show_debug,
+				debug_page = debug_page,
+				universe = &uinfo,
 				fps = last_fps,
 				t = t,
 				time = now - start,

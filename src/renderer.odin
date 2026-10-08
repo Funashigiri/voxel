@@ -63,7 +63,8 @@ Frame_Params :: struct {
 	squad:       ^Squad,
 	clock:       ^Game_Clock,
 	system:      ^Star_System,
-	show_debug:  bool, // панель F3
+	debug_page:  int, // страница F3 (0 — выкл)
+	universe:    ^Universe_Info,
 	fps:         f64,
 	chunks_drawn: int,
 	t:           f32, // доля между тиками
@@ -378,7 +379,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.Enable(gl.BLEND)
 	fp.chunks_drawn = r.chunks_drawn
 	if landing_ui {
-		if fp.show_debug {
+		if fp.debug_page > 0 {
 			gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 			hud_draw(&fp)
 		}

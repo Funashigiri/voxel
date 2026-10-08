@@ -24,22 +24,30 @@ LINE_BG :: [4]u8{40, 40, 40, 150}
 @(private = "file")
 Panel :: struct {
 	x, y, px: f32,
+	cols:     []f32, // колонки таблицы (в пикселях шрифта)
 }
+
+// колонки таблиц: планеты, ближайшие звёзды, ближайшие галактики
+@(private = "file")
+PLANET_COLS := [?]f32{0, 16, 106, 156}
+@(private = "file")
+STAR_COLS := [?]f32{0, 50, 162, 250}
+@(private = "file")
+GALAXY_COLS := [?]f32{0, 62, 208, 318}
 
 @(private = "file")
 panel_line :: proc(p: ^Panel, color: [4]u8, parts: ..string) {
-	// колонки для таблицы планет (в пикселях шрифта)
-	COLS := [?]f32{0, 16, 106, 156}
+	cols := p.cols != nil ? p.cols : PLANET_COLS[:]
 	right: f32 = 0
 	for part, i in parts {
-		col := len(parts) > 1 ? COLS[min(i, len(COLS) - 1)] : 0
+		col := len(parts) > 1 ? cols[min(i, len(cols) - 1)] : 0
 		right = max(right, col + eng.text_width(part, 1))
 	}
 	if right > 0 {
 		eng.imm_rect(p.x - p.px, p.y - p.px, p.x + (right + 1) * p.px, p.y + (eng.TEXT_LINE_HEIGHT - 1) * p.px, LINE_BG)
 	}
 	for part, i in parts {
-		col := len(parts) > 1 ? COLS[min(i, len(COLS) - 1)] : 0
+		col := len(parts) > 1 ? cols[min(i, len(cols) - 1)] : 0
 		eng.draw_text(part, p.x + col * p.px, p.y, p.px, color)
 	}
 	p.y += eng.TEXT_LINE_HEIGHT * p.px
@@ -77,75 +85,144 @@ lon_text :: proc(lon: f64) -> string {
 	return lon <= 180 ? fmt.tprintf("%.1f° в.д.", lon) : fmt.tprintf("%.1f° з.д.", 360 - lon)
 }
 
-hud_draw_debug :: proc(s: ^Star_System, w: ^World, c: ^Game_Clock, player: ^Character, fps: f64, chunks_drawn, chunks_loaded: int, width, height: i32) {
-	g := gui_scale(height)
-	p := Panel{x = 4 * g, y = 4 * g, px = g}
-	star := &s.star
+PAGE_TITLES := [4]string{"", "мир и планета", "звёздная система", "галактика и вселенная"}
+
+// Шапка любой страницы F3.
+@(private = "file")
+page_header :: proc(p: ^Panel, fp: ^Frame_Params) {
+	panel_line(p, WHITE, fmt.tprintf("Voxel %s  —  %d FPS", VERSION, int(fp.fps + 0.5)))
+	panel_line(p, GRAY, fmt.tprintf("F3: страница %d/3 — %s", fp.debug_page, PAGE_TITLES[fp.debug_page]))
+	panel_gap(p)
+}
+
+// Страница 1: мир, время, наша планета и где мы на ней.
+@(private = "file")
+page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
+	s := fp.system
+	w := fp.world
+	player := fp.player
+	c := fp.clock
 	hp := home_planet(s)
 	home := &s.home
 
-	panel_line(&p, WHITE, fmt.tprintf("Voxel %s  —  %d FPS", VERSION, int(fps + 0.5)))
-	panel_line(&p, WHITE, fmt.tprintf("XYZ: %.2f / %.2f / %.2f", player.pos.x, player.pos.y, player.pos.z))
-	panel_line(&p, WHITE, fmt.tprintf("Чанков: %d видно, %d загружено", chunks_drawn, chunks_loaded))
-	panel_line(&p, WHITE, fmt.tprintf("Зерно мира: %d", s.seed))
-	panel_gap(&p)
+	panel_line(p, WHITE, fmt.tprintf("XYZ: %.2f / %.2f / %.2f", player.pos.x, player.pos.y, player.pos.z))
+	panel_line(p, WHITE, fmt.tprintf("Чанков: %d видно, %d загружено", fp.chunks_drawn, len(w.chunks)))
+	panel_line(p, WHITE, fmt.tprintf("Зерно мира: %d", s.seed))
+	panel_gap(p)
 
 	day, h, m := clock_local(c)
-	panel_line(&p, GOLD, fmt.tprintf("Время: день %d, %02d:%02d (местное)", day, h, m))
-	panel_line(&p, WHITE, fmt.tprintf("Сутки: %.1f ст. ч = %.1f мин; прошло %.2f ст. ч", c.day_hours, clock_day_real_minutes(c), c.std_hours))
-	panel_line(&p, GRAY, "1 стандартный час = 100 секунд")
-	panel_gap(&p)
+	panel_line(p, GOLD, fmt.tprintf("Время: день %d, %02d:%02d (местное)", day, h, m))
+	panel_line(p, WHITE, fmt.tprintf("Сутки: %.1f ст. ч = %.1f мин; прошло %.2f ст. ч", c.day_hours, clock_day_real_minutes(c), c.std_hours))
+	panel_line(p, GRAY, "1 стандартный час = 100 секунд")
+	panel_gap(p)
 
-	panel_line(&p, GOLD, fmt.tprintf("Звезда: %s — %s, %.0f K", star.name, STAR_CLASS_NAMES[star.class], star.temperature))
-	panel_line(&p, WHITE, fmt.tprintf("масса %.2f, светимость %.2f, радиус %.2f (Солнце = 1)", star.mass, star.luminosity, star.radius))
-	panel_line(&p, GOLD, fmt.tprintf("Планет: %d", s.planet_count))
-	for i in 0 ..< s.planet_count {
-		pl := &s.planets[i]
-		here := i == home.index
-		col := here ? GOLD : WHITE
-		mark := here ? "  < мы здесь" : ""
-		panel_line(&p, col,
-			fmt.tprintf("%d.", i + 1),
-			PLANET_KIND_NAMES[pl.kind],
-			fmt.tprintf("%.2f а.е.", pl.orbit_au),
-			fmt.tprintf("R %.0f км%s", pl.radius_km, mark),
-		)
-	}
-	panel_gap(&p)
-
-	panel_line(&p, GOLD, fmt.tprintf("Наша планета: %s", hp.name))
-	panel_line(&p, WHITE, fmt.tprintf("радиус %.0f км (%.2f Земли), гравитация %.2f g", hp.radius_km, hp.radius_km / EARTH_RADIUS_KM, home.gravity_g))
-	panel_line(&p, WHITE, fmt.tprintf("сутки %.1f ст. ч, наклон оси %.1f°", home.day_hours, home.axial_tilt_deg))
-	panel_line(&p, WHITE, fmt.tprintf("год %.1f местных суток (%.2f земного)", home.year_days, hp.year_hours / EARTH_YEAR_HOURS))
-	if home.moon_count == 0 {
-		panel_line(&p, WHITE, "лун нет")
-	}
-	for i in 0 ..< home.moon_count {
-		mo := &home.moons[i]
-		panel_line(&p, WHITE, fmt.tprintf("луна %d: R %.0f км, орбита %.0f тыс. км, период %.1f сут", i + 1, mo.radius_km, mo.orbit_km / 1000, mo.period_hours / home.day_hours))
-	}
-	panel_gap(&p)
+	panel_line(p, GOLD, fmt.tprintf("Наша планета: %s", hp.name))
+	panel_line(p, WHITE, fmt.tprintf("радиус %.0f км (%.2f Земли), гравитация %.2f g", hp.radius_km, hp.radius_km / EARTH_RADIUS_KM, home.gravity_g))
+	panel_line(p, WHITE, fmt.tprintf("сутки %.1f ст. ч, наклон оси %.1f°", home.day_hours, home.axial_tilt_deg))
+	panel_line(p, WHITE, fmt.tprintf("год %.1f местных суток (%.2f земного)", home.year_days, hp.year_hours / EARTH_YEAR_HOURS))
+	panel_gap(p)
 
 	// где мы на шаре — считается по текущей позиции
 	geo := &w.geo
 	dir := geo_frame_dir(geo, player.pos.x, player.pos.z)
 	lat, lon := geo_latlon(dir)
-	panel_line(&p, GOLD, fmt.tprintf("Мы: широта %s, долгота %s", lat_text(lat), lon_text(lon)))
-	panel_line(&p, WHITE, fmt.tprintf("грань куба: %s, до ребра %s", FACE_NAMES[geo.face], dist_text(geo_edge_dist(geo, player.pos.x, player.pos.z))))
+	panel_line(p, GOLD, fmt.tprintf("Мы: широта %s, долгота %s", lat_text(lat), lon_text(lon)))
+	panel_line(p, WHITE, fmt.tprintf("грань куба: %s, до ребра %s", FACE_NAMES[geo.face], dist_text(geo_edge_dist(geo, player.pos.x, player.pos.z))))
 	_, _, anomaly := geo_nearest_corner(geo, player.pos.x, player.pos.z)
-	panel_line(&p, anomaly < ANOMALY_RADIUS ? VIOLET : WHITE, fmt.tprintf("до аномалии (вершины куба): %s", dist_text(anomaly)))
-	panel_line(&p, WHITE, fmt.tprintf("над уровнем моря: %.0f м; окружность планеты %.0f км", player.pos.y - (SEA_LEVEL + 1), 2 * 3.14159265 * geo.radius / 1000))
+	panel_line(p, anomaly < ANOMALY_RADIUS ? VIOLET : WHITE, fmt.tprintf("до аномалии (вершины куба): %s", dist_text(anomaly)))
+	panel_line(p, WHITE, fmt.tprintf("над уровнем моря: %.0f м; окружность планеты %.0f км", player.pos.y - (SEA_LEVEL + 1), 2 * 3.14159265 * geo.radius / 1000))
+}
+
+// Страница 2: звезда, планеты, луны.
+@(private = "file")
+page_system :: proc(p: ^Panel, fp: ^Frame_Params) {
+	s := fp.system
+	star := &s.star
+	home := &s.home
+
+	panel_line(p, GOLD, fmt.tprintf("Звезда: %s — %s, %.0f K", star.name, STAR_CLASS_NAMES[star.class], star.temperature))
+	panel_line(p, WHITE, fmt.tprintf("масса %.2f, светимость %.2f, радиус %.2f (Солнце = 1)", star.mass, star.luminosity, star.radius))
+	panel_gap(p)
+	panel_line(p, GOLD, fmt.tprintf("Планет: %d", s.planet_count))
+	for i in 0 ..< s.planet_count {
+		pl := &s.planets[i]
+		here := i == home.index
+		panel_line(p, here ? GOLD : WHITE,
+			fmt.tprintf("%d.", i + 1),
+			PLANET_KIND_NAMES[pl.kind],
+			fmt.tprintf("%.2f а.е.", pl.orbit_au),
+			fmt.tprintf("R %.0f км%s", pl.radius_km, here ? "  < мы здесь" : ""),
+		)
+	}
+	panel_gap(p)
+
+	panel_line(p, GOLD, fmt.tprintf("Луны планеты %s:", home_planet(s).name))
+	if home.moon_count == 0 do panel_line(p, WHITE, "лун нет")
+	for i in 0 ..< home.moon_count {
+		mo := &home.moons[i]
+		panel_line(p, WHITE, fmt.tprintf("луна %d: R %.0f км, орбита %.0f тыс. км, период %.1f сут", i + 1, mo.radius_km, mo.orbit_km / 1000, mo.period_hours / home.day_hours))
+	}
+}
+
+// Страница 3: вселенная, наша галактика, ближайшие звёзды и галактики.
+@(private = "file")
+page_universe :: proc(p: ^Panel, fp: ^Frame_Params) {
+	info := fp.universe
+	u := info.u
+	g := &info.home.galaxy
+	pos := &info.home.star.pos
+
+	panel_line(p, GOLD, fmt.tprintf("Вселенная: бесконечная, возраст %.1f млрд лет", u.age_years / 1e9))
+	panel_line(p, WHITE, fmt.tprintf("расширение %.1f км/с на Мпк; горизонт событий %s", H0, ly_text(u.horizon_ly)))
+	panel_line(p, WHITE, fmt.tprintf("видимая часть: радиус %s, галактик ~%s", ly_text(u.observable_ly), sci_text(info.observable_galaxies)))
+	panel_line(p, GRAY, fmt.tprintf("мы, св. лет: X %s  Y %s  Z %s", big_grouped(pos.cell[0]), big_grouped(pos.cell[1]), big_grouped(pos.cell[2])))
+	panel_gap(p)
+
+	panel_line(p, GOLD, fmt.tprintf("Галактика: %s — %s", info.galaxy_name, GALAXY_KIND_NAMES[g.kind]))
+	host := info.host_name != "" ? fmt.tprintf(", спутник галактики %s", info.host_name) : ""
+	panel_line(p, WHITE, fmt.tprintf("звёзд %s, диаметр %s%s", count_text(g.stars), ly_text(galaxy_diameter(g)), host))
+	panel_line(p, WHITE, fmt.tprintf("в центре чёрная дыра: %s масс Солнца", count_text(g.bh_mass)))
+	panel_line(p, WHITE, fmt.tprintf("мы: %s", where_text(info)))
+	panel_line(p, WHITE, fmt.tprintf("плотность звёзд: %.4f на кубический св. год", info.density))
+	panel_gap(p)
+
+	panel_line(p, GOLD, "Ближайшие звёзды:")
+	p.cols = STAR_COLS[:]
+	for s in info.stars {
+		panel_line(p, WHITE, s.name, STAR_CLASS_NAMES[s.class], ly_text(s.dist), fmt.tprintf("планет: %d", s.planets))
+	}
+	p.cols = nil
+	panel_gap(p)
+
+	panel_line(p, GOLD, fmt.tprintf("Ближайшие галактики (в 10 млн св. лет — %d):", info.galaxies_10mly))
+	p.cols = GALAXY_COLS[:]
+	for ng in info.galaxies {
+		motion := ng.bound ? "связана гравитацией" : fmt.tprintf("удаляется %.0f км/с", recession_kms(ng.dist))
+		panel_line(p, WHITE, ng.name, GALAXY_KIND_NAMES[ng.kind], ly_text(ng.dist), motion)
+	}
+	if len(info.galaxies) == 0 do panel_line(p, WHITE, "в 13 млн св. лет — ни одной")
+	p.cols = nil
 }
 
 // Рисует весь текстовый интерфейс (вызывать с включённым смешиванием).
 hud_draw :: proc(fp: ^Frame_Params) {
 	ortho := linalg.matrix_ortho3d_f32(0, f32(fp.width), f32(fp.height), 0, -1, 1)
 	hud_draw_clock(fp.clock, fp.width, fp.height)
-	if fp.show_debug {
-		hud_draw_debug(fp.system, fp.world, fp.clock, fp.player, fp.fps, fp.chunks_drawn, len(fp.world.chunks), fp.width, fp.height)
+	if fp.debug_page > 0 {
+		g := gui_scale(fp.height)
+		p := Panel{x = 4 * g, y = 4 * g, px = g}
+		page_header(&p, fp)
+		switch fp.debug_page {
+		case 1:
+			page_world(&p, fp)
+		case 2:
+			page_system(&p, fp)
+		case 3:
+			page_universe(&p, fp)
+		}
 	}
 	eng.imm_flush(ortho)
-	if fp.show_debug do hud_draw_globe(fp, ortho)
+	if fp.debug_page == 1 do hud_draw_globe(fp, ortho)
 }
 
 // Глобус планеты в правом верхнем углу (под часами) с отметкой "мы здесь".
