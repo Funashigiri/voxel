@@ -11,7 +11,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.006"
+VERSION :: "0.007"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -43,6 +43,10 @@ Options :: struct {
 	debug_panel:   bool, // сразу открыть панель F3
 	no_intro:      bool, // без высадки в капсулах (сразу на земле)
 	has_look:      bool, // заданы -yaw / -pitch
+	has_yaw:       bool,
+	edge_dist:     f64, // > 0: высадка в стольких метрах от ребра грани (тест стыка)
+	anomaly_dist:  f64, // > 0: высадка в стольких метрах от вершины куба (тест аномалии)
+	selftest:      bool, // проверить геометрию стыков граней и выйти
 	dump_textures: string,
 }
 
@@ -72,7 +76,7 @@ parse_options :: proc() -> (o: Options) {
 			}
 		case "-yaw":
 			o.yaw = f32(strconv.parse_f64(val) or_else 0)
-			o.has_look = true
+			o.has_look, o.has_yaw = true, true
 		case "-pitch":
 			o.pitch = f32(strconv.parse_f64(val) or_else 0)
 			o.has_look = true
@@ -118,6 +122,12 @@ parse_options :: proc() -> (o: Options) {
 			o.lat = strconv.parse_f64(las) or_else 40
 			o.lon = strconv.parse_f64(los) or_else 0
 			o.has_latlon = true
+		case "-selftest":
+			o.selftest = true
+		case "-edge":
+			o.edge_dist = strconv.parse_f64(val) or_else 200
+		case "-anomaly":
+			o.anomaly_dist = strconv.parse_f64(val) or_else 220
 		case "-orbit":
 			o.orbit = f32(strconv.parse_f64(val) or_else 0)
 		case "-interval":
@@ -154,7 +164,8 @@ spawn_area_ready :: proc(w: ^World, pos: [3]f64, radius: i32) -> bool {
 	cx := eng.floor_div(i32(math.floor(pos.x)), CHUNK_SIZE)
 	cz := eng.floor_div(i32(math.floor(pos.z)), CHUNK_SIZE)
 	for dz in -radius ..= radius do for dx in -radius ..= radius {
-		c := world_get_chunk(w, cx + dx, cz + dz)
+		if _, _, _, ok := world_resolve(w, (cx + dx) * CHUNK_SIZE, (cz + dz) * CHUNK_SIZE); !ok do continue // пустота у вершины
+		c := world_frame_chunk(w, cx + dx, cz + dz)
 		if c == nil || !c.meshed do return false
 	}
 	return true
@@ -200,8 +211,43 @@ main :: proc() {
 	if opts.has_latlon do lat, lon = opts.lat, opts.lon
 	site_x, site_z: f64
 	site_x, site_z, lat, lon = geo_choose_site(&geo, lat, lon, opts.seed, opts.has_latlon)
+	if errors := geo_check_links(&geo); errors > 0 do fmt.eprintln("ОШИБКА: рёбра граней не стыкуются:", errors)
+	if opts.selftest {
+		checked, errors := frame_selftest(geo)
+		fmt.printfln("selftest: рёбра %d ошибок; смена кадра: %d точек, %d ошибок", geo_check_links(&geo), checked, errors)
+		return
+	}
+	// тесты: высадка у ребра или у вершины; взгляд — в их сторону
+	test_yaw, has_test_yaw := f32(0), false
+	if opts.edge_dist > 0 || opts.anomaly_dist > 0 {
+		n := f64(geo.n)
+		if opts.anomaly_dist > 0 {
+			cx, cz, _ := geo_nearest_corner(&geo, site_x, site_z)
+			d := opts.anomaly_dist / math.SQRT_TWO
+			site_x = cx == 0 ? d : n - d
+			site_z = cz == 0 ? d : n - d
+			test_yaw = f32(math.atan2(-(cx - site_x), cz - site_z))
+		} else {
+			d := opts.edge_dist
+			ds := [4]f64{site_x, n - site_x, site_z, n - site_z}
+			k := 0
+			for i in 1 ..< 4 do if ds[i] < ds[k] do k = i
+			switch k {
+			case 0:
+				site_x, test_yaw = d, math.PI / 2
+			case 1:
+				site_x, test_yaw = n - d, -math.PI / 2
+			case 2:
+				site_z, test_yaw = d, math.PI
+			case 3:
+				site_z, test_yaw = n - d, 0
+			}
+		}
+		has_test_yaw = true
+		lat, lon = geo_latlon(geo_dir(&geo, geo.face, site_x, site_z))
+	}
 	system.home.latitude_deg, system.home.longitude_deg = lat, lon
-	fmt.printfln("Высадка: широта %.2f, долгота %.2f, грань %s, до ребра %.0f км",
+	fmt.printfln("Высадка: широта %.2f, долгота %.2f, грань %s, до ребра %.1f км",
 		lat, lon, FACE_NAMES[geo.face], geo_edge_dist(&geo, site_x, site_z) / 1000)
 
 	world: World
@@ -215,6 +261,7 @@ main :: proc() {
 	spawn := find_spawn(&world, sx, sz)
 	if opts.water_spawn do spawn = find_water_spawn(&world, sx, sz)
 	if opts.mountain_spawn do spawn = find_mountain_spawn(&world, sx, sz)
+	if opts.anomaly_dist > 0 || opts.edge_dist > 0 do spawn = spawn_at(&world, sx, sz)
 	for !spawn_area_ready(&world, spawn, 2) {
 		world_update(&world, spawn, 0.1)
 		free_all(context.temp_allocator)
@@ -226,6 +273,12 @@ main :: proc() {
 
 	player: Character
 	character_spawn(&player, &world, spawn)
+	if opts.anomaly_dist > 0 {
+		// место высадки могло сдвинуться (вода) — смотрим на вершину от него
+		cx, cz, _ := geo_nearest_corner(&world.geo, spawn.x, spawn.z)
+		test_yaw = f32(math.atan2(-(cx - spawn.x), cz - spawn.z))
+	}
+	if has_test_yaw && !opts.has_yaw do opts.yaw, opts.has_look = math.to_degrees(test_yaw), true
 	player.yaw = math.to_radians(opts.yaw)
 	player.pitch = math.to_radians(opts.pitch)
 	player.body_yaw = player.yaw
@@ -364,6 +417,9 @@ main :: proc() {
 			if eng.win.cursor_locked do mdx, mdy = eng.win.mouse_dx, eng.win.mouse_dy
 			landing_update(&landing, &world, drift, mdx, mdy, cam.pos, f32(dt))
 		}
+
+		// ушли за ребро грани — кадром становится соседняя грань
+		frame_follow({&world, &player, &squad, &landing, &cam, &sky, &r})
 
 		world_update(&world, player.pos, WORLD_BUDGET)
 

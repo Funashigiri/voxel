@@ -319,7 +319,7 @@ companion_tick :: proc(c: ^Companion, w: ^World, player: ^Character) {
 	b.prev_yaw = b.yaw
 	b.prev_pitch = b.pitch
 	// чанк выгружен — спутник "замирает", как сущности в Minecraft
-	if world_get_chunk(w, eng.floor_div(i32(math.floor(b.pos.x)), CHUNK_SIZE), eng.floor_div(i32(math.floor(b.pos.z)), CHUNK_SIZE)) == nil {
+	if world_frame_chunk(w, eng.floor_div(i32(math.floor(b.pos.x)), CHUNK_SIZE), eng.floor_div(i32(math.floor(b.pos.z)), CHUNK_SIZE)) == nil {
 		b.prev_pos = b.pos
 		return
 	}

@@ -45,17 +45,209 @@ FACE_BASES := [Cube_Face]Face_Basis {
 	.NZ = {{0, 0, -1}, {-1, 0, 0}, {0, -1, 0}},
 }
 
-MIN_EDGE_DIST :: 100_000.0 // высаживаемся не ближе 100 км к ребру грани
+MIN_ANOMALY_DIST :: 20_000.0 // высаживаемся не ближе 20 км к аномалии (вершине куба)
 
 Planet_Geo :: struct {
 	radius: f64, // в блоках (метрах)
-	n:      i32, // колонок вдоль ребра грани
-	face:   Cube_Face, // грань, на которой идёт игра
+	n:      i32, // колонок вдоль ребра грани (кратно размеру чанка)
+	face:   Cube_Face, // грань, на которой сейчас идёт игра ("кадр")
+	edges:  [Cube_Face][Edge]Edge_Link, // кто за каким ребром и как повёрнута его сетка
+}
+
+// Рёбра грани: за -x, +x, -z, +z.
+Edge :: enum u8 {
+	NX,
+	PX,
+	NZ,
+	PZ,
+}
+
+// Поворот на 90°·k и сдвиг клеточной сетки: g = r·f + t.
+Xform :: struct {
+	r: [2][2]i32, // r[строка][столбец]
+	t: [2]i32,
+}
+
+Edge_Link :: struct {
+	face: Cube_Face, // соседняя грань
+	m:    Xform, // клетки за ребром (в координатах этой грани) -> клетки соседней
 }
 
 geo_make :: proc(radius_km: f64) -> (g: Planet_Geo) {
 	g.radius = radius_km * 1000
-	g.n = i32(math.round(g.radius * math.PI / 2))
+	// кратно чанку, чтобы чанки соседних граней стыковались целиком
+	g.n = i32(math.round(g.radius * math.PI / 2 / CHUNK_SIZE)) * CHUNK_SIZE
+	geo_build_edges(&g)
+	return
+}
+
+xform_cell :: proc(m: Xform, x, z: i32) -> (i32, i32) {
+	return m.r[0][0] * x + m.r[0][1] * z + m.t[0], m.r[1][0] * x + m.r[1][1] * z + m.t[1]
+}
+
+// Непрерывная точка: центр клетки переходит в центр клетки.
+xform_pos :: proc(m: Xform, x, z: f64) -> (f64, f64) {
+	qx, qz := x - 0.5, z - 0.5
+	return f64(m.r[0][0]) * qx + f64(m.r[0][1]) * qz + f64(m.t[0]) + 0.5, f64(m.r[1][0]) * qx + f64(m.r[1][1]) * qz + f64(m.t[1]) + 0.5
+}
+
+xform_vec :: proc(m: Xform, x, z: f64) -> (f64, f64) {
+	return f64(m.r[0][0]) * x + f64(m.r[0][1]) * z, f64(m.r[1][0]) * x + f64(m.r[1][1]) * z
+}
+
+// Поворот направления взгляда (yaw: вперёд = (-sin, cos) в осях x, z).
+xform_yaw :: proc(m: Xform, yaw: f32) -> f32 {
+	fx, fz := xform_vec(m, f64(-math.sin(yaw)), f64(math.cos(yaw)))
+	return f32(math.atan2(-fx, fz))
+}
+
+xform_inverse :: proc(m: Xform) -> (inv: Xform) {
+	// поворот обратим транспонированием
+	inv.r = {{m.r[0][0], m.r[1][0]}, {m.r[0][1], m.r[1][1]}}
+	inv.t = {-(inv.r[0][0] * m.t[0] + inv.r[0][1] * m.t[1]), -(inv.r[1][0] * m.t[0] + inv.r[1][1] * m.t[1])}
+	return
+}
+
+XFORM_IDENTITY :: Xform{r = {{1, 0}, {0, 1}}}
+
+// Композиция: сначала b, потом a.
+xform_compose :: proc(a, b: Xform) -> (c: Xform) {
+	for i in 0 ..< 2 {
+		for j in 0 ..< 2 do c.r[i][j] = a.r[i][0] * b.r[0][j] + a.r[i][1] * b.r[1][j]
+		c.t[i] = a.r[i][0] * b.t[0] + a.r[i][1] * b.t[1] + a.t[i]
+	}
+	return
+}
+
+// Для каждой грани и ребра находим соседа и поворот его сетки: берём клетки
+// сразу за серединой ребра, смотрим, в какие клетки соседа они попадают на шаре.
+@(private = "file")
+geo_build_edges :: proc(g: ^Planet_Geo) {
+	n := g.n
+	cell_of_dir :: proc(g: ^Planet_Geo, d: [3]f64) -> (Cube_Face, [2]i32) {
+		f, x, z := geo_locate(g, d)
+		return f, {i32(math.floor(x)), i32(math.floor(z))}
+	}
+	for face in Cube_Face {
+		for e in Edge {
+			a: [2]i32
+			step: [2]i32 = {1, 1} // шаги, которые остаются за ребром
+			switch e {
+			case .NX:
+				a, step.x = {-1, n / 2}, -1
+			case .PX:
+				a = {n, n / 2}
+			case .NZ:
+				a, step.y = {n / 2, -1}, -1
+			case .PZ:
+				a = {n / 2, n}
+			}
+			img :: proc(g: ^Planet_Geo, face: Cube_Face, c: [2]i32) -> (Cube_Face, [2]i32) {
+				return cell_of_dir(g, geo_dir(g, face, f64(c.x) + 0.5, f64(c.y) + 0.5))
+			}
+			nf, ia := img(g, face, a)
+			_, ib := img(g, face, a + [2]i32{step.x, 0})
+			_, ic := img(g, face, a + [2]i32{0, step.y})
+			col0 := (ib - ia) * step.x // образ единичного шага по x
+			col1 := (ic - ia) * step.y // образ единичного шага по z
+			m: Xform
+			m.r = {{col0.x, col1.x}, {col0.y, col1.y}}
+			m.t = {ia.x - (m.r[0][0] * a.x + m.r[0][1] * a.y), ia.y - (m.r[1][0] * a.x + m.r[1][1] * a.y)}
+			g.edges[face][e] = {nf, m}
+		}
+	}
+}
+
+// Клетка (x, z) в координатах грани face -> реальная грань и клетка.
+// За одним ребром — соседняя грань; за двумя сразу (у вершины куба) — пустота.
+geo_resolve :: proc(g: ^Planet_Geo, face: Cube_Face, x, z: i32) -> (Cube_Face, i32, i32, bool) {
+	n := g.n
+	ox := x < 0 || x >= n
+	oz := z < 0 || z >= n
+	if !ox && !oz do return face, x, z, true
+	if ox && oz do return face, 0, 0, false
+	e: Edge = x < 0 ? .NX : x >= n ? .PX : z < 0 ? .NZ : .PZ
+	link := g.edges[face][e]
+	gx, gz := xform_cell(link.m, x, z)
+	if gx < 0 || gz < 0 || gx >= n || gz >= n do return face, 0, 0, false
+	return link.face, gx, gz, true
+}
+
+// Как клетки грани other лежат в кадре текущей грани (если она соседняя).
+geo_frame_of :: proc(g: ^Planet_Geo, other: Cube_Face) -> (Xform, bool) {
+	if other == g.face do return XFORM_IDENTITY, true
+	for e in Edge {
+		link := g.edges[g.face][e]
+		if link.face == other do return xform_inverse(link.m), true
+	}
+	return {}, false
+}
+
+// Проверка: перейти через ребро и вернуться обратно — тождество (иначе
+// сетки соседних граней собраны неверно). Возвращает число ошибок.
+geo_check_links :: proc(g: ^Planet_Geo) -> (errors: int) {
+	for face in Cube_Face {
+		for e in Edge {
+			link := g.edges[face][e]
+			if r := link.m.r; r[0][0] * r[1][1] - r[0][1] * r[1][0] != 1 do errors += 1 // только повороты
+			back, ok := Xform{}, false
+			for e2 in Edge {
+				if g.edges[link.face][e2].face == face {
+					back, ok = g.edges[link.face][e2].m, true
+				}
+			}
+			if !ok {
+				errors += 1
+				continue
+			}
+			for t in ([3]i32{0, g.n / 3, g.n - 1}) {
+				// клетка сразу за ребром -> на соседней грани -> обратно
+				c: [2]i32
+				switch e {
+				case .NX:
+					c = {-1, t}
+				case .PX:
+					c = {g.n, t}
+				case .NZ:
+					c = {t, -1}
+				case .PZ:
+					c = {t, g.n}
+				}
+				gx, gz := xform_cell(link.m, c.x, c.y)
+				bx, bz := xform_cell(back, gx, gz)
+				if bx != c.x || bz != c.y do errors += 1
+			}
+		}
+	}
+	return
+}
+
+// Направление от центра планеты для точки кадра (за ребром — на соседней грани).
+geo_frame_dir :: proc(g: ^Planet_Geo, x, z: f64) -> [3]f64 {
+	n := f64(g.n)
+	ox := x < 0 || x >= n
+	oz := z < 0 || z >= n
+	if ox == oz do return geo_dir(g, g.face, x, z)
+	e: Edge = ox ? (x < 0 ? .NX : .PX) : (z < 0 ? .NZ : .PZ)
+	link := g.edges[g.face][e]
+	gx, gz := xform_pos(link.m, x, z)
+	return geo_dir(g, link.face, gx, gz)
+}
+
+// Аномалии — в восьми вершинах куба: серый туман и столп из гладкого камня.
+ANOMALY_RADIUS :: 150.0 // радиус тумана, блоков
+ANOMALY_Y :: 64.0 // высота центра тумана
+ANOMALY_DIRS := [8][3]f64 {
+	{-1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {-1, 1, 1},
+	{1, -1, -1}, {1, -1, 1}, {1, 1, -1}, {1, 1, 1},
+}
+
+// Ближайшая вершина куба (угол текущей грани) в координатах кадра.
+geo_nearest_corner :: proc(g: ^Planet_Geo, x, z: f64) -> (cx, cz, dist: f64) {
+	n := f64(g.n)
+	cx = x < n / 2 ? 0 : n
+	cz = z < n / 2 ? 0 : n
+	dist = math.sqrt((x - cx) * (x - cx) + (z - cz) * (z - cz))
 	return
 }
 
@@ -73,9 +265,12 @@ geo_dir :: proc(g: ^Planet_Geo, face: Cube_Face, x, z: f64) -> [3]f64 {
 	return normalize3(fb.n + fb.u * math.tan(a) + fb.v * math.tan(b))
 }
 
-// Точка на поверхности (в блоках) для центра колонки (x, z) текущей грани.
-geo_point :: proc(g: ^Planet_Geo, x, z: i32) -> [3]f64 {
-	return geo_dir(g, g.face, f64(x) + 0.5, f64(z) + 0.5) * g.radius
+// Точка на поверхности (в блоках) для центра колонки (x, z) грани face.
+// Колонки за ребром берутся у соседней грани (так рельеф на стыке совпадает).
+geo_point :: proc(g: ^Planet_Geo, face: Cube_Face, x, z: i32) -> [3]f64 {
+	f, gx, gz, ok := geo_resolve(g, face, x, z)
+	if !ok do return geo_dir(g, face, f64(x) + 0.5, f64(z) + 0.5) * g.radius
+	return geo_dir(g, f, f64(gx) + 0.5, f64(gz) + 0.5) * g.radius
 }
 
 // На какой грани и в какой клетке лежит направление.
@@ -117,12 +312,8 @@ geo_edge_dist :: proc(g: ^Planet_Geo, x, z: f64) -> f64 {
 	return min(x, n - x, z, n - z)
 }
 
-geo_inside :: proc(g: ^Planet_Geo, x, z: i32) -> bool {
-	return x >= 0 && z >= 0 && x < g.n && z < g.n
-}
-
-// Выбирает точку высадки: начиная с (lat, lon), а если она ближе 100 км к ребру
-// или в океане — ищет другую в умеренных широтах. Задаёт грань и возвращает
+// Выбирает точку высадки: начиная с (lat, lon), а если она ближе 20 км к
+// аномалии или в океане — ищет другую в умеренных широтах. Задаёт грань и возвращает
 // локальные x, z.
 geo_choose_site :: proc(g: ^Planet_Geo, lat, lon: f64, seed: u32, keep_exact: bool) -> (x, z, out_lat, out_lon: f64) {
 	r := eng.rng_make(u64(seed) * 977 + 3)
@@ -131,7 +322,8 @@ geo_choose_site :: proc(g: ^Planet_Geo, lat, lon: f64, seed: u32, keep_exact: bo
 		dir := geo_from_latlon(la, lo)
 		face, fx, fz := geo_locate(g, dir)
 		offset, _ := planet_relief(i64(seed), dir * g.radius)
-		good := geo_edge_dist(g, fx, fz) >= MIN_EDGE_DIST && offset > 3 // на суше
+		_, _, anomaly := geo_nearest_corner(g, fx, fz)
+		good := anomaly >= MIN_ANOMALY_DIST && offset > 3 // на суше
 		if keep_exact || good || attempt == 2999 {
 			g.face = face
 			return fx, fz, la, lo

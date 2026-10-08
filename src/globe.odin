@@ -114,9 +114,15 @@ globe_create :: proc(g: ^Planet_Geo, seed: u32) -> (gl_: Globe, ok: bool) {
 	return gl_, true
 }
 
-// Рисует глобус в квадрате (x, y — левый верхний угол в пикселях, size — сторона).
-// Возвращает экранную позицию отметки игрока и видна ли она.
-globe_draw :: proc(gb: ^Globe, player_dir: [3]f64, time: f64, x, y, size: f32, screen_h: i32) -> (marker: [2]f32, visible: bool) {
+// Как глобус лежит на экране — для отметок поверх него.
+Globe_View :: struct {
+	mvp, model:  matrix[4, 4]f32,
+	x, y, size: f32,
+}
+
+// Рисует глобус в квадрате (x, y — левый верхний угол в пикселях, size — сторона),
+// повёрнутый к игроку.
+globe_draw :: proc(gb: ^Globe, player_dir: [3]f64, time: f64, x, y, size: f32, screen_h: i32) -> Globe_View {
 	lat := f32(math.asin(clamp(player_dir.y, -1, 1)))
 	lon := f32(math.atan2(player_dir.x, player_dir.z))
 	sway := f32(math.sin(time * 0.35)) * 0.35
@@ -145,10 +151,14 @@ globe_draw :: proc(gb: ^Globe, player_dir: [3]f64, time: f64, x, y, size: f32, s
 	gl.Disable(gl.SCISSOR_TEST)
 	gl.Disable(gl.DEPTH_TEST)
 
-	// отметка игрока: проекция точки чуть над поверхностью
-	pd := [4]f32{f32(player_dir.x) * 1.02, f32(player_dir.y) * 1.02, f32(player_dir.z) * 1.02, 1}
-	c := mvp * pd
+	return {mvp, model, x, y, size}
+}
+
+// Экранная позиция точки чуть над поверхностью глобуса и видна ли она (не с обратной стороны).
+globe_project :: proc(v: Globe_View, dir: [3]f64) -> (pos: [2]f32, facing: bool) {
+	pd := [4]f32{f32(dir.x) * 1.02, f32(dir.y) * 1.02, f32(dir.z) * 1.02, 1}
+	c := v.mvp * pd
 	ndc := [2]f32{c.x / c.w, c.y / c.w}
-	facing := (model * [4]f32{pd.x, pd.y, pd.z, 0}).z > 0
-	return {x + (ndc.x * 0.5 + 0.5) * size, y + (1 - (ndc.y * 0.5 + 0.5)) * size}, facing
+	facing = (v.model * [4]f32{pd.x, pd.y, pd.z, 0}).z > 0
+	return {v.x + (ndc.x * 0.5 + 0.5) * v.size, v.y + (1 - (ndc.y * 0.5 + 0.5)) * v.size}, facing
 }

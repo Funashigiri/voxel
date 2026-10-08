@@ -168,16 +168,31 @@ emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer:
 
 @(private = "file")
 fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
-	neighbors: [3][3]^Chunk
-	for dz in i32(-1) ..= 1 do for dx in i32(-1) ..= 1 {
-		neighbors[dz + 1][dx + 1] = world_get_chunk(w, c.key.x + dx, c.key.y + dz)
-	}
+	// колонки бортика берём через рёбра граней (сетка соседа может быть повёрнута)
+	x0 := c.key.x * CHUNK_SIZE
+	z0 := c.key.z * CHUNK_SIZE
+	last_key: Chunk_Key
+	last: ^Chunk
 	for pz in i32(-1) ..= CHUNK_SIZE do for px in i32(-1) ..= CHUNK_SIZE {
-		n := neighbors[eng.floor_div(pz, CHUNK_SIZE) + 1][eng.floor_div(px, CHUNK_SIZE) + 1]
-		lx := eng.floor_mod(px, CHUNK_SIZE)
-		lz := eng.floor_mod(pz, CHUNK_SIZE)
+		n: ^Chunk
+		lx, lz: i32
+		if px >= 0 && pz >= 0 && px < CHUNK_SIZE && pz < CHUNK_SIZE {
+			n, lx, lz = c, px, pz
+		} else if face, gx, gz, ok := geo_resolve(&w.geo, c.key.face, x0 + px, z0 + pz); ok {
+			key := chunk_key_of(face, gx, gz)
+			if last == nil || key != last_key {
+				last_key = key
+				last = world_chunk(w, key)
+			}
+			n = last
+			lx = eng.floor_mod(gx, CHUNK_SIZE)
+			lz = eng.floor_mod(gz, CHUNK_SIZE)
+		}
 		if n == nil {
-			for y in i32(0) ..< CHUNK_HEIGHT do p.blocks[pidx(px, y, pz)] = .Air
+			// пустота у вершины куба: со стороны столпа — как камень
+			fill: Block = .Air
+			if _, _, _, ok := geo_resolve(&w.geo, c.key.face, x0 + px, z0 + pz); !ok do fill = .Monolith
+			for y in i32(0) ..< CHUNK_HEIGHT do p.blocks[pidx(px, y, pz)] = fill
 			p.light_h[(pz + 1) * P + (px + 1)] = 0
 			continue
 		}
@@ -195,7 +210,7 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 	clear(&water_verts)
 
 	x0 := c.key.x * CHUNK_SIZE
-	z0 := c.key.y * CHUNK_SIZE
+	z0 := c.key.z * CHUNK_SIZE
 	for y in i32(0) ..= c.max_y do for z in i32(0) ..< CHUNK_SIZE do for x in i32(0) ..< CHUNK_SIZE {
 		b := p.blocks[pidx(x, y, z)]
 		if b == .Air do continue

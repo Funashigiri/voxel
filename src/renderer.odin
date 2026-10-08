@@ -12,7 +12,7 @@ import gl "vendor:OpenGL"
 Chunk_Shader :: struct {
 	prog:                                                 u32,
 	u_view_proj, u_origin, u_time, u_atlas, u_alpha_cutoff: i32,
-	u_fog:                                                i32,
+	u_fog, u_rot, u_side_shade:                           i32,
 }
 
 Entity_Shader :: struct {
@@ -42,7 +42,13 @@ Renderer :: struct {
 	underwater:     bool, // камера под водой в этом кадре
 	player_light:   f32,
 	chunks_drawn:   int,
+	// затенение боков вдоль x и z кадра; после поворота кадра (переход через
+	// ребро) значения меняются местами и плавно возвращаются к обычным
+	side_shade:     [2]f32,
+	anomaly:        [4]f32, // туман ближайшей аномалии: центр от камеры, радиус
 }
+
+SIDE_SHADE :: [2]f32{0.6, 0.8}
 
 Frame_Params :: struct {
 	world:       ^World,
@@ -79,6 +85,8 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 			u_atlas        = loc(p, "u_atlas"),
 			u_alpha_cutoff = loc(p, "u_alpha_cutoff"),
 			u_fog          = loc(p, "u_fog"),
+			u_rot          = loc(p, "u_rot"),
+			u_side_shade   = loc(p, "u_side_shade"),
 		}
 	}
 	{
@@ -122,6 +130,7 @@ renderer_init :: proc(r: ^Renderer, view_radius: i32) -> bool {
 	view_blocks := f32(view_radius * CHUNK_SIZE)
 	r.fog = {view_blocks * 0.55, view_blocks * 0.95}
 	r.player_light = 1
+	r.side_shade = SIDE_SHADE
 	return true
 }
 
@@ -152,6 +161,7 @@ aabb_visible :: proc(f: ^Frustum, mn, mx: [3]f32) -> bool {
 Visible_Chunk :: struct {
 	chunk:  ^Chunk,
 	origin: [3]f32,
+	rot:    [4]f32,
 	dist2:  f32,
 }
 
@@ -161,6 +171,17 @@ set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
 	eng.set_vec3(eng.uniform_loc(prog, "u_sky_top"), SKY_TOP)
 	eng.set_vec3(eng.uniform_loc(prog, "u_sky_horizon"), SKY_HORIZON)
 	eng.set_vec4(eng.uniform_loc(prog, "u_fog_override"), r.underwater ? WATER_FOG_COLOR : {})
+	eng.set_vec4(eng.uniform_loc(prog, "u_anomaly"), r.anomaly)
+}
+
+// Туман ближайшей аномалии (вершины куба) — в координатах относительно камеры.
+@(private = "file")
+update_anomaly :: proc(r: ^Renderer, w: ^World, cam: ^Camera) {
+	cx, cz, dist := geo_nearest_corner(&w.geo, cam.pos.x, cam.pos.z)
+	r.anomaly = {}
+	if dist < ANOMALY_RADIUS + 2000 {
+		r.anomaly = {f32(cx - cam.pos.x), f32(ANOMALY_Y - cam.pos.y), f32(cz - cam.pos.z), ANOMALY_RADIUS}
+	}
 }
 
 // Плавно подстраивает яркость персонажа под свет в его клетке (тень деревьев и т.п.).
@@ -192,6 +213,8 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		r.underwater = b == .Water
 	}
 	fog := r.underwater ? WATER_FOG : r.fog
+	update_anomaly(r, fp.world, cam)
+	r.side_shade += (SIDE_SHADE - r.side_shade) * min(1, fp.dt * 1.5)
 	gl.ClearColor(SKY_HORIZON.r, SKY_HORIZON.g, SKY_HORIZON.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 
@@ -218,6 +241,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_vec2(r.chunk.u_fog, fog)
 	eng.set_i32(r.chunk.u_atlas, 0)
 	eng.set_f32(r.chunk.u_alpha_cutoff, 0.5)
+	eng.set_vec2(r.chunk.u_side_shade, r.side_shade)
 	set_sky_uniforms(r, r.chunk.prog)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.atlas)
@@ -226,20 +250,23 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	visible := make([dynamic]Visible_Chunk, 0, len(fp.world.chunks), context.temp_allocator)
 	for _, c in fp.world.chunks {
 		if !c.meshed do continue
-		origin := [3]f32 {
-			f32(f64(c.key.x * CHUNK_SIZE) - 1 - cam.pos.x),
-			f32(-1 - cam.pos.y),
-			f32(f64(c.key.y * CHUNK_SIZE) - 1 - cam.pos.z),
-		}
-		mn := origin + 1
-		mx := mn + [3]f32{CHUNK_SIZE, f32(c.max_y + 2), CHUNK_SIZE}
+		// чанк соседней грани лежит в кадре повёрнутым на 90°·k
+		m, placed := geo_frame_of(&fp.world.geo, c.key.face)
+		if !placed do continue
+		fx, fz := xform_pos(m, f64(c.key.x * CHUNK_SIZE), f64(c.key.z * CHUNK_SIZE))
+		origin := [3]f32{f32(fx - cam.pos.x), f32(-cam.pos.y), f32(fz - cam.pos.z)}
+		rot := [4]f32{f32(m.r[0][0]), f32(m.r[1][0]), f32(m.r[0][1]), f32(m.r[1][1])}
+		far := [2]f32{rot.x + rot.z, rot.y + rot.w} * CHUNK_SIZE // образ угла (16, 16)
+		mn := [3]f32{origin.x + min(0, far.x), origin.y, origin.z + min(0, far.y)}
+		mx := [3]f32{origin.x + max(0, far.x), origin.y + f32(c.max_y + 1), origin.z + max(0, far.y)}
 		if !aabb_visible(&frustum, mn, mx) do continue
-		centre := mn + [3]f32{8, 0, 8}
-		append(&visible, Visible_Chunk{c, origin, centre.x * centre.x + centre.z * centre.z})
+		centre := (mn + mx) / 2
+		append(&visible, Visible_Chunk{c, origin, rot, centre.x * centre.x + centre.z * centre.z})
 	}
 	slice.sort_by(visible[:], proc(a, b: Visible_Chunk) -> bool {return a.dist2 < b.dist2})
 	for &v in visible {
 		eng.set_vec3(r.chunk.u_origin, v.origin)
+		eng.set_vec4(r.chunk.u_rot, v.rot)
 		chunk_mesh_draw(&v.chunk.opaque_mesh)
 	}
 	r.chunks_drawn = len(visible)
@@ -275,6 +302,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	#reverse for &v in visible[:] {
 		if v.chunk.water_mesh.quads == 0 do continue
 		eng.set_vec3(r.chunk.u_origin, v.origin)
+		eng.set_vec4(r.chunk.u_rot, v.rot)
 		chunk_mesh_draw(&v.chunk.water_mesh)
 	}
 	gl.Enable(gl.CULL_FACE)
@@ -303,7 +331,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.DepthMask(true)
 
 	// ---- облака: сначала глубина, потом цвет (без двойного наложения граней)
-	cloud_origin := sky_update_clouds(fp.sky, cam.pos, fp.time)
+	cloud_origin := sky_update_clouds(fp.sky, &fp.world.geo, cam.pos, fp.time)
 	if fp.sky.cloud_verts > 0 {
 		gl.UseProgram(r.cloud.prog)
 		eng.set_mat4(r.cloud.u_view_proj, cam.view_proj)

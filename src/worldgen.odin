@@ -11,7 +11,6 @@ import "core:math/noise"
 import eng "engine"
 
 // Фрактальный шум в точке p (блоки) с размером деталей scale.
-@(private = "file")
 fbm :: proc(seed: i64, p: [3]f64, scale: f64, octaves: int) -> f32 {
 	sum, amp, norm: f32 = 0, 1, 0
 	freq := 1 / scale
@@ -108,16 +107,28 @@ place_tree :: proc(c: ^Chunk, x0, z0, tx, base, tz: i32, log, leaves: Block, hei
 	}
 }
 
+MONOLITH_RADIUS :: 7.0 // столп в вершине куба-планеты
+
+// Расстояние от центра колонки до ближайшей вершины куба (угла грани).
+corner_dist :: proc(n, x, z: i32) -> f64 {
+	cx: f64 = x < n / 2 ? 0 : f64(n)
+	cz: f64 = z < n / 2 ? 0 : f64(n)
+	dx, dz := f64(x) + 0.5 - cx, f64(z) + 0.5 - cz
+	return math.sqrt(dx * dx + dz * dz)
+}
+
 generate_chunk :: proc(w: ^World, c: ^Chunk) {
 	seed := i64(w.seed)
 	useed := w.seed
+	face := c.key.face
+	n := w.geo.n
 	x0 := c.key.x * CHUNK_SIZE
-	z0 := c.key.y * CHUNK_SIZE
+	z0 := c.key.z * CHUNK_SIZE
 
 	points: [N * N][3]f64 // точки шара для колонок (с запасом PAD вокруг чанка)
 	heights: [N * N]i32
 	for j in 0 ..< N do for i in 0 ..< N {
-		points[j * N + i] = geo_point(&w.geo, x0 + i32(i) - PAD, z0 + i32(j) - PAD)
+		points[j * N + i] = geo_point(&w.geo, face, x0 + i32(i) - PAD, z0 + i32(j) - PAD)
 		heights[j * N + i] = terrain_height(seed, points[j * N + i])
 	}
 	slope_at :: proc(heights: ^[N * N]i32, i, j: int) -> i32 {
@@ -134,9 +145,9 @@ generate_chunk :: proc(w: ^World, c: ^Chunk) {
 		i := int(lx) + PAD
 		j := int(lz) + PAD
 		wx, wz := x0 + lx, z0 + lz
-		if !geo_inside(&w.geo, wx, wz) {
-			// за ребром грани — пока стена (переход между гранями будет позже)
-			for y in i32(0) ..< CHUNK_HEIGHT do c.blocks[block_index(lx, y, lz)] = .Bedrock
+		if corner_dist(n, wx, wz) < MONOLITH_RADIUS {
+			// вершина куба: столп сквозь всю планету
+			for y in i32(0) ..< CHUNK_HEIGHT do c.blocks[block_index(lx, y, lz)] = .Monolith
 			continue
 		}
 		p := points[j * N + i]
@@ -190,7 +201,9 @@ generate_chunk :: proc(w: ^World, c: ^Chunk) {
 		i := int(tx - (x0 - PAD))
 		j := int(tz - (z0 - PAD))
 		if i < 1 || j < 1 || i >= N - 1 || j >= N - 1 do continue
-		if !geo_inside(&w.geo, tx, tz) do continue
+		// деревья целиком внутри грани (не режутся на стыке) и не у столпа
+		if tx < 3 || tz < 3 || tx > n - 4 || tz > n - 4 do continue
+		if corner_dist(n, tx, tz) < MONOLITH_RADIUS + 4 do continue
 		tp := points[j * N + i]
 		if eng.hash2f(gx, gz, useed + 501) > forest_density(seed, tp) do continue
 		h := heights[j * N + i]
@@ -234,10 +247,10 @@ chunk_update_light :: proc(c: ^Chunk) {
 @(private = "file")
 column_at :: proc(w: ^World, x, z: i32) -> (h, slope: i32, p: [3]f64) {
 	s := i64(w.seed)
-	p = geo_point(&w.geo, x, z)
+	p = geo_point(&w.geo, w.geo.face, x, z)
 	h = terrain_height(s, p)
 	for d in ([4][2]i32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
-		slope = max(slope, abs(h - terrain_height(s, geo_point(&w.geo, x + d.x, z + d.y))))
+		slope = max(slope, abs(h - terrain_height(s, geo_point(&w.geo, w.geo.face, x + d.x, z + d.y))))
 	}
 	return
 }
@@ -249,6 +262,8 @@ find_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
 			for dx := -r; dx <= r; dx += 4 {
 				if max(abs(dx), abs(dz)) != r do continue
 				x, z := cx + dx, cz + dz
+				if _, _, _, ok := world_resolve(w, x, z); !ok do continue // пустота у вершины
+				if corner_dist(w.geo.n, x, z) < MONOLITH_RADIUS + 2 do continue
 				h, slope, p := column_at(w, x, z)
 				if h <= SEA_LEVEL + 2 do continue
 				surface, _ := surface_for(i64(w.seed), p, h, slope)
@@ -260,13 +275,20 @@ find_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
 	return {f64(cx) + 0.5, f64(h) + 1, f64(cz) + 0.5}
 }
 
+// Отладка: ровно в колонке (x, z) — на суше или на воде.
+spawn_at :: proc(w: ^World, x, z: i32) -> [3]f64 {
+	h, _, _ := column_at(w, x, z)
+	if h < SEA_LEVEL do return {f64(x) + 0.5, SEA_LEVEL - 0.4, f64(z) + 0.5}
+	return {f64(x) + 0.5, f64(h) + 1, f64(z) + 0.5}
+}
+
 // Отладка: точка над глубокой водой недалеко от (cx, cz).
 find_water_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
 	for r := i32(0); r < 1200; r += 4 {
 		for dz := -r; dz <= r; dz += 4 {
 			for dx := -r; dx <= r; dx += 4 {
 				if max(abs(dx), abs(dz)) != r do continue
-				if terrain_height(i64(w.seed), geo_point(&w.geo, cx + dx, cz + dz)) < SEA_LEVEL - 5 {
+				if terrain_height(i64(w.seed), geo_point(&w.geo, w.geo.face, cx + dx, cz + dz)) < SEA_LEVEL - 5 {
 					return {f64(cx + dx) + 0.5, SEA_LEVEL - 0.4, f64(cz + dz) + 0.5}
 				}
 			}
@@ -281,7 +303,7 @@ find_mountain_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
 		for dz := -r; dz <= r; dz += 6 {
 			for dx := -r; dx <= r; dx += 6 {
 				if max(abs(dx), abs(dz)) != r do continue
-				h := terrain_height(i64(w.seed), geo_point(&w.geo, cx + dx, cz + dz))
+				h := terrain_height(i64(w.seed), geo_point(&w.geo, w.geo.face, cx + dx, cz + dz))
 				if h >= 92 do return {f64(cx + dx) + 0.5, f64(h) + 1, f64(cz + dz) + 0.5}
 			}
 		}

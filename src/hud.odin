@@ -16,6 +16,8 @@ GRAY :: [4]u8{190, 190, 190, 255}
 @(private = "file")
 GOLD :: [4]u8{255, 214, 92, 255}
 @(private = "file")
+VIOLET :: [4]u8{196, 160, 255, 255}
+@(private = "file")
 LINE_BG :: [4]u8{40, 40, 40, 150}
 
 // Строка панели: несколько кусков текста в фиксированных колонках.
@@ -62,6 +64,12 @@ hud_draw_clock :: proc(c: ^Game_Clock, width, height: i32) {
 @(private = "file")
 lat_text :: proc(lat: f64) -> string {
 	return fmt.tprintf("%.1f° %s", abs(lat), lat >= 0 ? "с.ш." : "ю.ш.")
+}
+
+// Расстояние: до километра — в метрах, дальше — в км.
+@(private = "file")
+dist_text :: proc(d: f64) -> string {
+	return d < 1000 ? fmt.tprintf("%.0f м", d) : fmt.tprintf("%.1f км", d / 1000)
 }
 
 @(private = "file")
@@ -120,10 +128,12 @@ hud_draw_debug :: proc(s: ^Star_System, w: ^World, c: ^Game_Clock, player: ^Char
 
 	// где мы на шаре — считается по текущей позиции
 	geo := &w.geo
-	dir := geo_dir(geo, geo.face, player.pos.x, player.pos.z)
+	dir := geo_frame_dir(geo, player.pos.x, player.pos.z)
 	lat, lon := geo_latlon(dir)
 	panel_line(&p, GOLD, fmt.tprintf("Мы: широта %s, долгота %s", lat_text(lat), lon_text(lon)))
-	panel_line(&p, WHITE, fmt.tprintf("грань куба: %s, до ребра %.1f км", FACE_NAMES[geo.face], geo_edge_dist(geo, player.pos.x, player.pos.z) / 1000))
+	panel_line(&p, WHITE, fmt.tprintf("грань куба: %s, до ребра %s", FACE_NAMES[geo.face], dist_text(geo_edge_dist(geo, player.pos.x, player.pos.z))))
+	_, _, anomaly := geo_nearest_corner(geo, player.pos.x, player.pos.z)
+	panel_line(&p, anomaly < ANOMALY_RADIUS ? VIOLET : WHITE, fmt.tprintf("до аномалии (вершины куба): %s", dist_text(anomaly)))
 	panel_line(&p, WHITE, fmt.tprintf("над уровнем моря: %.0f м; окружность планеты %.0f км", player.pos.y - (SEA_LEVEL + 1), 2 * 3.14159265 * geo.radius / 1000))
 }
 
@@ -149,13 +159,22 @@ hud_draw_globe :: proc(fp: ^Frame_Params, ortho: matrix[4, 4]f32) {
 	eng.imm_flush(ortho)
 
 	geo := &fp.world.geo
-	dir := geo_dir(geo, geo.face, fp.player.pos.x, fp.player.pos.z)
-	marker, visible := globe_draw(fp.globe, dir, fp.time, x, y, size, fp.height)
+	dir := geo_frame_dir(geo, fp.player.pos.x, fp.player.pos.z)
+	view := globe_draw(fp.globe, dir, fp.time, x, y, size, fp.height)
 	gl.Viewport(0, 0, fp.width, fp.height)
 	gl.Enable(gl.BLEND)
 	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 	gl.Disable(gl.CULL_FACE)
 
+	// аномалии в вершинах куба
+	for a in ANOMALY_DIRS {
+		pos, facing := globe_project(view, a / math.sqrt(f64(3)))
+		if !facing do continue
+		r := 1.5 * g
+		eng.imm_rect(pos.x - r - g, pos.y - r - g, pos.x + r + g, pos.y + r + g, {40, 20, 60, 200})
+		eng.imm_rect(pos.x - r, pos.y - r, pos.x + r, pos.y + r, {176, 140, 230, 255})
+	}
+	marker, visible := globe_project(view, dir)
 	if visible {
 		blink := u8(170 + 85 * math.sin(fp.time * 6))
 		r := 2 * g

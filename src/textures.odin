@@ -29,6 +29,7 @@ Tex :: enum u8 {
 	Dandelion,
 	Poppy,
 	Scorched,
+	Monolith,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -286,6 +287,19 @@ gen_scorched :: proc() -> (img: Pixels) {
 	return
 }
 
+// Гладкий тёмный камень с едва заметным сиреневым отливом.
+@(private = "file")
+gen_monolith :: proc() -> (img: Pixels) {
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.7 * vn(x, y, 8, 120) + 0.3 * h(x, y, 121)
+		v := 20 + n * 9
+		c := rgb(u8(v), u8(v * 0.94), u8(v * 1.25))
+		if (x + y * 3) % 16 == 0 && h(x, y, 122) < 0.5 do c = rgb(u8(v + 8), u8(v + 6), u8(v * 1.25 + 12)) // блик
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
 @(private = "file")
 gen_water :: proc(frame: int) -> (img: Pixels) {
 	pal := []RGBA{{38, 76, 184, 168}, {50, 94, 206, 168}, {66, 114, 222, 172}, {94, 142, 236, 178}}
@@ -357,6 +371,8 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_flower(rgb(236, 64, 52), rgb(204, 32, 30), rgb(150, 18, 18), rgb(44, 30, 24))
 	case .Scorched:
 		return gen_scorched()
+	case .Monolith:
+		return gen_monolith()
 	case .Water:
 		return gen_water(0)
 	}

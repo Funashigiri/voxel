@@ -1,6 +1,12 @@
 package main
 
 // Мир из чанков 16x128x16, подгружаемых вокруг игрока.
+//
+// Чанк принадлежит грани куба-планеты и лежит в её собственной сетке
+// (ключ — грань + координаты чанка на ней). Игра идёт в "кадре" текущей
+// грани: координаты x, z — её сетка, продолженная через рёбра на соседние
+// грани (их сетка повёрнута на 90°·k). За двумя рёбрами сразу (у вершины
+// куба) — пустота, её закрывает столп-аномалия.
 
 import "core:math"
 import "core:slice"
@@ -12,7 +18,10 @@ CHUNK_AREA :: CHUNK_SIZE * CHUNK_SIZE
 CHUNK_VOLUME :: CHUNK_AREA * CHUNK_HEIGHT
 SEA_LEVEL :: 62
 
-Chunk_Key :: [2]i32
+Chunk_Key :: struct {
+	face: Cube_Face,
+	x, z: i32, // координаты чанка в сетке своей грани
+}
 
 Chunk :: struct {
 	key:          Chunk_Key,
@@ -30,7 +39,7 @@ World :: struct {
 	geo:         Planet_Geo, // планета и грань, на которой идёт игра
 	chunks:      map[Chunk_Key]^Chunk,
 	view_radius: i32,
-	load_order:  [dynamic]Chunk_Key, // смещения чанков, отсортированные по расстоянию
+	load_order:  [dynamic][2]i32, // смещения чанков, отсортированные по расстоянию
 	// Изменения мира поверх генерации — переживают выгрузку чанков
 	// (пока только до выхода из игры: сохранения ещё нет).
 	edits:       map[Chunk_Key][dynamic]Block_Edit,
@@ -52,10 +61,10 @@ world_init :: proc(w: ^World, seed: u32, view_radius: i32, geo: Planet_Geo) {
 	r := view_radius
 	for dz in -r ..= r do for dx in -r ..= r {
 		if f32(dx * dx + dz * dz) <= (f32(r) + 0.5) * (f32(r) + 0.5) {
-			append(&w.load_order, Chunk_Key{dx, dz})
+			append(&w.load_order, [2]i32{dx, dz})
 		}
 	}
-	slice.sort_by(w.load_order[:], proc(a, b: Chunk_Key) -> bool {
+	slice.sort_by(w.load_order[:], proc(a, b: [2]i32) -> bool {
 		return a.x * a.x + a.y * a.y < b.x * b.x + b.y * b.y
 	})
 }
@@ -72,18 +81,40 @@ world_destroy :: proc(w: ^World) {
 	delete(w.edits)
 }
 
-world_get_chunk :: proc(w: ^World, cx, cz: i32) -> ^Chunk {
-	return w.chunks[{cx, cz}] or_else nil
+// Клетка кадра -> грань, клетка на ней (ok = false — пустота у вершины куба).
+world_resolve :: proc(w: ^World, x, z: i32) -> (face: Cube_Face, gx, gz: i32, ok: bool) {
+	return geo_resolve(&w.geo, w.geo.face, x, z)
 }
 
+chunk_key_of :: proc(face: Cube_Face, gx, gz: i32) -> Chunk_Key {
+	return {face, eng.floor_div(gx, CHUNK_SIZE), eng.floor_div(gz, CHUNK_SIZE)}
+}
+
+world_chunk :: proc(w: ^World, key: Chunk_Key) -> ^Chunk {
+	return w.chunks[key] or_else nil
+}
+
+// Чанк кадра (координаты чанка в кадре текущей грани).
+world_frame_chunk :: proc(w: ^World, fcx, fcz: i32) -> ^Chunk {
+	face, gx, gz, ok := world_resolve(w, fcx * CHUNK_SIZE, fcz * CHUNK_SIZE)
+	if !ok do return nil
+	return world_chunk(w, chunk_key_of(face, gx, gz))
+}
+
+// Блок в мировой (глобальной) клетке грани face.
+global_get_block :: proc(w: ^World, face: Cube_Face, gx, y, gz: i32) -> (b: Block, loaded: bool) {
+	c := world_chunk(w, chunk_key_of(face, gx, gz))
+	if c == nil do return .Air, false
+	return c.blocks[block_index(eng.floor_mod(gx, CHUNK_SIZE), y, eng.floor_mod(gz, CHUNK_SIZE))], true
+}
+
+// Блок в координатах кадра. Пустота у вершины куба — непроходимый столп.
 world_get_block :: proc(w: ^World, x, y, z: i32) -> (b: Block, loaded: bool) {
 	if y < 0 do return .Bedrock, true
 	if y >= CHUNK_HEIGHT do return .Air, true
-	c := world_get_chunk(w, eng.floor_div(x, CHUNK_SIZE), eng.floor_div(z, CHUNK_SIZE))
-	if c == nil do return .Air, false
-	lx := eng.floor_mod(x, CHUNK_SIZE)
-	lz := eng.floor_mod(z, CHUNK_SIZE)
-	return c.blocks[block_index(lx, y, lz)], true
+	face, gx, gz, ok := world_resolve(w, x, z)
+	if !ok do return .Monolith, true
+	return global_get_block(w, face, gx, y, gz)
 }
 
 // Незагруженные чанки считаются твёрдыми, чтобы игрок не провалился.
@@ -96,10 +127,12 @@ world_is_solid :: proc(w: ^World, x, y, z: i32) -> bool {
 // Яркость неба в точке: 1 — открыто небу, SHADOW_LIGHT — в тени.
 world_sky_light :: proc(w: ^World, x, y, z: i32) -> f32 {
 	if y >= CHUNK_HEIGHT do return 1
-	c := world_get_chunk(w, eng.floor_div(x, CHUNK_SIZE), eng.floor_div(z, CHUNK_SIZE))
+	face, gx, gz, ok := world_resolve(w, x, z)
+	if !ok do return 1
+	c := world_chunk(w, chunk_key_of(face, gx, gz))
 	if c == nil do return 1
-	lx := eng.floor_mod(x, CHUNK_SIZE)
-	lz := eng.floor_mod(z, CHUNK_SIZE)
+	lx := eng.floor_mod(gx, CHUNK_SIZE)
+	lz := eng.floor_mod(gz, CHUNK_SIZE)
 	return y >= i32(c.light_height[lz * CHUNK_SIZE + lx]) ? 1 : SHADOW_LIGHT
 }
 
@@ -117,19 +150,32 @@ ensure_chunk :: proc(w: ^World, key: Chunk_Key) -> (c: ^Chunk, created: bool) {
 	return c, true
 }
 
-// Меняет блок, запоминает изменение и помечает чанки на перестройку сетки.
+// Соседний чанк (dx, dz) в сетке грани чанка; через ребро — на другой грани.
+chunk_neighbor_key :: proc(w: ^World, key: Chunk_Key, dx, dz: i32) -> (Chunk_Key, bool) {
+	x := (key.x + dx) * CHUNK_SIZE + CHUNK_SIZE / 2
+	z := (key.z + dz) * CHUNK_SIZE + CHUNK_SIZE / 2
+	face, gx, gz, ok := geo_resolve(&w.geo, key.face, x, z)
+	if !ok do return {}, false
+	return chunk_key_of(face, gx, gz), true
+}
+
+// Меняет блок (координаты кадра), запоминает изменение и помечает чанки на
+// перестройку сетки.
 world_set_block :: proc(w: ^World, x, y, z: i32, b: Block) {
 	if y < 0 || y >= CHUNK_HEIGHT do return
-	key := Chunk_Key{eng.floor_div(x, CHUNK_SIZE), eng.floor_div(z, CHUNK_SIZE)}
-	lx := eng.floor_mod(x, CHUNK_SIZE)
-	lz := eng.floor_mod(z, CHUNK_SIZE)
+	face, gx, gz, ok := world_resolve(w, x, z)
+	if !ok do return
+	key := chunk_key_of(face, gx, gz)
+	lx := eng.floor_mod(gx, CHUNK_SIZE)
+	lz := eng.floor_mod(gz, CHUNK_SIZE)
 	idx := block_index(lx, y, lz)
+	if c := world_chunk(w, key); c != nil && c.blocks[idx] == .Monolith do return // столп неразрушим
 
 	list := w.edits[key]
 	append(&list, Block_Edit{idx, b})
 	w.edits[key] = list
 
-	c := world_get_chunk(w, key.x, key.y)
+	c := world_chunk(w, key)
 	if c == nil do return
 	c.blocks[idx] = b
 	chunk_update_light(c)
@@ -137,7 +183,9 @@ world_set_block :: proc(w: ^World, x, y, z: i32, b: Block) {
 	for dz in i32(-1) ..= 1 do for dx in i32(-1) ..= 1 {
 		if dx < 0 && lx != 0 || dx > 0 && lx != CHUNK_SIZE - 1 do continue
 		if dz < 0 && lz != 0 || dz > 0 && lz != CHUNK_SIZE - 1 do continue
-		if n := world_get_chunk(w, key.x + dx, key.y + dz); n != nil do n.meshed = false
+		if nk, nok := chunk_neighbor_key(w, key, dx, dz); nok {
+			if n := world_chunk(w, nk); n != nil do n.meshed = false
+		}
 	}
 }
 
@@ -150,14 +198,18 @@ world_update :: proc(w: ^World, center: [3]f64, budget_sec: f64) -> (all_ready: 
 
 	all_ready = true
 	outer: for off in w.load_order {
-		key := Chunk_Key{pcx + off.x, pcz + off.y}
+		face, gx, gz, ok := world_resolve(w, (pcx + off.x) * CHUNK_SIZE, (pcz + off.y) * CHUNK_SIZE)
+		if !ok do continue // пустота у вершины куба
+		key := chunk_key_of(face, gx, gz)
 		c, _ := ensure_chunk(w, key)
 		if c.meshed do continue
 		all_ready = false
-		// для сетки нужны все 8 соседей (AO и грани на границе)
+		// для сетки нужны все 8 соседей (AO и грани на границе), в т.ч. через рёбра
 		for dz in i32(-1) ..= 1 do for dx in i32(-1) ..= 1 {
 			if dx == 0 && dz == 0 do continue
-			if _, created := ensure_chunk(w, key + Chunk_Key{dx, dz}); created {
+			nk, nok := chunk_neighbor_key(w, key, dx, dz)
+			if !nok do continue
+			if _, created := ensure_chunk(w, nk); created {
 				if eng.time_now() - start > budget_sec do break outer
 			}
 		}
@@ -165,11 +217,12 @@ world_update :: proc(w: ^World, center: [3]f64, budget_sec: f64) -> (all_ready: 
 		if eng.time_now() - start > budget_sec do break
 	}
 
-	// выгрузка дальних чанков
+	// выгрузка дальних чанков (и чанков граней, которых нет в кадре)
 	unload_r := w.view_radius + 3
 	to_remove := make([dynamic]Chunk_Key, context.temp_allocator)
 	for key in w.chunks {
-		if abs(key.x - pcx) > unload_r || abs(key.y - pcz) > unload_r {
+		fx, fz, placed := chunk_frame_pos(w, key)
+		if !placed || abs(eng.floor_div(fx, CHUNK_SIZE) - pcx) > unload_r || abs(eng.floor_div(fz, CHUNK_SIZE) - pcz) > unload_r {
 			append(&to_remove, key)
 		}
 	}
@@ -181,4 +234,13 @@ world_update :: proc(w: ^World, center: [3]f64, budget_sec: f64) -> (all_ready: 
 		delete_key(&w.chunks, key)
 	}
 	return
+}
+
+// Где в кадре лежит первая клетка чанка (для выгрузки).
+@(private = "file")
+chunk_frame_pos :: proc(w: ^World, key: Chunk_Key) -> (x, z: i32, ok: bool) {
+	m, placed := geo_frame_of(&w.geo, key.face)
+	if !placed do return 0, 0, false
+	x, z = xform_cell(m, key.x * CHUNK_SIZE + CHUNK_SIZE / 2, key.z * CHUNK_SIZE + CHUNK_SIZE / 2)
+	return x, z, true
 }
