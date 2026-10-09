@@ -142,17 +142,61 @@ vec3 apply_anomaly(vec3 col, vec3 rel, float dist) {
 `
 
 // ---------------------------------------------------------------- чанки
+// Времена года на поверхности (climate.odin): оттенок травы и листвы по
+// климату, трава жухнет зимой и в засуху, листва дуба и берёзы осенью желтеет и
+// краснеет, зимой опадает; в мороз (если идут осадки) ложится снег.
+SEASON_GLSL :: `
+const vec3 SNOW_COLOR = vec3(0.9, 0.93, 0.98);
+// оттенок по климату: сухо — желтее, холодно — буро-оливковый
+vec3 grass_tint(vec3 c, vec2 tint) {
+	vec3 m = mix(vec3(1.0), vec3(1.32, 1.08, 0.52), tint.x);
+	m = mix(m, vec3(0.8, 0.7, 0.48), tint.y);
+	return c * m;
+}
+// зимой и в сухой сезон трава жухнет
+vec3 grass_season(vec3 c, float t, float p) {
+	float dormant = max(smoothstep(4.0, -2.0, t), smoothstep(25.0, 5.0, p) * smoothstep(12.0, 18.0, t) * 0.8);
+	return mix(c, c * vec3(1.12, 0.92, 0.5), dormant);
+}
+// осень: при похолодании ниже ~12 °C листва желтеет и краснеет (h — у каждого дерева свой оттенок)
+vec3 leaf_autumn(vec3 c, float t, float trend, float h) {
+	float a = trend < 0.0 ? smoothstep(13.0, 5.0, t) : smoothstep(9.0, 3.0, t);
+	vec3 autumn = mix(vec3(0.95, 0.72, 0.18), vec3(0.85, 0.28, 0.1), h);
+	float lum = dot(c, vec3(0.3, 0.59, 0.11));
+	return mix(c, autumn * lum * 2.2, a);
+}
+// 0 — в листве, 1 — голые ветки
+float leaves_bare(float t, float trend) {
+	return trend < 0.0 ? smoothstep(4.0, 0.0, t) : smoothstep(7.0, 3.0, t);
+}
+// снег: ложится в мороз и копится всю зиму (за несколько месяцев — даже при
+// скудных осадках), весной сходит с запаздыванием; в сухом климате его нет
+float snow_cover(float t, float trend, float p) {
+	float cold = trend < 0.0 ? smoothstep(1.0, -2.0, t) : smoothstep(3.0, -1.0, t);
+	return cold * smoothstep(3.0, 20.0, p * 4.0);
+}
+`
+
 CHUNK_VS :: `#version 330 core
 layout(location = 0) in uvec4 a_pos;  // xyz: 1/16 блока, w: свет | грань<<8 | флаги<<11
-layout(location = 1) in uvec4 a_tex;  // u, v (тексели), слой
+layout(location = 1) in uvec4 a_tex;  // u, v (тексели), слой, климат (сухость | холод<<4)
 uniform mat4 u_view_proj;
 uniform vec3 u_origin;     // начало чанка относительно камеры
 uniform vec4 u_rot;        // поворот сетки грани чанка в кадр (mat2 по столбцам)
 uniform vec2 u_side_shade; // затенение боков, смотрящих вдоль x и вдоль z кадра
 uniform float u_time;
+uniform float u_chunk_alt; // низ чанка над уровнем моря, м
+uniform vec4 u_layer_a;    // слои: верх травы, бок травы, высокая трава, листва дуба
+uniform vec4 u_layer_b;    // листва берёзы, хвоя ели, листва акации, листва тропического дерева
+uniform vec4 u_layer_c;    // одуванчик, мак
 out vec3 v_uvl;
 out float v_light;
 out vec3 v_rel;
+out float v_alt;
+out vec2 v_tint;
+flat out int v_kind; // 1 — верх травы, 2 — бок травы, 3 — трава-растение, 4 — листопадная листва, 5 — вечнозелёная, 6 — прочий верх, 7 — цветы
+flat out int v_face;
+flat out float v_hash;
 // Направленное затенение граней как в Minecraft: верх 1.0, бока 0.8/0.6, низ 0.5.
 const float FACE_SHADE[7] = float[7](0.6, 0.6, 1.0, 0.5, 0.8, 0.8, 1.0);
 void main() {
@@ -166,11 +210,26 @@ void main() {
 		shade = along_x ? u_side_shade.x : u_side_shade.y;
 	}
 	uint flags = a_pos.w >> 11u;
-	float layer = float(a_tex.z);
+	float base = float(a_tex.z);
+	float layer = base;
 	if ((flags & 1u) != 0u) layer += float(int(u_time * 10.0) % 32); // WATER_FRAMES
 	v_uvl = vec3(vec2(a_tex.xy) * (1.0 / 16.0), layer);
 	v_light = float(a_pos.w & 255u) / 255.0 * shade;
 	v_rel = p;
+	v_alt = u_chunk_alt + q.y;
+	v_tint = vec2(float(a_tex.w & 15u), float(a_tex.w >> 4u)) / 15.0;
+	v_face = int(face);
+	int kind = face == 2u ? 6 : 0;
+	if (base == u_layer_a.x) kind = 1;
+	else if (base == u_layer_a.y) kind = 2;
+	else if (base == u_layer_a.z) kind = 3;
+	else if (base == u_layer_a.w || base == u_layer_b.x) kind = 4;
+	else if (base == u_layer_b.y || base == u_layer_b.z || base == u_layer_b.w) kind = 5;
+	else if (base == u_layer_c.x || base == u_layer_c.y) kind = 7;
+	if ((flags & 1u) != 0u) kind = 0; // вода
+	v_kind = kind;
+	vec3 cell = floor(q - vec3(0.01));
+	v_hash = fract(sin(dot(cell + u_origin * 0.0, vec3(12.9898, 78.233, 37.719)) + u_chunk_alt * 0.37) * 43758.5453);
 	gl_Position = u_view_proj * vec4(p, 1.0);
 }
 `
@@ -179,15 +238,42 @@ CHUNK_FS :: `#version 330 core
 in vec3 v_uvl;
 in float v_light;
 in vec3 v_rel;
+in float v_alt;
+in vec2 v_tint;
+flat in int v_kind;
+flat in int v_face;
+flat in float v_hash;
 uniform sampler2DArray u_atlas;
 uniform float u_alpha_cutoff;
 uniform vec2 u_fog; // туман под водой
+uniform vec4 u_season; // температура у моря сейчас (°C), её ход за месяц, осадки за месяц (мм); w — 1: климат есть
+uniform float u_lapse; // похолодание с высотой, К/м
 out vec4 o_color;
-` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
 	vec4 c = texture(u_atlas, v_uvl);
 	if (c.a < u_alpha_cutoff) discard;
-	vec3 col = apply_light(c.rgb * v_light * cloud_shadow(v_rel));
+	vec3 base = c.rgb;
+	if (u_season.w > 0.5 && v_kind > 0) {
+		float t = u_season.x - u_lapse * max(v_alt, 0.0);
+		float snow = snow_cover(t, u_season.y, u_season.z);
+		if (v_kind <= 3) base = grass_season(grass_tint(base, v_tint), t, u_season.z);
+		if (v_kind == 4) {
+			// листопадные: осенью желтеют и краснеют, зимой голые ветки
+			float bare = leaves_bare(t, u_season.y);
+			vec2 tx = floor(v_uvl.xy * 16.0);
+			float r = fract(sin(dot(tx, vec2(12.9898, 78.233)) + v_hash * 91.7) * 43758.5453);
+			if (r < bare * 0.82) discard; // опали — остались веточки
+			base = mix(leaf_autumn(grass_tint(base, v_tint * 0.5), t, u_season.y, v_hash), vec3(0.3, 0.25, 0.2), bare);
+		}
+		if (v_kind == 3 && snow > 0.6) discard; // траву занесло
+		if (v_kind == 7 && (snow > 0.2 || t < 5.0 + 3.0 * v_hash)) discard; // цветы — только в тёплое время
+		bool top = v_face == 2 && v_kind != 3;
+		if (v_kind == 2 && v_uvl.y < 0.19) top = true; // снег свешивается с края, как у травы в Minecraft
+		if (top) base = mix(base, SNOW_COLOR, snow);
+		else if (v_kind == 5 || v_kind == 4) base = mix(base, SNOW_COLOR, snow * 0.35);
+	}
+	vec3 col = apply_light(base * v_light * cloud_shadow(v_rel));
 	// под водой свет гаснет с глубиной: ниже ~200 м почти темно
 	float depth = -(u_haze.z + v_rel.y);
 	if (depth > 0.0) col *= exp(-depth / 60.0);
@@ -351,7 +437,12 @@ FAR_VS :: `#version 330 core
 layout(location = 0) in vec3 a_off;
 layout(location = 1) in vec4 a_normal; // оси планеты
 layout(location = 2) in vec4 a_color;  // цвет; a = 1 — вода
+layout(location = 3) in vec4 a_clim;   // материковость, осадки ×0,01, доли листопадных и хвойных крон
 uniform mat4 u_view_proj;
+uniform vec3 u_org;       // начало тайла, оси планеты (м)
+uniform float u_radius;   // радиус планеты, м
+uniform float u_lapse;    // похолодание с высотой, К/м
+uniform sampler2D u_clim; // по широте сейчас: температура над океаном и сушей, осадки, ход температуры
 uniform mat3 u_jinv;  // оси планеты -> кадр
 uniform mat3 u_jt;    // для нормалей (J транспонированная)
 uniform vec3 u_rel_o; // начало тайла относительно камеры (кадр)
@@ -361,8 +452,15 @@ uniform float u_floor;    // 1 — рисуем дно под водой (вер
 out vec3 v_rel;
 out vec3 v_n;
 out vec4 v_col;
+out vec3 v_season; // температура здесь сейчас, её ход за месяц, осадки за месяц
+out vec2 v_crowns; // доли листопадных и хвойных крон
 ` + LOGDEPTH_GLSL + `
 void main() {
+	vec3 P = u_org + a_off;
+	float r = length(P);
+	vec4 z = texture(u_clim, vec2((degrees(asin(clamp(P.y / r, -1.0, 1.0))) + 90.0) / 180.0, 0.5));
+	v_season = vec3(mix(z.x, z.y, a_clim.x) - u_lapse * max(r - u_radius, 0.0), z.w, z.z * a_clim.y * 2.55);
+	v_crowns = a_clim.zw;
 	vec3 rel = u_rel_o + u_jinv * a_off;
 	if (u_floor > 0.5 && a_color.a > 0.5) rel.y -= max(a_normal.w * 127.0, 2.0);
 	// под блоками (у их края) рельеф опущен: блоки рисуются поверх, а щели на
@@ -380,12 +478,15 @@ FAR_FS :: `#version 330 core
 in vec3 v_rel;
 in vec3 v_n;
 in vec4 v_col;
+in vec3 v_season;
+in vec2 v_crowns;
+uniform float u_season_on; // 1 — климат есть
 uniform sampler2D u_mask;   // какие чанки уже нарисованы блоками
 uniform vec3 u_mask_org;    // камера в маске (блоки), размер маски (чанки)
 uniform vec2 u_side_shade;  // затенение боков вдоль x и z кадра — как у блоков
 uniform float u_floor;      // 1 — дно под водой
 out vec4 o_color;
-` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
 	vec2 m = (u_mask_org.xy + v_rel.xz) / 16.0;
 	float under = m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z ? texelFetch(u_mask, ivec2(m), 0).r : 0.0;
@@ -400,7 +501,19 @@ void main() {
 	float k = smoothstep(-0.03, 0.12, u_sun_dir.y) * smoothstep(250.0, 2500.0, dist) * (1.0 - water);
 	float lam = (max(dot(n, u_sun_dir), 0.0) + 0.35) / (max(u_sun_dir.y, 0.0) + 0.35);
 	shade *= mix(1.0, clamp(lam, 0.55, 1.6), k);
-	vec3 col = apply_light(v_col.rgb * shade * cloud_shadow(v_rel));
+	vec3 base = v_col.rgb;
+	if (u_season_on > 0.5 && water < 0.5) {
+		// времена года: трава жухнет, листопадные желтеют и голеют, в мороз — снег
+		float t = v_season.x;
+		float decid = v_crowns.x;
+		float conif = v_crowns.y;
+		base = mix(base, grass_season(base, t, v_season.z), max(1.0 - decid - conif, 0.0));
+		float bare = leaves_bare(t, v_season.y);
+		vec3 fall = mix(leaf_autumn(base, t, v_season.y, 0.5), vec3(0.3, 0.26, 0.21), bare * 0.7);
+		base = mix(base, fall, decid);
+		base = mix(base, SNOW_COLOR, snow_cover(t, v_season.y, v_season.z) * (1.0 - 0.65 * conif - 0.4 * decid * (1.0 - bare)));
+	}
+	vec3 col = apply_light(base * shade * cloud_shadow(v_rel));
 	if (water > 0.5 && (u_floor > 0.5 || under > 0.25 || dot(v_rel, n) > 0.0)) {
 		// гладь снизу или под ближней водой: сквозь неё должно быть видно тёмное дно
 		col = apply_light(v_col.rgb * 0.45);

@@ -39,6 +39,21 @@ Tex :: enum u8 {
 	Bridgmanite,
 	Molten_Iron,
 	Iron_Core,
+	// климат (0.015)
+	Snow,
+	Ice,
+	Spruce_Log,
+	Spruce_Log_Top,
+	Spruce_Leaves,
+	Acacia_Log,
+	Acacia_Log_Top,
+	Acacia_Leaves,
+	Jungle_Log,
+	Jungle_Log_Top,
+	Jungle_Leaves,
+	Cactus_Side,
+	Cactus_Top,
+	Dead_Bush,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -432,6 +447,72 @@ gen_iron_core :: proc() -> (img: Pixels) {
 	return
 }
 
+// Снег: белый с голубоватыми тенями.
+@(private = "file")
+gen_snow :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(222, 230, 238), rgb(232, 238, 244), rgb(242, 246, 250), rgb(250, 252, 255)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		img[y * TEX_SIZE + x] = pick(pal, 0.5 * h(x, y, 220) + 0.5 * vn(x, y, 4, 221))
+	}
+	return
+}
+
+// Лёд: голубой, с белыми трещинами и пузырьками.
+@(private = "file")
+gen_ice :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(142, 178, 222), rgb(156, 190, 230), rgb(170, 202, 236), rgb(186, 214, 242)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		c := pick(pal, 0.7 * vn(x, y, 8, 230) + 0.3 * h(x, y, 231))
+		if abs(f32(x) - f32(y) * 0.6 - 3 - 4 * vn(0, y, 4, 232)) < 0.6 do c = rgb(214, 232, 248) // трещина
+		if h(x, y, 233) > 0.96 do c = rgb(236, 244, 252)
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Кактус сбоку: зелёные рёбра с колючками.
+@(private = "file")
+gen_cactus_side :: proc() -> (img: Pixels) {
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		rib := x % 4
+		c := rib == 0 ? rgb(46, 92, 34) : rib == 2 ? rgb(84, 140, 54) : rgb(64, 118, 44)
+		if rib == 2 && (y + x / 4 * 3) % 5 == 0 do c = rgb(226, 222, 170) // колючка
+		if h(x, y, 240) < 0.08 do c = rgb(54, 104, 40)
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+@(private = "file")
+gen_cactus_top :: proc() -> (img: Pixels) {
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		dx, dy := f32(x) - 7.5, f32(y) - 7.5
+		r := math.sqrt(dx * dx + dy * dy)
+		c := int(r) % 3 == 0 ? rgb(70, 124, 48) : rgb(88, 146, 58)
+		if r > 7 do c = rgb(46, 92, 34)
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Сухой куст: голые бурые веточки.
+@(private = "file")
+gen_dead_bush :: proc() -> (img: Pixels) {
+	dark := rgb(96, 66, 36)
+	light := rgb(146, 104, 58)
+	for b in 0 ..< 6 {
+		x := 3 + int(h(b, 0, 250) * 10)
+		height := 5 + int(h(b, 1, 251) * 8)
+		dir := h(b, 2, 252) < 0.5 ? -1 : 1
+		for i in 0 ..< height {
+			y := TEX_SIZE - 1 - i
+			xx := x + dir * (i / 3)
+			if xx >= 0 && xx < TEX_SIZE do put(&img, xx, y, mix_rgb(dark, light, f32(i) / f32(height)))
+		}
+	}
+	return
+}
+
 @(private = "file")
 gen_water :: proc(frame: int) -> (img: Pixels) {
 	pal := []RGBA{{38, 76, 184, 168}, {50, 94, 206, 168}, {66, 114, 222, 172}, {94, 142, 236, 178}}
@@ -523,6 +604,34 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_iron_core()
 	case .Peridotite:
 		return gen_peridotite()
+	case .Snow:
+		return gen_snow()
+	case .Ice:
+		return gen_ice()
+	case .Spruce_Log:
+		return gen_log_side([]RGBA{rgb(44, 30, 18), rgb(56, 38, 22), rgb(68, 47, 27), rgb(80, 56, 33)}, 260)
+	case .Spruce_Log_Top:
+		return gen_log_top([]RGBA{rgb(56, 38, 22), rgb(68, 47, 27)}, rgb(150, 112, 66), rgb(132, 97, 56), rgb(112, 81, 46), 265)
+	case .Spruce_Leaves:
+		return gen_leaves([]RGBA{rgb(24, 52, 34), rgb(30, 62, 40), rgb(36, 72, 46), rgb(44, 84, 54), rgb(52, 96, 62)}, 270)
+	case .Acacia_Log:
+		return gen_log_side([]RGBA{rgb(88, 82, 72), rgb(104, 97, 86), rgb(118, 110, 98), rgb(132, 124, 110)}, 280)
+	case .Acacia_Log_Top:
+		return gen_log_top([]RGBA{rgb(104, 97, 86), rgb(118, 110, 98)}, rgb(196, 112, 60), rgb(176, 96, 50), rgb(154, 82, 42), 285)
+	case .Acacia_Leaves:
+		return gen_leaves([]RGBA{rgb(82, 96, 30), rgb(98, 112, 38), rgb(112, 126, 44), rgb(126, 140, 52), rgb(142, 152, 62)}, 290)
+	case .Jungle_Log:
+		return gen_log_side([]RGBA{rgb(98, 78, 46), rgb(116, 94, 56), rgb(132, 108, 66), rgb(88, 116, 50)}, 300)
+	case .Jungle_Log_Top:
+		return gen_log_top([]RGBA{rgb(86, 70, 38), rgb(98, 82, 44)}, rgb(176, 136, 76), rgb(158, 120, 66), rgb(138, 104, 56), 305)
+	case .Jungle_Leaves:
+		return gen_leaves([]RGBA{rgb(30, 92, 18), rgb(38, 110, 22), rgb(48, 128, 28), rgb(60, 146, 34), rgb(74, 162, 42)}, 310)
+	case .Cactus_Side:
+		return gen_cactus_side()
+	case .Cactus_Top:
+		return gen_cactus_top()
+	case .Dead_Bush:
+		return gen_dead_bush()
 	case .Water:
 		return gen_water(0)
 	}

@@ -14,6 +14,7 @@ Chunk_Shader :: struct {
 	prog:                                                 u32,
 	u_view_proj, u_origin, u_time, u_atlas, u_alpha_cutoff: i32,
 	u_fog, u_rot, u_side_shade:                           i32,
+	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c: i32,
 }
 
 Entity_Shader :: struct {
@@ -88,6 +89,7 @@ Frame_Params :: struct {
 	clock:       ^Game_Clock,
 	system:      ^Star_System,
 	debug_page:  int, // страница F3 (0 — выкл)
+	season:      f64, // время года: 0..1 по средней аномалии (climate.odin)
 	universe:    ^Universe_Info,
 	fps:         f64,
 	chunks_drawn: int,
@@ -112,6 +114,12 @@ renderer_init :: proc(r: ^Renderer) -> bool {
 			u_fog          = loc(p, "u_fog"),
 			u_rot          = loc(p, "u_rot"),
 			u_side_shade   = loc(p, "u_side_shade"),
+			u_chunk_alt    = loc(p, "u_chunk_alt"),
+			u_season       = loc(p, "u_season"),
+			u_lapse        = loc(p, "u_lapse"),
+			u_layer_a      = loc(p, "u_layer_a"),
+			u_layer_b      = loc(p, "u_layer_b"),
+			u_layer_c      = loc(p, "u_layer_c"),
 		}
 	}
 	{
@@ -189,6 +197,7 @@ Visible_Chunk :: struct {
 	origin: [3]f32,
 	rot:    [4]f32,
 	dist2:  f32,
+	season: [4]f32, // климат здесь сейчас (см. CHUNK_FS)
 }
 
 // Цвета неба и тумана. Под водой туман синий и густой (как в Minecraft).
@@ -297,7 +306,7 @@ draw_far :: proc(r: ^Renderer, fp: ^Frame_Params) {
 	gl.Disable(gl.CULL_FACE)
 	gl.UseProgram(fp.far.prog)
 	set_sky_uniforms(r, fp.far.prog)
-	far_draw(fp.far, &r.pv, vp, &frustum, r.side_shade)
+	far_draw(fp.far, &r.pv, vp, &frustum, r.side_shade, fp.season)
 
 	if c := fp.clouds; c != nil && !r.off_clouds {
 		gl.Enable(gl.BLEND)
@@ -379,6 +388,10 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_i32(r.chunk.u_atlas, 0)
 	eng.set_f32(r.chunk.u_alpha_cutoff, 0.5)
 	eng.set_vec2(r.chunk.u_side_shade, r.side_shade)
+	eng.set_f32(r.chunk.u_lapse, f32(climate.lapse))
+	eng.set_vec4(r.chunk.u_layer_a, {f32(Tex.Grass_Top), f32(Tex.Grass_Side), f32(Tex.Tall_Grass), f32(Tex.Oak_Leaves)})
+	eng.set_vec4(r.chunk.u_layer_b, {f32(Tex.Birch_Leaves), f32(Tex.Spruce_Leaves), f32(Tex.Acacia_Leaves), f32(Tex.Jungle_Leaves)})
+	eng.set_vec4(r.chunk.u_layer_c, {f32(Tex.Dandelion), f32(Tex.Poppy), -1, -1})
 	set_sky_uniforms(r, r.chunk.prog)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.atlas)
@@ -398,12 +411,14 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		mx := [3]f32{origin.x + max(0, far.x), origin.y + CHUNK_SIZE, origin.z + max(0, far.y)}
 		if !aabb_visible(&frustum, mn, mx) do continue
 		centre := (mn + mx) / 2
-		append(&visible, Visible_Chunk{c, origin, rot, centre.x * centre.x + centre.z * centre.z})
+		append(&visible, Visible_Chunk{c, origin, rot, centre.x * centre.x + centre.z * centre.z, chunk_season(fp.world, c, fp.season)})
 	}
 	slice.sort_by(visible[:], proc(a, b: Visible_Chunk) -> bool {return a.dist2 < b.dist2})
 	for &v in visible {
 		eng.set_vec3(r.chunk.u_origin, v.origin)
 		eng.set_vec4(r.chunk.u_rot, v.rot)
+		eng.set_vec4(r.chunk.u_season, v.season)
+		eng.set_f32(r.chunk.u_chunk_alt, f32(f64(v.chunk.key.y * CHUNK_SIZE) - Y_SEA))
 		chunk_mesh_draw(&v.chunk.opaque_mesh)
 	}
 	r.chunks_drawn = len(visible)
@@ -440,6 +455,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		if v.chunk.water_mesh.quads == 0 do continue
 		eng.set_vec3(r.chunk.u_origin, v.origin)
 		eng.set_vec4(r.chunk.u_rot, v.rot)
+		eng.set_vec4(r.chunk.u_season, {})
 		chunk_mesh_draw(&v.chunk.water_mesh)
 	}
 	gl.Enable(gl.CULL_FACE)
@@ -556,4 +572,16 @@ HAND_TRANSFORM :: proc() -> eng.Mat4 {
 		linalg.matrix4_rotate_f32(0.25, {0, 1, 0}) *
 		linalg.matrix4_rotate_f32(math.to_radians(f32(115)), {1, 0, 0}) *
 		linalg.matrix4_rotate_f32(0.0, {0, 1, 0})
+}
+
+// Климат чанка сейчас: температура у моря, её ход за месяц, осадки за месяц.
+@(private = "file")
+chunk_season :: proc(w: ^World, c: ^Chunk, s: f64) -> [4]f32 {
+	if !climate.ok do return {}
+	col := world_column(w, {c.key.face, c.key.x, c.key.z})
+	if col == nil do return {}
+	t, p := climate_at(&climate, &col.clim, s)
+	t1, _ := climate_at(&climate, &col.clim, s + 1.0 / 24)
+	t0, _ := climate_at(&climate, &col.clim, s - 1.0 / 24)
+	return {f32(t), f32(t1 - t0), f32(p), 1}
 }

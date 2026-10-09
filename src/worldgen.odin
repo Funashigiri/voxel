@@ -69,16 +69,36 @@ far_selftest :: proc(seed: u32, g: ^Planet_Geo) -> (ridge_mean, diff_mean, diff_
 	return ridge_mean / N, diff_mean / N, diff_max, ocean / N, h_lo, h_hi
 }
 
-surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32) -> (surface, filler: Block) {
+// Поверхность и подстилка в клетке по климату: ледник — снег на льду, тундра
+// — мхи, осыпи и скалы у снеговой линии, пустыни — песок и щебень, сухие
+// степи и саванны — с проплешинами земли.
+surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32, bc: ^Block_Climate) -> (surface, filler: Block) {
 	if h < SEA_LEVEL - 1 {
 		n := fbm(seed + 131, p, 24, 2)
 		if h >= SEA_LEVEL - 4 || n > 0.25 do return .Sand, .Sand
 		if n < -0.2 do return .Gravel, .Gravel
 		return .Dirt, .Dirt
 	}
-	if h <= SEA_LEVEL + 1 do return .Sand, .Sand
-	// круто или выше границы скал — почвы нет, наружу выходят пласты (.Stone — метка, см. column_block)
-	if slope >= 3 || f64(h) + 1 - Y_SEA >= rock_line(seed, p, 0.5) do return .Stone, .Stone
+	biome := bc.k.biome
+	if biome == .Ice_Cap do return .Snow, .Ice // ледник спускается и к самому морю
+	if h <= SEA_LEVEL + 1 do return biome == .Tundra ? .Gravel : .Sand, biome == .Tundra ? .Gravel : .Sand
+	// круто — почвы нет, наружу выходят пласты (.Stone — метка, см. column_block)
+	if slope >= 3 do return .Stone, .Stone
+	n := f64(fbm(seed + 135, p, 18, 2))
+	#partial switch biome {
+	case .Tundra:
+		rock := smooth(6, 1, bc.t_max) // ближе к вечным снегам — больше камня
+		if n * 0.5 + 0.5 < rock * 0.85 do return .Stone, .Stone
+		if n > 0.45 do return .Gravel, .Gravel
+	case .Desert_Hot:
+		return .Sand, .Sand
+	case .Desert_Cold:
+		if n > 0.2 do return .Gravel, .Gravel
+		if n < -0.35 do return .Dirt, .Dirt
+		return .Sand, .Sand
+	case .Steppe, .Savanna, .Mediterranean:
+		if n > 0.55 do return .Dirt, .Dirt
+	}
 	return .Grass, .Dirt
 }
 
@@ -143,7 +163,10 @@ generate_column :: proc(w: ^World, col: ^Column) {
 			col.surface[i], col.filler[i] = .Monolith, .Monolith
 		} else {
 			col.height[i] = h
-			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj))
+			bc := block_climate(w, face, x0 + lx, z0 + lz, h < SEA_LEVEL ? -1 : f64(h) + 1 - Y_SEA, col.points[i])
+			col.biome[i] = bc.k.biome
+			col.tint[i] = bc.tint
+			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj), &bc)
 		}
 		col.sky[i] = col.height[i] + 1
 		if col.height[i] < SEA_LEVEL {
@@ -152,6 +175,22 @@ generate_column :: proc(w: ^World, col: ^Column) {
 		}
 		col.lo = min(col.lo, col.height[i] - 4)
 		col.hi = max(col.hi, col.height[i] + 1) // +1 — трава и цветы
+	}
+
+	// климат в центре колонки — для смены времён года на экране
+	{
+		cx, cz := col.key.x, col.key.z
+		cs := [4]Corner_Climate{corner_climate(w, face, cx, cz), corner_climate(w, face, cx + 1, cz), corner_climate(w, face, cx, cz + 1), corner_climate(w, face, cx + 1, cz + 1)}
+		col.clim = cs[0].cp
+		col.clim.cont, col.clim.wet = 0, 0
+		for c in cs {
+			col.clim.cont += c.cp.cont / 4
+			col.clim.wet += c.cp.wet / 4
+		}
+		c := points[(PAD + 8) * N + PAD + 8]
+		col.clim.lat = math.to_degrees(math.asin(clamp(c.y / w.geo.radius, -1, 1)))
+		col.clim.alt = 0
+		col.clim.land = true
 	}
 
 	// деревья (в том числе из соседних колонок, чья листва заходит сюда)
@@ -172,14 +211,33 @@ generate_column :: proc(w: ^World, col: ^Column) {
 		if corner_dist(n, tx, tz) < MONOLITH_RADIUS + 4 do continue
 		tp := points[j * N + i]
 		h := heights[j * N + i]
-		if eng.hash2f(gx, gz, useed + 501) > forest_density(seed, tp, f64(h) + 1 - Y_SEA) do continue
+		if h < SEA_LEVEL do continue
+		bc := block_climate(w, face, tx, tz, f64(h) + 1 - Y_SEA, tp)
+		if eng.hash2f(gx, gz, useed + 501) > forest_cover(seed, tp, bc.k.biome, bc.t_max) do continue
 		slope := slope_at(&heights, i, j)
-		surface, _ := surface_for(seed, tp, h, slope)
-		if surface != .Grass || slope > 2 do continue
+		surface, _ := surface_for(seed, tp, h, slope, &bc)
+		kind := tree_kind_for(&bc, f64(eng.hash2f(gx, gz, useed + 502)), f64(fbm(seed + 99, tp, 160, 2)))
+		if kind == .Cactus {
+			if surface != .Sand || slope > 1 do continue
+		} else if surface != .Grass || slope > 2 {
+			continue
+		}
 		if col.tree_n >= MAX_COL_TREES do break
-		birch := fbm(seed + 99, tp, 160, 2) > 0.2 || eng.hash2f(gx, gz, useed + 502) < 0.12
-		height := i32(4 + (hsh >> 16) % 3) + (birch ? 1 : 0)
-		col.trees[col.tree_n] = {tx, tz, h + 1, height, birch}
+		r3 := i32((hsh >> 16) % 3)
+		height: i32
+		switch kind {
+		case .Oak:
+			height = 4 + r3
+		case .Birch, .Acacia:
+			height = 5 + r3
+		case .Spruce:
+			height = 6 + 2 * r3
+		case .Jungle:
+			height = 9 + i32((hsh >> 20) % 7)
+		case .Cactus:
+			height = 1 + r3
+		}
+		col.trees[col.tree_n] = {tx, tz, h + 1, height, kind}
 		col.tree_n += 1
 	}
 	// свет неба и полоса поверхности — с листвой и стволами
@@ -221,21 +279,72 @@ generate_column :: proc(w: ^World, col: ^Column) {
 }
 
 // Блоки дерева (ствол и листва) — для света неба (колонка) и для секций.
+// Формы: дуб и берёза — круглая крона; ель — конус ярусами; акация — изогнутый
+// ствол и плоский зонтик; тропическое дерево — высокое, с широкой кроной; кактус — столбик.
 tree_blocks :: proc(t: Tree, seed: u32, data: ^$T, put: proc(data: ^T, wx, y, wz: i32, b: Block, x0, z0: i32), x0, z0: i32) {
-	log: Block = t.birch ? .Birch_Log : .Oak_Log
-	leaves: Block = t.birch ? .Birch_Leaves : .Oak_Leaves
-	for dy in t.height - 3 ..= t.height {
-		y := t.base + dy
-		r: i32 = dy >= t.height - 1 ? 1 : 2
+	log, leaves: Block
+	switch t.kind {
+	case .Oak:
+		log, leaves = .Oak_Log, .Oak_Leaves
+	case .Birch:
+		log, leaves = .Birch_Log, .Birch_Leaves
+	case .Spruce:
+		log, leaves = .Spruce_Log, .Spruce_Leaves
+	case .Acacia:
+		log, leaves = .Acacia_Log, .Acacia_Leaves
+	case .Jungle:
+		log, leaves = .Jungle_Log, .Jungle_Leaves
+	case .Cactus:
+		for dy in 0 ..< t.height do put(data, t.x, t.base + dy, t.z, .Cactus, x0, z0)
+		return
+	}
+	disk :: proc(t: Tree, seed: u32, data: ^$T, put: proc(data: ^T, wx, y, wz: i32, b: Block, x0, z0: i32), x0, z0, cx, cz, y, r: i32, leaves: Block, ragged: bool) {
 		for dz in -r ..= r do for dx in -r ..= r {
-			if abs(dx) == r && abs(dz) == r {
-				if dy == t.height do continue
-				if eng.hash3f(t.x + dx, y, t.z + dz, seed + 503) < 0.5 do continue
+			if abs(dx) == r && abs(dz) == r && r > 0 {
+				if !ragged || eng.hash3f(cx + dx, y, cz + dz, seed + 503) < 0.5 do continue
 			}
-			put(data, t.x + dx, y, t.z + dz, leaves, x0, z0)
+			put(data, cx + dx, y, cz + dz, leaves, x0, z0)
 		}
 	}
-	for dy in 0 ..< t.height do put(data, t.x, t.base + dy, t.z, log, x0, z0)
+	switch t.kind {
+	case .Oak, .Birch:
+		for dy in t.height - 3 ..= t.height {
+			r: i32 = dy >= t.height - 1 ? 1 : 2
+			disk(t, seed, data, put, x0, z0, t.x, t.z, t.base + dy, r, leaves, dy != t.height)
+		}
+		for dy in 0 ..< t.height do put(data, t.x, t.base + dy, t.z, log, x0, z0)
+	case .Spruce:
+		// ярусы от низа кроны к макушке: 1, 2, 1, 2, … сужаясь к верху
+		for dy in 2 ..= t.height {
+			k := t.height - dy
+			r: i32 = k == 0 ? 0 : k % 2 == 1 ? 1 : min(2, 1 + k / 3)
+			disk(t, seed, data, put, x0, z0, t.x, t.z, t.base + dy, r, leaves, false)
+		}
+		put(data, t.x, t.base + t.height + 1, t.z, leaves, x0, z0)
+		for dy in 0 ..< t.height do put(data, t.x, t.base + dy, t.z, log, x0, z0)
+	case .Acacia:
+		// ствол прямо, у макушки уходит вбок на 1 блок; сверху — плоский зонтик
+		h := eng.hash2(t.x, t.z, seed + 510)
+		dirs := [4][2]i32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+		d := dirs[h % 4]
+		bend := t.height - 2
+		for dy in 0 ..< t.height {
+			ox, oz: i32 = 0, 0
+			if dy >= bend do ox, oz = d.x, d.y
+			put(data, t.x + ox, t.base + dy, t.z + oz, log, x0, z0)
+		}
+		cx, cz := t.x + d.x, t.z + d.y
+		disk(t, seed, data, put, x0, z0, cx, cz, t.base + t.height, 2, leaves, true)
+		disk(t, seed, data, put, x0, z0, cx, cz, t.base + t.height + 1, 1, leaves, false)
+	case .Jungle:
+		// высокий ствол, пышная крона в пять ярусов
+		for dy in t.height - 3 ..= t.height + 1 {
+			r: i32 = dy == t.height - 3 || dy == t.height ? 2 : dy == t.height + 1 ? 1 : 3
+			disk(t, seed, data, put, x0, z0, t.x, t.z, t.base + dy, r, leaves, true)
+		}
+		for dy in 0 ..< t.height do put(data, t.x, t.base + dy, t.z, log, x0, z0)
+	case .Cactus:
+	}
 }
 
 // Порода на глубине: осадочные слои полосами, под ними кора, глубже мантия.
@@ -254,11 +363,14 @@ strata :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
 // Блок колонки на высоте y (без деревьев и растений).
 column_block :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
 	h := col.height[i]
-	if y > h do return y <= SEA_LEVEL ? .Water : .Air
+	if y > h {
+		if y == SEA_LEVEL && col.biome[i] == .Sea_Ice do return .Ice // многолетний лёд на море
+		return y <= SEA_LEVEL ? .Water : .Air
+	}
 	if col.monolith[i] do return .Monolith
 	if col.surface[i] == .Stone do return strata(col, i, y, seed) // голая скала: сразу пласты
 	if y == h do return col.surface[i]
-	if y >= h - 3 do return col.filler[i]
+	if y >= h - (col.surface[i] == .Snow ? 12 : 3) do return col.filler[i] // ледник — толща льда
 	return strata(col, i, y, seed)
 }
 
@@ -280,21 +392,40 @@ generate_section :: proc(w: ^World, col: ^Column, c: ^Chunk) {
 		for ly in i32(0) ..< CHUNK_SIZE {
 			c.blocks[block_index(lx, ly, lz)] = column_block(col, i, y0 + ly, useed)
 		}
-		// трава и цветы
+		// трава, цветы, сухие кусты — по природной зоне
 		h := col.height[i]
-		if col.surface[i] != .Grass || h + 1 < y0 || h + 1 >= y0 + CHUNK_SIZE do continue
+		if h + 1 < y0 || h + 1 >= y0 + CHUNK_SIZE do continue
 		wx, wz := x0 + lx, z0 + lz
 		p := col.points[i]
 		r := eng.hash2f(wx, wz, useed + 101)
-		grassy := 0.5 + 0.5 * fbm(seed + 55, p, 48, 2)
+		biome := col.biome[i]
 		plant := Block.Air
-		if r < 0.03 + 0.32 * grassy {
-			plant = .Tall_Grass
-		} else {
-			patch := fbm(seed + 66, p, 20, 1)
-			f := eng.hash2f(wx, wz, useed + 102)
-			if (patch > 0.55 && f < 0.12) || f < 0.003 {
-				plant = fbm(seed + 77, p, 60, 1) > 0 ? .Dandelion : .Poppy
+		if col.surface[i] == .Sand && h > SEA_LEVEL + 1 && (biome == .Desert_Hot || biome == .Desert_Cold || biome == .Steppe) {
+			if r < 0.012 do plant = .Dead_Bush
+		} else if col.surface[i] == .Grass {
+			grassy := f32(0.5 + 0.5 * fbm(seed + 55, p, 48, 2))
+			dense: f32
+			flowers := false
+			#partial switch biome {
+			case .Rainforest, .Savanna, .Steppe:
+				dense = 0.25 + 0.4 * grassy
+			case .Taiga, .Tundra:
+				dense = 0.02 + 0.12 * grassy
+			case .Mediterranean:
+				dense = 0.05 + 0.2 * grassy
+				flowers = true
+			case:
+				dense = 0.03 + 0.32 * grassy
+				flowers = true
+			}
+			if r < dense {
+				plant = .Tall_Grass
+			} else if flowers {
+				patch := fbm(seed + 66, p, 20, 1)
+				f := eng.hash2f(wx, wz, useed + 102)
+				if (patch > 0.55 && f < 0.12) || f < 0.003 {
+					plant = fbm(seed + 77, p, 60, 1) > 0 ? .Dandelion : .Poppy
+				}
 			}
 		}
 		if plant != .Air do c.blocks[block_index(lx, h + 1 - y0, lz)] = plant
@@ -309,13 +440,12 @@ generate_section :: proc(w: ^World, col: ^Column, c: ^Chunk) {
 			if lx < 0 || lz < 0 || ly < 0 || lx >= CHUNK_SIZE || lz >= CHUNK_SIZE || ly >= CHUNK_SIZE do return
 			i := block_index(lx, ly, lz)
 			cur := g.c.blocks[i]
-			is_log := b == .Oak_Log || b == .Birch_Log
-			if cur == .Air || is_plant(cur) || (is_log && BLOCK_INFO[cur].render == .Leaves) do g.c.blocks[i] = b
+			if cur == .Air || is_plant(cur) || (is_log(b) && BLOCK_INFO[cur].render == .Leaves) do g.c.blocks[i] = b
 		}, x0, z0)
 		// под деревом трава превращается в землю
 		lx, lz := t.x - x0, t.z - z0
 		ly := t.base - 1 - y0
-		if lx >= 0 && lz >= 0 && lx < CHUNK_SIZE && lz < CHUNK_SIZE && ly >= 0 && ly < CHUNK_SIZE {
+		if t.kind != .Cactus && lx >= 0 && lz >= 0 && lx < CHUNK_SIZE && lz < CHUNK_SIZE && ly >= 0 && ly < CHUNK_SIZE {
 			c.blocks[block_index(lx, ly, lz)] = .Dirt
 		}
 	}
@@ -341,18 +471,21 @@ column_at :: proc(w: ^World, x, z: i32) -> (h, slope: i32, p: [3]f64) {
 }
 
 // Ищет точку на траве недалеко от (cx, cz) текущей грани.
-find_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
+// zone — только в умеренном лесу или степи (иначе — любая суша без воды).
+find_spawn :: proc(w: ^World, cx, cz: i32, zone := true) -> [3]f64 {
 	for r := i32(0); r < 400; r += 4 {
 		for dz := -r; dz <= r; dz += 4 {
 			for dx := -r; dx <= r; dx += 4 {
 				if max(abs(dx), abs(dz)) != r do continue
 				x, z := cx + dx, cz + dz
-				if _, _, _, ok := world_resolve(w, x, z); !ok do continue // пустота у вершины
+				face, gx, gz, ok := world_resolve(w, x, z)
+				if !ok do continue // пустота у вершины
 				if corner_dist(w.geo.n, x, z) < MONOLITH_RADIUS + 2 do continue
 				h, slope, p := column_at(w, x, z)
 				if h <= SEA_LEVEL + 2 do continue
-				surface, _ := surface_for(i64(w.seed), p, h, slope)
-				if surface == .Grass do return {f64(x) + 0.5, f64(h) + 1, f64(z) + 0.5}
+				bc := block_climate(w, face, gx, gz, f64(h) + 1 - Y_SEA, p)
+				surface, _ := surface_for(i64(w.seed), p, h, slope, &bc)
+				if zone ? surface == .Grass && climate_start_zone(bc.k) : true do return {f64(x) + 0.5, f64(h) + 1, f64(z) + 0.5}
 			}
 		}
 	}
@@ -471,4 +604,113 @@ deep_block :: proc(y: i32) -> Block {
 		return .Ringwoodite
 	}
 	return .Peridotite
+}
+
+// ---------------------------------------------------------------- климат в блоках
+
+// Климат в углу колонки: по месяцам температура у моря и осадки.
+Corner_Climate :: struct {
+	t, p: [12]f32,
+	cp:   Climate_Point,
+}
+
+// Углы общие у четырёх колонок — считаются один раз (генерация — в главном потоке).
+@(private = "file")
+corner_cache: map[[3]i32]Corner_Climate
+
+world_climate_reset :: proc() {
+	clear(&corner_cache)
+}
+
+@(private = "file")
+corner_climate :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> Corner_Climate {
+	key := [3]i32{i32(face), cx, cz}
+	if c, ok := corner_cache[key]; ok do return c
+	cc := make_corner_climate(i64(w.seed), geo_dir(&w.geo, face, f64(cx * CHUNK_SIZE), f64(cz * CHUNK_SIZE)) * w.geo.radius)
+	corner_cache[key] = cc
+	return cc
+}
+
+// Климат в точке шара p (м): условия места и месяцы на уровне моря.
+make_corner_climate :: proc(seed: i64, p: [3]f64) -> (cc: Corner_Climate) {
+	cc.cp = climate_point(&climate, seed, p, elevation(seed, p, 2000))
+	sea := cc.cp
+	sea.alt = 0
+	t, pr := climate_months(&climate, &sea)
+	for m in 0 ..< 12 do cc.t[m], cc.p[m] = f32(t[m]), f32(pr[m])
+	return
+}
+
+Block_Climate :: struct {
+	k:                    Koppen,
+	t_max, t_min, t_ann:  f64,
+	p_sum:                f64,
+	tint:                 u8,
+	cont, wet:            f64, // условия места (для смены сезонов на дальнем рельефе)
+	month_t, month_p:     [12]f32, // по месяцам: температура (°C) и осадки (мм) здесь
+}
+
+// Климат клетки (gx, gz) грани face на высоте alt (м над морем; < 0 — под водой):
+// плавно между углами колонки, граница зон чуть извилиста (температура и
+// осадки колеблются от места к месту).
+block_climate :: proc(w: ^World, face: Cube_Face, gx, gz: i32, alt: f64, p: [3]f64) -> (b: Block_Climate) {
+	cx, cz := eng.floor_div(gx, CHUNK_SIZE), eng.floor_div(gz, CHUNK_SIZE)
+	fx := (f64(gx - cx * CHUNK_SIZE) + 0.5) / CHUNK_SIZE
+	fz := (f64(gz - cz * CHUNK_SIZE) + 0.5) / CHUNK_SIZE
+	c00 := corner_climate(w, face, cx, cz)
+	c10 := corner_climate(w, face, cx + 1, cz)
+	c01 := corner_climate(w, face, cx, cz + 1)
+	c11 := corner_climate(w, face, cx + 1, cz + 1)
+	dither := f64(fbm(i64(w.seed) + 700, p, 600, 2)) * 1.2
+	wet := 1 + 0.25 * f64(fbm(i64(w.seed) + 701, p, 900, 2))
+	return climate_blend({&c00, &c10, &c01, &c11}, fx, fz, alt, dither, wet)
+}
+
+// Климат между четырьмя углами (00, 10, 01, 11) на высоте alt (м; < 0 — под водой).
+climate_blend :: proc(cs: [4]^Corner_Climate, fx, fz, alt, dither, wet: f64) -> (b: Block_Climate) {
+	c00, c10, c01, c11 := cs[0], cs[1], cs[2], cs[3]
+	b.cont = (c00.cp.cont * (1 - fx) + c10.cp.cont * fx) * (1 - fz) + (c01.cp.cont * (1 - fx) + c11.cp.cont * fx) * fz
+	b.wet = ((c00.cp.wet * (1 - fx) + c10.cp.wet * fx) * (1 - fz) + (c01.cp.wet * (1 - fx) + c11.cp.wet * fx) * fz) * wet
+	t, pr: [12]f64
+	b.t_max, b.t_min = -1.0e9, 1.0e9
+	for m in 0 ..< 12 {
+		bt := (f64(c00.t[m]) * (1 - fx) + f64(c10.t[m]) * fx) * (1 - fz) + (f64(c01.t[m]) * (1 - fx) + f64(c11.t[m]) * fx) * fz
+		bp := (f64(c00.p[m]) * (1 - fx) + f64(c10.p[m]) * fx) * (1 - fz) + (f64(c01.p[m]) * (1 - fx) + f64(c11.p[m]) * fx) * fz
+		t[m] = bt - climate.lapse * max(alt, 0) + dither
+		pr[m] = bp * wet
+		b.t_max = max(b.t_max, t[m])
+		b.t_min = min(b.t_min, t[m])
+		b.t_ann += t[m] / 12
+		b.p_sum += pr[m]
+		b.month_t[m], b.month_p[m] = f32(t[m]), f32(pr[m])
+	}
+	if alt < 0 {
+		b.k.biome = b.t_max < -1.8 ? .Sea_Ice : .Ocean // летом не тает — многолетний лёд
+	} else {
+		b.k = koppen_classify(t, pr)
+	}
+	// оттенок травы и листвы: сухость и холод
+	aridity := b.p_sum / max(20 * max(b.t_ann, 0) + 280, 100)
+	dry := clamp(1.5 - aridity, 0, 1)
+	cold := clamp((18 - b.t_max) / 14, 0, 1)
+	b.tint = u8(dry * 15 + 0.5) | u8(cold * 15 + 0.5) << 4
+	return
+}
+
+// Какое дерево растёт в этой зоне.
+tree_kind_for :: proc(bc: ^Block_Climate, roll, birch_noise: f64) -> Tree_Kind {
+	#partial switch bc.k.biome {
+	case .Taiga:
+		return roll < 0.85 ? .Spruce : .Birch
+	case .Temperate_Forest:
+		if bc.k.code[0] == 'D' && roll < 0.35 do return .Spruce // смешанный лес континентального климата
+		return birch_noise > 0.2 || roll > 0.88 ? .Birch : .Oak
+	case .Savanna:
+		return .Acacia
+	case .Rainforest:
+		return .Jungle
+	case .Desert_Hot:
+		return .Cactus
+	}
+	return roll > 0.85 ? .Birch : .Oak
 }

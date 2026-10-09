@@ -59,13 +59,40 @@ Globe :: struct {
 @(private = "file")
 mix3 :: proc(a, b: [3]f32, t: f32) -> [3]f32 {return a + (b - a) * clamp(t, 0, 1)}
 
-// Цвет точки планеты по крупному рельефу (мелкий рельеф с орбиты не виден).
+// Цвет точки планеты: океаны по глубине, суша — по природной зоне (как в
+// climate.odin; мелкий рельеф с орбиты не виден).
 @(private = "file")
 globe_color :: proc(seed: i64, g: ^Planet_Geo, dir: [3]f64) -> [3]f32 {
 	alt := f32(elevation(seed, dir * g.radius, 150_000))
+	if climate.ok {
+		cp := climate_point(&climate, seed, dir * g.radius, f64(alt))
+		k, _, _ := climate_classify(&climate, &cp)
+		#partial switch k.biome {
+		case .Sea_Ice, .Ice_Cap:
+			return {0.9, 0.94, 1.0}
+		case .Tundra:
+			return {0.56, 0.54, 0.44}
+		case .Taiga:
+			return {0.16, 0.32, 0.2}
+		case .Temperate_Forest:
+			return {0.26, 0.46, 0.2}
+		case .Mediterranean:
+			return {0.5, 0.54, 0.3}
+		case .Steppe:
+			return {0.62, 0.6, 0.38}
+		case .Desert_Cold:
+			return {0.68, 0.64, 0.52}
+		case .Desert_Hot:
+			return {0.86, 0.73, 0.46}
+		case .Savanna:
+			return {0.6, 0.6, 0.3}
+		case .Rainforest:
+			return {0.1, 0.36, 0.12}
+		}
+	}
 	lat := abs(math.to_degrees(math.asin(clamp(dir.y, -1, 1))))
 	wobble := f32(math.sin(dir.x * 9 + dir.z * 5) * 3)
-	if f32(lat) > 68 + wobble do return {0.9, 0.94, 1.0} // полярная шапка
+	if !climate.ok && f32(lat) > 68 + wobble do return {0.9, 0.94, 1.0} // полярная шапка
 	if alt < 0 {
 		// мелководье светлее, глубины — тёмно-синие
 		return mix3({0.22, 0.5, 0.8}, {0.04, 0.12, 0.36}, -alt / 4000)

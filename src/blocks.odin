@@ -31,6 +31,17 @@ Block :: enum u8 {
 	Bridgmanite,
 	Molten_Iron,
 	Iron_Core,
+	// климат (0.015): снег, лёд, деревья и растения природных зон
+	Snow,
+	Ice,
+	Spruce_Log,
+	Spruce_Leaves,
+	Acacia_Log,
+	Acacia_Leaves,
+	Jungle_Log,
+	Jungle_Leaves,
+	Cactus,
+	Dead_Bush,
 }
 
 // Русские названия (F3: что под ногами).
@@ -61,6 +72,16 @@ BLOCK_NAMES := [Block]string {
 	.Bridgmanite  = "бриджманит (нижняя мантия)",
 	.Molten_Iron  = "жидкое железо (внешнее ядро)",
 	.Iron_Core    = "железо с никелем (твёрдое ядро)",
+	.Snow         = "снег",
+	.Ice          = "лёд",
+	.Spruce_Log   = "ель",
+	.Spruce_Leaves = "хвоя ели",
+	.Acacia_Log   = "акация",
+	.Acacia_Leaves = "листва акации",
+	.Jungle_Log   = "тропическое дерево",
+	.Jungle_Leaves = "листва тропического дерева",
+	.Cactus       = "кактус",
+	.Dead_Bush    = "сухой куст",
 }
 
 Render_Kind :: enum u8 {
@@ -132,6 +153,17 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Bridgmanite] = cube(all_faces(.Bridgmanite))
 	BLOCK_INFO[.Molten_Iron] = cube(all_faces(.Molten_Iron))
 	BLOCK_INFO[.Iron_Core] = cube(all_faces(.Iron_Core))
+	BLOCK_INFO[.Snow] = cube(all_faces(.Snow))
+	BLOCK_INFO[.Ice] = cube(all_faces(.Ice))
+	BLOCK_INFO[.Spruce_Log] = cube(column_faces(.Spruce_Log, .Spruce_Log_Top, .Spruce_Log_Top))
+	BLOCK_INFO[.Acacia_Log] = cube(column_faces(.Acacia_Log, .Acacia_Log_Top, .Acacia_Log_Top))
+	BLOCK_INFO[.Jungle_Log] = cube(column_faces(.Jungle_Log, .Jungle_Log_Top, .Jungle_Log_Top))
+	BLOCK_INFO[.Cactus] = cube(column_faces(.Cactus_Side, .Cactus_Top, .Cactus_Top))
+	for b in ([3]Block{.Spruce_Leaves, .Acacia_Leaves, .Jungle_Leaves}) {
+		t := b == .Spruce_Leaves ? Tex.Spruce_Leaves : b == .Acacia_Leaves ? Tex.Acacia_Leaves : Tex.Jungle_Leaves
+		BLOCK_INFO[b] = {render = .Leaves, solid = true, blocks_light = true, tex = all_faces(t)}
+	}
+	BLOCK_INFO[.Dead_Bush] = {render = .Cross, tex = all_faces(.Dead_Bush)}
 	BLOCK_INFO[.Oak_Log] = cube(column_faces(.Oak_Log, .Oak_Log_Top, .Oak_Log_Top))
 	BLOCK_INFO[.Birch_Log] = cube(column_faces(.Birch_Log, .Birch_Log_Top, .Birch_Log_Top))
 	BLOCK_INFO[.Water] = {
@@ -154,6 +186,15 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Tall_Grass] = {render = .Cross, tex = all_faces(.Tall_Grass)}
 	BLOCK_INFO[.Dandelion] = {render = .Cross, tex = all_faces(.Dandelion)}
 	BLOCK_INFO[.Poppy] = {render = .Cross, tex = all_faces(.Poppy)}
+}
+
+// Ствол дерева (или кактус) — не затирает листву соседей при генерации.
+is_log :: proc(b: Block) -> bool {
+	#partial switch b {
+	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus:
+		return true
+	}
+	return false
 }
 
 is_plant :: proc(b: Block) -> bool {

@@ -18,7 +18,7 @@ Chunk_Vertex :: struct {
 	light_face: u16, // свет [0..255] | грань << 8 | флаги << 11
 	u, v:       u8, // тексели 0..16
 	layer:      u8,
-	_:          u8,
+	tint:       u8, // климат: сухость (младшие 4 бита), холод (старшие)
 }
 
 Chunk_Mesh :: struct {
@@ -34,6 +34,7 @@ P :: CHUNK_SIZE + 2
 Padded :: struct {
 	blocks:  [P * P * P]Block,
 	light_h: [P * P]i32, // свет неба: первый y (от низа секции), куда он достаёт
+	tint:    [P * P]u8, // оттенок травы и листвы по климату (сухость, холод)
 }
 
 @(private = "file")
@@ -92,7 +93,7 @@ cell :: proc "contextless" (p: ^Padded, x, y, z: i32) -> (v: f32, caster: bool) 
 }
 
 @(private = "file")
-emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, light: [4]f32, face_id: u16, layer: u8, flags: u16) {
+emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, light: [4]f32, face_id: u16, layer: u8, flags: u16, tint: u8 = 0) {
 	// разворачиваем диагональ квадрата, чтобы AO интерполировался ровно
 	order := [4]int{0, 1, 2, 3}
 	if light[1] + light[3] > light[0] + light[2] do order = {1, 2, 3, 0}
@@ -106,6 +107,7 @@ emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, lig
 			u = uv[k].x,
 			v = uv[k].y,
 			layer = layer,
+			tint = tint,
 		})
 	}
 }
@@ -138,7 +140,7 @@ emit_cube_face :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, fa
 		uv[k] = QUAD_UV[k]
 		if corner.y == 1 && face != .Up && face != .Down do uv[k].y = u8(16 - top16)
 	}
-	emit_quad(out, pos, uv, light, u16(face), layer, flags)
+	emit_quad(out, pos, uv, light, u16(face), layer, flags, p.tint[(z + 1) * P + (x + 1)])
 }
 
 @(private = "file")
@@ -158,8 +160,9 @@ emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer:
 		b := d[1]
 		front := [4][3]i32{{bx + a.x, by, bz + a.y}, {bx + b.x, by, bz + b.y}, {bx + b.x, by + 16, bz + b.y}, {bx + a.x, by + 16, bz + a.y}}
 		back := [4][3]i32{front[1], front[0], front[3], front[2]}
-		emit_quad(out, front, QUAD_UV, light, FACE_ID_CROSS, layer, 0)
-		emit_quad(out, back, QUAD_UV, light, FACE_ID_CROSS, layer, 0)
+		tint := p.tint[(z + 1) * P + (x + 1)]
+		emit_quad(out, front, QUAD_UV, light, FACE_ID_CROSS, layer, 0, tint)
+		emit_quad(out, back, QUAD_UV, light, FACE_ID_CROSS, layer, 0, tint)
 	}
 }
 
@@ -183,6 +186,7 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 			fill: Block = ok ? .Air : .Monolith
 			for y in i32(-1) ..= CHUNK_SIZE do p.blocks[pidx(px, y, pz)] = fill
 			p.light_h[(pz + 1) * P + (px + 1)] = min(i32)
+			p.tint[(pz + 1) * P + (px + 1)] = 0
 			continue
 		}
 		ci := column_index(gx, gz)
@@ -202,6 +206,7 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 			}
 		}
 		p.light_h[(pz + 1) * P + (px + 1)] = col.sky[ci] - y0
+		p.tint[(pz + 1) * P + (px + 1)] = col.tint[ci]
 	}
 }
 

@@ -49,7 +49,16 @@ Tree :: struct {
 	x, z:   i32, // клетка ствола (сетка грани)
 	base:   i32, // первый блок ствола
 	height: i32,
-	birch:  bool,
+	kind:   Tree_Kind,
+}
+
+Tree_Kind :: enum u8 {
+	Oak,
+	Birch,
+	Spruce,
+	Acacia,
+	Jungle,
+	Cactus,
 }
 
 Column :: struct {
@@ -70,6 +79,10 @@ Column :: struct {
 	moho:     i32, // ниже — мантия
 	oceanic:  bool, // кора океанов (базальт), иначе материков (гранит)
 	covered:  bool, // поверхность здесь нарисована блоками (для дальнего рельефа)
+	// климат (0.015): природная зона и оттенок травы по блокам, условия в центре колонки
+	biome:    [CHUNK_AREA]Biome,
+	tint:     [CHUNK_AREA]u8, // сухость (младшие 4 бита) и холод (старшие) — для травы и листвы
+	clim:     Climate_Point,
 }
 
 World :: struct {

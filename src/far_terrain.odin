@@ -49,6 +49,7 @@ Far_Vertex :: struct {
 	off:    [3]f32, // от начала тайла, оси планеты, м
 	normal: [4]i8, // нормаль в осях планеты; w — глубина воды, м (для дна)
 	color:  [4]u8, // цвет поверхности; a = 255 — вода
+	clim:   [4]u8, // климат для смены сезонов: материковость, осадки ×0,01, доля листопадных и хвойных крон
 }
 
 FAR_FLOOR_DIST :: 8000.0 // ближе — у воды рисуется и дно (видно сквозь ближнюю воду)
@@ -81,6 +82,7 @@ Far_Tile :: struct {
 // Цвета поверхностей — средние цвета текстур блоков (так вдали мир того же цвета, что вблизи).
 Far_Palette :: struct {
 	grass, tall_grass, sand, stone, dirt, gravel, oak, birch, water, sandstone, limestone, granite: [3]f32,
+	snow, ice, spruce, acacia, jungle: [3]f32,
 }
 
 // Для фоновых потоков — только чтение.
@@ -108,9 +110,11 @@ Far_Terrain :: struct {
 	prog:       u32,
 	u:          struct {
 		view_proj, jinv, jt, rel_o, logk, mask, mask_org, side_shade, floor: i32,
+		org, radius, lapse, clim, season_on: i32,
 	},
 	ebo:        u32,
 	mask_tex:   u32,
+	clim_tex:   u32, // по широте: температура над океаном и сушей, осадки, ход температуры (сейчас)
 	mask:       [MASK_N * MASK_N]u8,
 	mask_org:   [3]f32,
 	draw:       [dynamic]^Far_Tile,
@@ -143,7 +147,20 @@ far_init :: proc(ft: ^Far_Terrain, geo: Planet_Geo, seed: u32) -> bool {
 		mask_org   = loc(p, "u_mask_org"),
 		side_shade = loc(p, "u_side_shade"),
 		floor      = loc(p, "u_floor"),
+		org        = loc(p, "u_org"),
+		radius     = loc(p, "u_radius"),
+		lapse      = loc(p, "u_lapse"),
+		clim       = loc(p, "u_clim"),
+		season_on  = loc(p, "u_season_on"),
 	}
+	gl.GenTextures(1, &ft.clim_tex)
+	gl.BindTexture(gl.TEXTURE_2D, ft.clim_tex)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, CLIM_LAT, 1, 0, gl.RGBA, gl.FLOAT, nil)
+	gl.BindTexture(gl.TEXTURE_2D, 0)
 
 	indices := far_indices()
 	gl.BindVertexArray(0)
@@ -218,6 +235,11 @@ far_palette :: proc() -> (p: Far_Palette) {
 	p.sandstone = tex_average(.Sandstone)
 	p.limestone = tex_average(.Limestone)
 	p.granite = tex_average(.Granite)
+	p.snow = tex_average(.Snow)
+	p.ice = tex_average(.Ice)
+	p.spruce = tex_average(.Spruce_Leaves)
+	p.acacia = tex_average(.Acacia_Leaves)
+	p.jungle = tex_average(.Jungle_Leaves)
 	return
 }
 
@@ -293,13 +315,27 @@ smooth :: proc(e0, e1, x: f64) -> f64 {
 @(private = "file")
 mix3 :: proc(a, b: [3]f32, t: f64) -> [3]f32 {return a + (b - a) * f32(clamp(t, 0, 1))}
 
+// Оттенок травы по климату — тот же, что grass_tint в шейдерах (SEASON_GLSL).
+grass_tint_rgb :: proc(c: [3]f32, dry, cold: f64) -> [3]f32 {
+	m := mix3({1, 1, 1}, {1.32, 1.08, 0.52}, dry)
+	m = mix3(m, {0.8, 0.7, 0.48}, cold)
+	return c * m
+}
+
 // Цвет поверхности и её высота над уровнем моря (м) в точке шара p — по тем
-// же правилам, что блоки в generate_chunk, только плавно (доли вместо выбора).
+// же правилам, что блоки (природная зона, поверхность, деревья), только
+// плавно (доли вместо выбора). decid, conif — доли листопадных и хвойных крон.
 @(private = "file")
-far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64) -> (col: [3]f32, h: f64, water: bool) {
+far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Climate) -> (col: [3]f32, h: f64, water: bool, decid, conif: f64) {
 	pal := &fs.palette
 	seed := i64(fs.seed)
+	biome := bc.k.biome
 	if v < SEA_LEVEL {
+		if biome == .Sea_Ice {
+			// многолетний лёд: твёрдая белёсая гладь на уровне моря
+			n := f64(fbm_lod(seed + 136, p, 40, 2, cell))
+			return mix3(pal.ice, pal.snow, 0.55 + 0.3 * n), 0.2, false, 0, 0
+		}
 		// вода: полупрозрачная гладь поверх дна, глубже — дно темнее
 		depth := Y_SEA - (v + 0.5)
 		n := f64(fbm_lod(seed + 131, p, 24, 2, cell))
@@ -307,25 +343,69 @@ far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64) -> (col: [3
 		// дно под водой в тени (как у блоков: SHADOW_LIGHT), глубже — темнее
 		t := f32(math.exp(-depth / 8))
 		col = pal.water * 0.67 + (bottom * SHADOW_LIGHT * t + pal.water * 0.25 * (1 - t)) * 0.33
-		return col, 0, true
+		return col, 0, true, 0, 0
 	}
 	h = max(v + 0.5 - Y_SEA, 0.1)
-	rock := rock_line(seed, p, cell)
-	stone := max(smooth(2.2, 3.5, slope), smooth(rock - 150, rock + 150, h))
-	sand := 1 - smooth(63.5, 64.5, v)
+	dry := f64(bc.tint & 15) / 15
+	cold := f64(bc.tint >> 4) / 15
+	stone := smooth(2.2, 3.5, slope)
+	beach := 1 - smooth(63.5, 64.5, v)
 	grassy := 0.5 + 0.5 * f64(fbm_lod(seed + 55, p, 48, 2, cell))
-	col = mix3(pal.grass, pal.tall_grass, (0.03 + 0.32 * grassy) * 0.6)
+	grass := grass_tint_rgb(mix3(pal.grass, pal.tall_grass, (0.03 + 0.32 * grassy) * 0.6), dry, cold)
+	n := f64(fbm_lod(seed + 135, p, 18, 2, cell)) // как в surface_for
+	ground := grass
+	sand := pal.sand
+	#partial switch biome {
+	case .Ice_Cap:
+		ground = pal.snow
+		sand = pal.snow
+		stone *= 0.4 // на леднике скалы торчат только на самых крутых склонах
+	case .Tundra:
+		rock := smooth(6, 1, bc.t_max) * 0.85
+		ground = mix3(grass, pal.stone, rock)
+		ground = mix3(ground, pal.gravel, 0.15)
+		sand = pal.gravel
+	case .Desert_Hot:
+		ground = pal.sand
+	case .Desert_Cold:
+		ground = mix3(pal.sand, pal.gravel, 0.4)
+	case .Steppe, .Savanna, .Mediterranean:
+		ground = mix3(grass, pal.dirt, smooth(0.45, 0.65, n) * 0.6 + 0.08)
+	}
 	// голая скала — пласты: в низких горах осадочные, в высоких — гранит
 	bare := mix3(pal.sandstone * 0.67 + pal.limestone * 0.33, pal.granite, smooth(1500, 2500, h))
-	col = mix3(col, bare, stone)
-	col = mix3(col, pal.sand, sand)
+	col = mix3(ground, bare, stone)
+	col = mix3(col, sand, beach)
 	// лес: кроны закрывают землю и поднимают поверхность
-	cover := f64(forest_density(seed, p, h, cell)) * (1 - stone) * (1 - sand) * (1 - smooth(1.5, 2.5, slope))
+	cover := f64(forest_cover(seed, p, biome, bc.t_max, cell)) * (1 - stone) * (1 - beach) * (1 - smooth(1.5, 2.5, slope))
+	if biome == .Desert_Hot do cover = 0 // кактусы издали не видны
 	crowns := smooth(0, 0.45, cover)
+	if crowns <= 0 do return col, h, false, 0, 0
 	birch := clamp(smooth(0.1, 0.3, f64(fbm_lod(seed + 99, p, 160, 2, cell))) + 0.12, 0, 1)
-	col = mix3(col, mix3(pal.oak, pal.birch, birch) * 0.85, crowns * 0.9)
-	h += 5.5 * crowns
-	return col, h, false
+	broad := mix3(grass_tint_rgb(pal.oak, dry * 0.5, cold * 0.5), grass_tint_rgb(pal.birch, dry * 0.5, cold * 0.5), birch)
+	crown := broad
+	spruce := 0.0
+	rise := 5.5
+	#partial switch biome {
+	case .Taiga:
+		spruce = 0.85
+		rise = 8
+	case .Temperate_Forest:
+		if bc.k.code[0] == 'D' do spruce = 0.35
+	case .Savanna:
+		crown = pal.acacia
+		rise = 4
+	case .Rainforest:
+		crown = pal.jungle
+		rise = 13
+	}
+	crown = mix3(crown, pal.spruce, spruce)
+	col = mix3(col, crown * 0.85, crowns * 0.9)
+	h += rise * crowns
+	evergreen := biome == .Savanna || biome == .Rainforest
+	conif = crowns * spruce
+	decid = evergreen ? 0 : crowns * (1 - spruce)
+	return col, h, false, decid, conif
 }
 
 @(private = "file")
@@ -351,17 +431,35 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 		dirs[j * G + i] = d
 		v[j * G + i] = terrain_height_lod(i64(fs.seed), d * R, cell)
 	}
+	// климат меняется на сотни километров: 3×3 точки на тайл, между ними плавно
+	CG :: 3
+	cgrid: [CG * CG]Corner_Climate
+	for b in 0 ..< CG do for a in 0 ..< CG {
+		cgrid[b * CG + a] = make_corner_climate(i64(fs.seed), geo_dir(g, t.key.face, x0 + f64(a) * S / 2, z0 + f64(b) * S / 2) * R)
+	}
 	h: [G * G]f64
 	col: [G * G][3]f32
 	water: [G * G]bool
 	depth: [G * G]f64
+	clim: [G * G][4]u8
 	for j in 0 ..< G do for i in 0 ..< G {
 		k := j * G + i
 		il, ir := max(i - 1, 0), min(i + 1, G - 1)
 		jl, jr := max(j - 1, 0), min(j + 1, G - 1)
 		gx := abs(v[j * G + ir] - v[j * G + il]) / (f64(ir - il) * cell)
 		gz := abs(v[jr * G + i] - v[jl * G + i]) / (f64(jr - jl) * cell)
-		col[k], h[k], water[k] = far_surface(fs, dirs[k] * R, v[k], max(gx, gz), cell)
+		u := clamp(f64(i - 1) / FAR_K, 0, 1) * 2
+		w := clamp(f64(j - 1) / FAR_K, 0, 1) * 2
+		a := min(int(u), CG - 2)
+		b := min(int(w), CG - 2)
+		pk := dirs[k] * R
+		alt := v[k] < SEA_LEVEL ? -1 : v[k] + 0.5 - Y_SEA
+		dither := f64(fbm_lod(i64(fs.seed) + 700, pk, 600, 2, cell)) * 1.2
+		wet := 1 + 0.25 * f64(fbm_lod(i64(fs.seed) + 701, pk, 900, 2, cell))
+		bc := climate_blend({&cgrid[b * CG + a], &cgrid[b * CG + a + 1], &cgrid[(b + 1) * CG + a], &cgrid[(b + 1) * CG + a + 1]}, u - f64(a), w - f64(b), alt, dither, wet)
+		decid, conif: f64
+		col[k], h[k], water[k], decid, conif = far_surface(fs, pk, v[k], max(gx, gz), cell, &bc)
+		clim[k] = {u8(clamp(bc.cont, 0, 1) * 255), u8(clamp(bc.wet * 100, 0, 255)), u8(clamp(decid, 0, 1) * 255), u8(clamp(conif, 0, 1) * 255)}
 		if water[k] do depth[k] = Y_SEA - (v[k] + 0.5)
 	}
 	P: [G * G][3]f64
@@ -419,6 +517,7 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 			off    = {f32(off.x), f32(off.y), f32(off.z)},
 			normal = nrm,
 			color  = {u8(clamp(cc.r, 0, 1) * 255), u8(clamp(cc.g, 0, 1) * 255), u8(clamp(cc.b, 0, 1) * 255), water[k] ? 255 : 0},
+			clim   = clim[k],
 		}
 		bound = max(bound, len3(off))
 		if water[k] do bound = max(bound, len3(off - dirs[k] * min(depth[k], 127))) // дно
@@ -431,7 +530,7 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 		d := dirs[(j + 1) * G + (i + 1)]
 		src := verts[gv]
 		down := [3]f32{f32(d.x * skirt), f32(d.y * skirt), f32(d.z * skirt)}
-		verts[FAR_N * FAR_N + e * FAR_N + s] = {off = src.off - down, normal = src.normal, color = src.color}
+		verts[FAR_N * FAR_N + e * FAR_N + s] = {off = src.off - down, normal = src.normal, color = src.color, clim = src.clim}
 	}
 	t.verts = verts
 	t.bound = bound + skirt
@@ -608,6 +707,8 @@ far_upload :: proc(ft: ^Far_Terrain, t: ^Far_Tile) {
 		gl.VertexAttribPointer(1, 4, gl.BYTE, true, size_of(Far_Vertex), offset_of(Far_Vertex, normal))
 		gl.EnableVertexAttribArray(2)
 		gl.VertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, size_of(Far_Vertex), offset_of(Far_Vertex, color))
+		gl.EnableVertexAttribArray(3)
+		gl.VertexAttribPointer(3, 4, gl.UNSIGNED_BYTE, true, size_of(Far_Vertex), offset_of(Far_Vertex, clim))
 		gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, ft.ebo)
 		gl.BindVertexArray(0)
 	}
@@ -687,8 +788,24 @@ nearest_anomaly :: proc(up: [3]f64) -> (corner: int, dir: [3]f64) {
 // ---------------------------------------------------------------- отрисовка
 
 // Рисует дальний рельеф (uniform-ы неба, света, дымки уже выставлены вызывающим).
-far_draw :: proc(ft: ^Far_Terrain, pv: ^Planet_View, view_proj: eng.Mat4, frustum: ^[6][4]f32, side_shade: [2]f32) {
+far_draw :: proc(ft: ^Far_Terrain, pv: ^Planet_View, view_proj: eng.Mat4, frustum: ^[6][4]f32, side_shade: [2]f32, season: f64) {
 	gl.UseProgram(ft.prog)
+	// климат по широтам сейчас — для смены сезонов (снег, осень, жухлая трава)
+	if climate.ok {
+		zone: [CLIM_LAT][4]f32
+		for i in 0 ..< CLIM_LAT {
+			to, tl, p, trend := climate_band_now(&climate, i, season)
+			zone[i] = {f32(to), f32(tl), f32(p), f32(trend)}
+		}
+		gl.ActiveTexture(gl.TEXTURE4)
+		gl.BindTexture(gl.TEXTURE_2D, ft.clim_tex)
+		gl.TexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, CLIM_LAT, 1, gl.RGBA, gl.FLOAT, &zone[0][0])
+		gl.ActiveTexture(gl.TEXTURE0)
+	}
+	eng.set_i32(ft.u.clim, 4)
+	eng.set_f32(ft.u.season_on, climate.ok ? 1 : 0)
+	eng.set_f32(ft.u.lapse, f32(climate.lapse))
+	eng.set_f32(ft.u.radius, f32(ft.shared.geo.radius))
 	eng.set_mat4(ft.u.view_proj, view_proj)
 	jinv, jt: matrix[3, 3]f32
 	for r in 0 ..< 3 do for c in 0 ..< 3 {
@@ -716,6 +833,7 @@ far_draw :: proc(ft: ^Far_Terrain, pv: ^Planet_View, view_proj: eng.Mat4, frustu
 		if !sphere_visible(frustum, c, f32(t.radius * stretch)) do continue
 		if far_under_blocks(ft, c, f32(t.radius * stretch)) do continue
 		eng.set_vec3(ft.u.rel_o, c)
+		eng.set_vec3(ft.u.org, {f32(t.origin.x), f32(t.origin.y), f32(t.origin.z)})
 		gl.BindVertexArray(t.vao)
 		gl.DrawElements(gl.TRIANGLES, FAR_INDICES, gl.UNSIGNED_SHORT, nil)
 		ft.drawn += 1
@@ -727,6 +845,7 @@ far_draw :: proc(ft: ^Far_Terrain, pv: ^Planet_View, view_proj: eng.Mat4, frustu
 	for t in floors {
 		rel := planet_rel(pv, t.origin)
 		eng.set_vec3(ft.u.rel_o, {f32(rel.x), f32(rel.y), f32(rel.z)})
+		eng.set_vec3(ft.u.org, {f32(t.origin.x), f32(t.origin.y), f32(t.origin.z)})
 		gl.BindVertexArray(t.vao)
 		gl.DrawElements(gl.TRIANGLES, FAR_INDICES, gl.UNSIGNED_SHORT, nil)
 	}

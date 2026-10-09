@@ -107,8 +107,8 @@ lon_text :: proc(lon: f64) -> string {
 	return lon <= 180 ? fmt.tprintf("%.1f° в.д.", lon) : fmt.tprintf("%.1f° з.д.", 360 - lon)
 }
 
-PAGE_TITLES := [F3_PAGES + 1]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо", "строение планеты", "атмосфера", "звезда"}
-F3_PAGES :: 7
+PAGE_TITLES := [F3_PAGES + 1]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо", "строение планеты", "атмосфера", "звезда", "климат"}
+F3_PAGES :: 8
 
 // Шапка любой страницы F3.
 @(private = "file")
@@ -533,8 +533,11 @@ page_atmosphere :: proc(p: ^Panel, fp: ^Frame_Params) {
 	alt := fp.player.pos.y - Y_SEA
 	pr := atmo_pressure(a, alt)
 	o2 := pr * a.frac[.O2] * 100
+	// температура здесь сейчас — по климату (сезон, время суток), иначе средняя по высоте
+	t_here := atmo_temperature(a, alt)
+	if lc := local_climate(fp); lc.ok do t_here = lc.t_now + 273.15
 	panel_line(p, GOLD, fmt.tprintf("Здесь (%.0f м): %.3f бар, %s °C, воздух %.2f кг/м³, кислород %.1f кПа",
-		alt, pr, celsius(atmo_temperature(a, alt) - 273.15), pr * 1e5 * a.mu / (R_GAS * atmo_temperature(a, alt)), o2))
+		alt, pr, celsius(t_here - 273.15), pr * 1e5 * a.mu / (R_GAS * t_here), o2))
 	breath := "дышится как у моря на Земле"
 	switch {
 	case o2 < 7:
@@ -808,6 +811,156 @@ hud_draw_star_cutaway :: proc(fp: ^Frame_Params, ortho: matrix[4, 4]f32) {
 	eng.imm_flush(ortho)
 }
 
+// Климат там, где стоит игрок: зона и месяцы; температура сейчас (сезон и время суток).
+@(private = "file")
+Local_Climate :: struct {
+	ok:           bool,
+	bc:           Block_Climate,
+	cp:           Climate_Point,
+	t_day, t_now: f64, // среднесуточная и сейчас, °C
+	amp:          f64, // перепад день — ночь
+	p_now:        f64, // осадков в этом месяце, мм
+	snow:         f64, // 0..1 — лежит ли снег
+	alt:          f64,
+}
+
+@(private = "file")
+local_climate :: proc(fp: ^Frame_Params) -> (lc: Local_Climate) {
+	if !climate.ok do return
+	w := fp.world
+	pl := fp.player
+	face, gx, gz, ok := world_resolve(w, i32(math.floor(pl.pos.x)), i32(math.floor(pl.pos.z)))
+	if !ok do return
+	col := world_column(w, column_key_of(face, gx, gz))
+	if col == nil do return
+	lc.alt = pl.pos.y - Y_SEA
+	p := geo_point(&w.geo, face, gx, gz)
+	lc.bc = block_climate(w, face, gx, gz, lc.alt < -0.5 ? -1 : lc.alt, p)
+	lc.cp = col.clim
+	lc.cp.alt = max(lc.alt, 0)
+	lc.t_day, lc.p_now = climate_at(&climate, &lc.cp, fp.season)
+	// день и ночь: в сухом воздухе и при долгих сутках перепад больше
+	dry := f64(lc.bc.tint & 15) / 15
+	lc.amp = (4 + 9 * dry) * clamp(math.sqrt(fp.clock.day_hours / 24), 0.6, 2.5)
+	lc.t_now = lc.t_day + lc.amp / 2 * math.cos((fp.sky_state.local_hours - 15) / 24 * math.TAU)
+	// снег — как в шейдере (snow_cover): копится в мороз, весной сходит с запаздыванием
+	t1, _ := climate_at(&climate, &lc.cp, fp.season + 1.0 / 24)
+	t0, _ := climate_at(&climate, &lc.cp, fp.season - 1.0 / 24)
+	cold := t1 - t0 < 0 ? smooth01(1.0, -2.0, lc.t_day) : smooth01(3.0, -1.0, lc.t_day)
+	lc.snow = cold * smooth01(3, 20, lc.p_now * 4)
+	lc.ok = true
+	return
+}
+
+@(private = "file")
+MONTH_COLS := [?]f32{0, 46, 74, 102, 130, 158, 186, 214, 242, 270, 298, 326, 354}
+
+// Страница 8: климат здесь и на планете.
+@(private = "file")
+page_climate :: proc(p: ^Panel, fp: ^Frame_Params) {
+	if !climate.ok do return
+	lc := local_climate(fp)
+	cm := &climate
+	if lc.ok {
+		k := lc.bc.k
+		if k.biome == .Ocean || k.biome == .Sea_Ice {
+			panel_line(p, GOLD, fmt.tprintf("Климат здесь: %s", BIOME_NAMES[k.biome]))
+		} else {
+			panel_line(p, GOLD, fmt.tprintf("Климат здесь: %s — %s; зона: %s", koppen_text(k), koppen_desc(k), BIOME_NAMES[k.biome]))
+		}
+		st := fp.sky_state
+		season := st.season
+		if st.latitude < 0 do season = (season + 2) % 4
+		snow := lc.snow > 0.5 ? "лежит снег" : lc.snow > 0.05 ? "снег тает или только выпал" : "снега нет"
+		panel_line(p, WHITE, fmt.tprintf("сейчас %s: днём до %s °C, ночью до %s °C, сейчас %s °C; осадков за месяц %.0f мм; %s",
+			SEASON_NAMES[season], celsius(lc.t_day + lc.amp / 2), celsius(lc.t_day - lc.amp / 2), celsius(lc.t_now), lc.p_now, snow))
+		b := &lc.bc
+		panel_line(p, WHITE, fmt.tprintf("за год: в среднем %s °C, самый тёплый месяц %s °C, самый холодный %s °C; осадков %.0f мм",
+			celsius(b.t_ann), celsius(b.t_max), celsius(b.t_min), b.p_sum))
+		sea := lc.cp
+		sea.alt = 0
+		tree := climate_height_of(cm, &sea, 10)
+		snowline := climate_height_of(cm, &sea, 0)
+		wind := lc.cp.wind > 0 ? "с востока" : "с запада"
+		panel_line(p, WHITE, fmt.tprintf("граница леса здесь ~%s, вечные снега ~%s над морем; от моря: материковость %.0f%%, ветер чаще %s",
+			dist_text(max(tree, 0)), dist_text(max(snowline, 0)), lc.cp.cont * 100, wind))
+		panel_gap(p)
+		// по месяцам года планеты
+		p.cols = MONTH_COLS[:]
+		head: [13]string
+		trow: [13]string
+		prow: [13]string
+		head[0], trow[0], prow[0] = "месяц", "°C", "мм"
+		for m in 0 ..< 12 {
+			head[m + 1] = fmt.tprintf("%d", m + 1)
+			trow[m + 1] = celsius(f64(b.month_t[m]))
+			prow[m + 1] = fmt.tprintf("%.0f", b.month_p[m])
+		}
+		panel_line(p, GRAY, ..head[:])
+		panel_line(p, WHITE, ..trow[:])
+		panel_line(p, WHITE, ..prow[:])
+		p.cols = nil
+		panel_line(p, GRAY, fmt.tprintf("месяц — двенадцатая часть года планеты (%.0f местных суток); 1-й — от весеннего равноденствия на севере", fp.system.home.year_days / 12))
+		panel_gap(p)
+	}
+	panel_line(p, GOLD, fmt.tprintf("Планета: в среднем %.1f °C; на экваторе %.1f °C, у полюсов %.1f и %.1f °C (у моря, за год)",
+		cm.global_t, cm.equator_t, cm.pole_n_t, cm.pole_s_t))
+	panel_line(p, WHITE, fmt.tprintf("тропики (ячейка Хэдли) до %.0f° широты, пустыни около них, пояс циклонов ~%.0f°; осадков в среднем %.0f мм в год",
+		cm.hadley, cm.storm, cm.global_p))
+	panel_line(p, WHITE, fmt.tprintf("перенос тепла к полюсам ×%.2f от земного (давление, состав воздуха, вращение за %.1f ч)",
+		cm.d_ratio, fp.system.planets[fp.system.home.index].sidereal_hours))
+	panel_line(p, GRAY, "модель теплового баланса по широтам: свет звезды, излучение, перенос воздухом и течениями, снег и лёд")
+}
+
+// График: по широте — средняя за год (оранжевым), сейчас (красным), осадки (синим).
+@(private = "file")
+hud_draw_climate_chart :: proc(fp: ^Frame_Params, ortho: matrix[4, 4]f32) {
+	if !climate.ok do return
+	cm := &climate
+	g := gui_scale(fp.height)
+	wpx, hpx := 230 * g, 120 * g
+	x0 := f32(fp.width) - wpx - 6 * g
+	y0 := f32(fp.height) - hpx - 18 * g
+	eng.imm_rect(x0 - 2 * g, y0 - 2 * g, x0 + wpx + 2 * g, y0 + hpx + 12 * g, {0, 0, 0, 140})
+	// ось температуры: −50 … +50 °C; осадки — до максимума
+	ty :: proc(t, y0, hpx: f32) -> f32 {return y0 + hpx * (1 - (clamp(t, -50, 50) + 50) / 100)}
+	pmax: f32 = 1
+	pann: [CLIM_LAT]f32
+	tann, tnow: [CLIM_LAT]f32
+	for i in 0 ..< CLIM_LAT {
+		fl := cm.land[i]
+		for k in 0 ..< CLIM_SEASON {
+			pann[i] += cm.p_zonal[i][k] * 12 / CLIM_SEASON
+			tann[i] += (fl * cm.t_land[i][k] + (1 - fl) * cm.t_ocean[i][k]) / CLIM_SEASON
+		}
+		to, tl, _, _ := climate_band_now(cm, i, fp.season)
+		tnow[i] = f32(f64(fl) * tl + (1 - f64(fl)) * to)
+		pmax = max(pmax, pann[i])
+	}
+	bw := wpx / CLIM_LAT
+	for i in 0 ..< CLIM_LAT {
+		x := x0 + f32(i) * bw
+		ph := hpx * pann[i] / pmax * 0.9
+		eng.imm_rect(x, y0 + hpx - ph, x + bw, y0 + hpx, {60, 110, 200, 160})
+	}
+	eng.imm_rect(x0, ty(0, y0, hpx), x0 + wpx, ty(0, y0, hpx) + g * 0.5, {200, 200, 200, 120}) // 0 °C
+	for i in 0 ..< CLIM_LAT {
+		x := x0 + (f32(i) + 0.5) * bw
+		ya := ty(tann[i], y0, hpx)
+		yn := ty(tnow[i], y0, hpx)
+		eng.imm_rect(x - g, ya - g, x + g, ya + g, {255, 170, 60, 255})
+		eng.imm_rect(x - g * 0.7, yn - g * 0.7, x + g * 0.7, yn + g * 0.7, {240, 70, 60, 255})
+	}
+	// мы здесь
+	lat := fp.sky_state.latitude
+	mx := x0 + f32((lat + 90) / 180) * wpx
+	eng.imm_rect(mx - g * 0.5, y0, mx + g * 0.5, y0 + hpx, {255, 255, 255, 200})
+	label := "юг — широта — север"
+	lw := eng.text_width(label, g)
+	eng.draw_text(label, x0 + (wpx - lw) / 2, y0 + hpx + 2 * g, g, GOLD)
+	eng.imm_flush(ortho)
+}
+
 // Рисует весь текстовый интерфейс (вызывать с включённым смешиванием).
 hud_draw :: proc(fp: ^Frame_Params) {
 	ortho := linalg.matrix_ortho3d_f32(0, f32(fp.width), f32(fp.height), 0, -1, 1)
@@ -831,12 +984,15 @@ hud_draw :: proc(fp: ^Frame_Params) {
 			page_atmosphere(&p, fp)
 		case 7:
 			page_star(&p, fp)
+		case 8:
+			page_climate(&p, fp)
 		}
 	}
 	eng.imm_flush(ortho)
 	if fp.debug_page == 1 do hud_draw_globe(fp, ortho)
 	if fp.debug_page == 5 do hud_draw_cutaway(fp, ortho)
 	if fp.debug_page == 7 do hud_draw_star_cutaway(fp, ortho)
+	if fp.debug_page == 8 do hud_draw_climate_chart(fp, ortho)
 }
 
 // Глобус планеты в правом верхнем углу (под часами) с отметкой "мы здесь".

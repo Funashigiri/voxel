@@ -30,7 +30,8 @@ Clouds :: struct {
 	index_count: i32,
 	noise_tex:   u32, // 3D-текстура шума (NOISE_N³)
 	height:      f64, // нижняя кромка над уровнем моря, м
-	cover:       f64, // средняя облачность мира (0..1)
+	cover:       f64, // облачность здесь сейчас (0..1): по климату и погоде мира
+	weather:     f64, // погода мира: насколько облачнее или яснее климата (−0,2…+0,2)
 	offset:      [3]f64, // сдвиг узора этого мира (единицы шума)
 	wind:        [3]f64, // ветер (оси планеты), м/с
 	drift:       [3]f64, // накопленный снос узора, единицы шума
@@ -54,6 +55,7 @@ clouds_init :: proc(c: ^Clouds, seed: u32, air_scale: f64) -> bool {
 	r := eng.rng_make(u64(seed) * 0x5DEECE66D + 77)
 	c.height = clamp(1600 * air_scale, 800, 4000) * eng.rng_range(&r, 0.85, 1.15)
 	c.cover = eng.rng_range(&r, 0.25, 0.7)
+	c.weather = c.cover - 0.475
 	c.offset = {eng.rng_range(&r, 0, 997), eng.rng_range(&r, 0, 997), eng.rng_range(&r, 0, 997)}
 	w := [3]f64{eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1)}
 	c.wind = w / max(len3(w), 1e-6) * CLOUD_WIND * eng.rng_range(&r, 0.6, 1.4)

@@ -151,6 +151,7 @@ Galaxy_Cell :: struct {
 
 Universe :: struct {
 	seed:          u64,
+	world_seed:    u32, // зерно мира (им же — рельеф планет)
 	web_norm:      f64, // делитель плотности паутины (средняя плотность = 1)
 	gal_density:   f64, // измеренная средняя плотность галактик со спутниками, на Мпк³
 	sch_cdf:       [SCH_STEPS + 1]f64,
@@ -162,6 +163,7 @@ Universe :: struct {
 
 universe_init :: proc(u: ^Universe, world_seed: u32) {
 	u.seed = mix64(u64(world_seed) ~ 0x0123_4567_89AB_CDEF)
+	u.world_seed = world_seed
 
 	// распределение галактик по числу звёзд (функция Шехтера), в логарифмах
 	acc := 0.0
@@ -694,6 +696,7 @@ Home :: struct {
 	star:    Star, // наша звезда
 	rel:     [3]f64, // её положение относительно центра галактики, св. лет
 	planet:  int, // номер планеты для высадки в её системе
+	lat, lon: f64, // место высадки: умеренный лес или степь (climate.odin)
 	checked: int, // сколько звёзд проверено, пока она нашлась
 }
 
@@ -723,7 +726,8 @@ universe_find_home :: proc(u: ^Universe) -> (home: Home) {
 			rel := galaxy_sample(&g, &r)
 			rho := galaxy_density(&g, rel)
 			if rho < 1e-5 || rho > 0.03 do continue // не в пустоте и не в тесном опасном ядре
-			if star, planet, ok := search_near(u, &g, rel, rho, &home.checked); ok {
+			if star, planet, lat, lon, ok := search_near(u, &g, rel, rho, &home.checked); ok {
+				home.lat, home.lon = lat, lon
 				home.galaxy = g
 				home.star = star
 				home.star.pos = upos_clone(star.pos)
@@ -739,7 +743,7 @@ universe_find_home :: proc(u: ^Universe) -> (home: Home) {
 // Звёзды вокруг точки (около двухсот ближайших), от ближних к дальним: у
 // какой первой найдётся планета для высадки.
 @(private = "file")
-search_near :: proc(u: ^Universe, g: ^Galaxy, rel: [3]f64, rho: f64, checked: ^int) -> (best: Star, planet: int, ok: bool) {
+search_near :: proc(u: ^Universe, g: ^Galaxy, rel: [3]f64, rho: f64, checked: ^int) -> (best: Star, planet: int, lat, lon: f64, ok: bool) {
 	point := upos_add_ly(g.center, rel)
 	radius := clamp(math.cbrt(200 / (rho * 4.19)), 5, 300)
 	found := make([dynamic]Star, context.temp_allocator)
@@ -755,8 +759,14 @@ search_near :: proc(u: ^Universe, g: ^Galaxy, rel: [3]f64, rho: f64, checked: ^i
 		checked^ += 1
 		sys := star_system_generate(0, found[it.i], false)
 		idx := system_find_start(&sys)
+		// планета подходит — ищем на ней умеренный лес или степь (по честному климату)
+		if idx >= 0 {
+			if la, lo, site := start_site_search(&sys, idx, u.world_seed); site {
+				star_system_destroy(&sys)
+				return found[it.i], idx, la, lo, true
+			}
+		}
 		star_system_destroy(&sys)
-		if idx >= 0 do return found[it.i], idx, true
 	}
 	return
 }

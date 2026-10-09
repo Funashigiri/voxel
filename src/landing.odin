@@ -116,7 +116,7 @@ v3 :: proc(v: [3]f32) -> [3]f64 {return {f64(v.x), f64(v.y), f64(v.z)}}
 
 @(private = "file")
 is_foliage :: proc(b: Block) -> bool {
-	return BLOCK_INFO[b].render == .Leaves || b == .Oak_Log || b == .Birch_Log || is_plant(b)
+	return BLOCK_INFO[b].render == .Leaves || is_log(b) || is_plant(b)
 }
 
 // Верх земли под точкой (без листвы, брёвен, травы и воды), ищем от y вниз.

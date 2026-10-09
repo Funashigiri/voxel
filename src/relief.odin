@@ -31,8 +31,6 @@ Relief :: struct {
 // Параметры рельефа мира — задаются один раз при старте, до фоновых потоков.
 relief: Relief
 
-ROCK_LINE :: 2800.0 // выше — голые скалы, м над морем
-TREE_LINE :: 2400.0 // выше деревья не растут
 
 // water_m3 — объём воды на поверхности: доля океана выходит такой, чтобы
 // вода заполнила впадины рельефа (0 — случайная, как до 0.013).
@@ -168,15 +166,35 @@ terrain_height_lod :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
 	return elevation(seed, p, cell) + Y_SEA - 0.5
 }
 
-// Высота над морем, выше которой — голые скалы (с волнистой границей).
-rock_line :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
-	return ROCK_LINE + 250 * fl(seed + 151, p, 300, 2, cell)
-}
-
-// Густота леса: 0.03..0.93, к границе леса в горах редеет.
-forest_density :: proc(seed: i64, p: [3]f64, alt: f64, cell: f64 = 0.5) -> f32 {
-	f := fbm_lod(seed + 88, p, 220, 3, cell)
-	return (0.03 + 0.9 * eng.smoothstep(0.02, 0.35, f)) * f32(1 - smooth(TREE_LINE - 600, TREE_LINE, alt))
+// Густота леса по природной зоне (0..1): леса — сплошные массивы с полянами,
+// в саваннах и степях — редкие деревья, в пустыне — кактусы. Деревьям нужно
+// лето теплее ~10 °C: к границе леса (в горах и на севере) редеет.
+forest_cover :: proc(seed: i64, p: [3]f64, biome: Biome, t_max: f64, cell: f64 = 0.5) -> f32 {
+	base: f64
+	massive := false
+	#partial switch biome {
+	case .Temperate_Forest:
+		base, massive = 0.93, true
+	case .Taiga:
+		base, massive = 0.85, true
+	case .Rainforest:
+		base, massive = 1.0, true
+	case .Mediterranean:
+		base = 0.25
+	case .Savanna:
+		base = 0.07
+	case .Steppe:
+		base = 0.012
+	case .Desert_Hot:
+		return 0.02 // кактусы
+	case:
+		return 0
+	}
+	base *= smooth(10, 12.5, t_max)
+	f := f64(fbm_lod(seed + 88, p, 220, 3, cell))
+	if biome == .Rainforest do return f32(base * (0.6 + 0.4 * smooth(-0.2, 0.3, f))) // сомкнутый полог
+	if massive do return f32(base * (0.03 + 0.97 * smooth(0.02, 0.35, f)))
+	return f32(base * clamp(0.5 + f, 0, 1))
 }
 
 // Высота земли в вершине куба (у аномалии): столп поднимается над ней.

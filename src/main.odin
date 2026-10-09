@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.014"
+VERSION :: "0.015"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -46,6 +46,8 @@ Options :: struct {
 	universe_report: bool, // напечатать отчёт о вселенной с проверками и выйти
 	planets_report: bool, // сверить модель планет с Солнечной системой, статистика систем — и выйти
 	stars_report:  bool, // сверить модель звёзд с настоящими звёздами — и выйти
+	climate_report: bool, // сверить климат с Землёй — и выйти
+	biome:         string, // отладка: высадиться в природной зоне (forest, taiga, tundra, glacier, steppe, desert, savanna, rainforest…)
 	timescale:     f64, // ускорение времени (отладка)
 	start_day:     int, // день года при высадке (0 — случайный)
 	look_at:       string, // sun | moon — сразу смотреть туда (отладка)
@@ -139,6 +141,10 @@ parse_options :: proc() -> (o: Options) {
 			o.timescale = max(0, strconv.parse_f64(val) or_else 1)
 		case "-day":
 			o.start_day = max(1, strconv.parse_int(val) or_else 1)
+		case "-biome":
+			o.biome = val
+		case "-climate":
+			o.climate_report = true
 		case "-stars":
 			o.stars_report = true
 		case "-planets":
@@ -221,6 +227,10 @@ main :: proc() {
 		return
 	}
 
+	if opts.climate_report {
+		if climate_report() > 0 do os.exit(1)
+		return
+	}
 	if opts.stars_report {
 		if stars_report() > 0 do os.exit(1)
 		return
@@ -284,18 +294,32 @@ main :: proc() {
 	// планета-шар реального размера: выбираем грань и точку высадки
 	hp := home_planet(&system)
 	geo := geo_make(hp.radius_km)
-	// рельеф настоящего масштаба: океан — столько, сколько у планеты воды; высота гор — по силе тяжести
-	relief_init(opts.seed, geo.radius, system.home.gravity_g, hp.water * hp.mass_earth * M_EARTH_KG / 1000)
+	// рельеф настоящего масштаба (океан — столько, сколько у планеты воды; высота
+	// гор — по силе тяжести) и климат — обычно уже посчитаны поиском места высадки
+	if climate_key != {home.star.seed, u64(home.planet)} {
+		relief_init(opts.seed, geo.radius, system.home.gravity_g, hp.water * hp.mass_earth * M_EARTH_KG / 1000)
+		climate = climate_make(climate_input_for(&system, hp, opts.seed))
+		climate_key = {home.star.seed, u64(home.planet)}
+	}
+	world_climate_reset()
 	// строение планеты (кора, мантия, ядро) — из массы, состава, возраста; глубже коры блоки идут по нему
 	interior := interior_make(body_interior_input(&system, &hp.body))
 	defer free(interior)
 	deep_rock_init(interior)
 	// строение нашей звезды (её блеск, цвет и размер — прежние)
 	star_st := star_structure_make(system.star, system.age_gyr, system.metal)
-	lat, lon := system.home.latitude_deg, system.home.longitude_deg
+	// место высадки — найдено поиском: умеренный лес или степь
+	lat, lon := home.lat, home.lon
 	if opts.has_latlon do lat, lon = opts.lat, opts.lon
+	if b, ok := biome_from_name(opts.biome); ok {
+		if la, lo, found := climate_find_biome(opts.seed, hp.radius_km, b); found {
+			lat, lon = la, lo
+		} else {
+			fmt.printfln("зоны «%s» на этой планете нет", opts.biome)
+		}
+	}
 	site_x, site_z: f64
-	site_x, site_z, lat, lon = geo_choose_site(&geo, lat, lon, opts.seed, opts.has_latlon)
+	site_x, site_z, lat, lon = geo_choose_site(&geo, lat, lon, opts.seed, true)
 	if errors := geo_check_links(&geo); errors > 0 do fmt.eprintln("ОШИБКА: рёбра граней не стыкуются:", errors)
 	if opts.selftest {
 		checked, errors := frame_selftest(geo)
@@ -309,6 +333,11 @@ main :: proc() {
 			interior.density, interior.core_km, interior.inner_km, interior.center_t, interior.center_p, interior.magnetic_ut)
 		fmt.printfln("атмосфера: %.2f бар, %.1f °C, кислород %.0f кПа; суша и море: океан %.0f%% поверхности (оценка по воде %.0f%%)",
 			hp.atmo.pressure, hp.atmo.t_surface - 273.15, hp.atmo.o2_kpa, relief.ocean_frac * 100, hp.ocean_frac * 100)
+		site := geo_from_latlon(lat, lon) * geo.radius
+		scp := climate_point(&climate, i64(opts.seed), site, elevation(i64(opts.seed), site, 2000))
+		sk, _, _ := climate_classify(&climate, &scp)
+		fmt.printfln("климат: в среднем %.1f °C, экватор %.1f, полюса %.1f и %.1f; ячейка Хэдли до %.0f°, осадков %.0f мм в год; место высадки (%.1f°, %.1f°) — %s, %s",
+			climate.global_t, climate.equator_t, climate.pole_n_t, climate.pole_s_t, climate.hadley, climate.global_p, lat, lon, koppen_text(sk), BIOME_NAMES[sk.biome])
 		return
 	}
 	// тесты: высадка у ребра или у вершины; взгляд — в их сторону
@@ -382,7 +411,7 @@ main :: proc() {
 	if strings.contains(opts.off, "haze") do r.haze_beta = 0
 
 	sx, sz := i32(site_x), i32(site_z)
-	spawn := find_spawn(&world, sx, sz)
+	spawn := find_spawn(&world, sx, sz, opts.biome == "")
 	if opts.water_spawn do spawn = find_water_spawn(&world, sx, sz)
 	if opts.mountain_spawn do spawn = find_mountain_spawn(&world, sx, sz)
 	if opts.cliff_spawn {
@@ -481,6 +510,7 @@ main :: proc() {
 	around_time: f64 = -10
 	around: [2]f64
 
+	cover_set := false // облачность по климату: в первом кадре — сразу
 	for !eng.window_should_close() {
 		eng.window_begin_frame()
 		now := eng.time_now()
@@ -593,10 +623,22 @@ main :: proc() {
 		world_update(&world, player.pos, WORLD_BUDGET)
 
 		// небо этого кадра: солнце, луны, свет — по положению планеты и игрока на ней
+		season := climate_season(&astro, clock.std_hours + f64(t) * clock_tick_hours(&clock))
 		sky_state := astro_sky_at(&astro, &world.geo, player.pos + {0, opts.alt, 0}, clock.std_hours + f64(t) * clock_tick_hours(&clock), &star_sky)
 
 		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
 		clouds_tick(&clouds, now - start)
+		// облачность — по климату там, где мы: во влажных поясах гуще, над пустынями ясно
+		if climate.ok {
+			if face, gx, gz, ok := world_resolve(&world, i32(math.floor(player.pos.x)), i32(math.floor(player.pos.z))); ok {
+				if col := world_column(&world, column_key_of(face, gx, gz)); col != nil {
+					_, p_now := climate_at(&climate, &col.clim, season)
+					want := clamp(0.12 + 0.6 * math.smoothstep(5.0, 160.0, p_now) + clouds.weather, 0.04, 0.9)
+					clouds.cover += (want - clouds.cover) * (cover_set ? min(dt * 0.2, 1) : 1)
+					cover_set = true
+				}
+			}
+		}
 		cloud_shade, cloud_over: f64
 		{
 			up := geo_frame_dir(&world.geo, player.pos.x, player.pos.z)
@@ -660,6 +702,7 @@ main :: proc() {
 				clock = &clock,
 				system = &system,
 				debug_page = debug_page,
+				season = season,
 				universe = &uinfo,
 				fps = last_fps,
 				t = t,
