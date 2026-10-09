@@ -13,6 +13,7 @@ package main
 // растягивается. За время игры расширение ничтожно (~7·10⁻¹¹ в год).
 
 import "core:math"
+import "core:slice"
 import eng "engine"
 
 LY :: 9.4607304725808e15 // метров в световом году
@@ -431,7 +432,7 @@ galaxy_dust :: proc "contextless" (g: ^Galaxy, rel: [3]f64) -> f64 {
 	return DUST_KAPPA * g.dust * d
 }
 
-@(private = "file")
+
 pick_weighted :: proc(r: ^eng.Rng, weights: []f64) -> int {
 	total := 0.0
 	for w in weights do total += w
@@ -689,21 +690,23 @@ galaxy_sample :: proc(g: ^Galaxy, r: ^eng.Rng) -> [3]f64 {
 // ---------------------------------------------------------------- наш дом
 
 Home :: struct {
-	galaxy: Galaxy,
-	star:   Star, // наша звезда
-	rel:    [3]f64, // её положение относительно центра галактики, св. лет
+	galaxy:  Galaxy,
+	star:    Star, // наша звезда
+	rel:     [3]f64, // её положение относительно центра галактики, св. лет
+	planet:  int, // номер планеты для высадки в её системе
+	checked: int, // сколько звёзд проверено, пока она нашлась
 }
 
-// Выбирает нашу галактику и нашу звезду в ней. Наша звезда — случайная звезда
-// вселенной, поэтому галактика выбирается с вероятностью, пропорциональной
-// числу её звёзд (крупные — чаще, но тип каждый раз случайный). Место в
-// галактике — по распределению её звёзд, но не в пустоте и не в тесном ядре;
-// звезда — класса F/G/K/M.
+// Сначала — вселенная, потом поиск: случайное место в случайной галактике
+// (галактика — с вероятностью, пропорциональной числу её звёзд; место — по
+// распределению её звёзд, но не в пустоте и не в тесном ядре), и звёзды
+// вокруг — от ближних к дальним, пока у какой-нибудь не найдётся планета,
+// где можно высадиться (star_system.odin: start_check). Звезду никто не
+// подбирает: её система — по тем же правилам, что у любой другой.
 universe_find_home :: proc(u: ^Universe) -> (home: Home) {
 	r := eng.rng_make(u.seed ~ TAG_HOME)
 	list := make([dynamic]Galaxy, context.temp_allocator)
 	for _ in 0 ..< 1_000_000 {
-		// случайные клетки по всей вселенной; галактику берём с вероятностью ~ числу звёзд
 		clear(&list)
 		galaxy_cell_generate(u, random_key(&r, 1 << 31), &list)
 		chosen := -1
@@ -720,40 +723,40 @@ universe_find_home :: proc(u: ^Universe) -> (home: Home) {
 			rel := galaxy_sample(&g, &r)
 			rho := galaxy_density(&g, rel)
 			if rho < 1e-5 || rho > 0.03 do continue // не в пустоте и не в тесном опасном ядре
-			classes := [4]Star_Class{.M, .K, .G, .F}
-			class_weights := [4]f64{0.30, 0.30, 0.28, 0.12}
-			class := classes[pick_weighted(&r, class_weights[:])]
-			if star, ok := nearest_home_star(u, &g, rel, rho, class); ok {
+			if star, planet, ok := search_near(u, &g, rel, rho, &home.checked); ok {
 				home.galaxy = g
 				home.star = star
 				home.star.pos = upos_clone(star.pos)
 				home.rel = upos_delta_ly(star.pos, g.center)
+				home.planet = planet
 				return
 			}
 		}
 	}
-	panic("не нашлось места для нашей звезды")
+	panic("не нашлось планеты для высадки")
 }
 
-// Ближайшая к точке звезда класса class, у которой может быть пригодная для жизни планета.
+// Звёзды вокруг точки (около двухсот ближайших), от ближних к дальним: у
+// какой первой найдётся планета для высадки.
 @(private = "file")
-nearest_home_star :: proc(u: ^Universe, g: ^Galaxy, rel: [3]f64, rho: f64, class: Star_Class) -> (best: Star, ok: bool) {
+search_near :: proc(u: ^Universe, g: ^Galaxy, rel: [3]f64, rho: f64, checked: ^int) -> (best: Star, planet: int, ok: bool) {
 	point := upos_add_ly(g.center, rel)
-	expect := rho * STAR_TIERS[class].frac * star_pop_mult(g, class)
-	radius := clamp(math.cbrt(12 / (expect * 4.19)), f64(STAR_TIERS[class].cell), 400)
+	radius := clamp(math.cbrt(200 / (rho * 4.19)), 5, 300)
 	found := make([dynamic]Star, context.temp_allocator)
-	for _ in 0 ..< 2 {
-		clear(&found)
-		stars_near(u, point, radius, {class}, &found)
-		best_d := math.inf_f64(1)
-		for s in found {
-			if s.class == .M && s.mass < 0.35 do continue // у тусклых карликов зона жизни слишком близко
-			if d := len3(upos_delta_ly(s.pos, point)); d < best_d {
-				best, best_d, ok = s, d, true
-			}
-		}
-		if ok do return
-		radius *= 2
+	stars_near(u, point, radius, {.M, .K, .G, .F, .A, .B, .O}, &found)
+	Item :: struct {
+		i: int,
+		d: f64,
+	}
+	order := make([]Item, len(found), context.temp_allocator)
+	for s, i in found do order[i] = {i, len3(upos_delta_ly(s.pos, point))}
+	slice.sort_by(order, proc(a, b: Item) -> bool {return a.d < b.d})
+	for it in order {
+		checked^ += 1
+		sys := star_system_generate(0, found[it.i], false)
+		idx := system_find_start(&sys)
+		star_system_destroy(&sys)
+		if idx >= 0 do return found[it.i], idx, true
 	}
 	return
 }

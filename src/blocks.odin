@@ -26,6 +26,11 @@ Block :: enum u8 {
 	Granite,
 	Basalt,
 	Peridotite,
+	// глубокие недра (0.013): переходная зона, нижняя мантия, ядро
+	Ringwoodite,
+	Bridgmanite,
+	Molten_Iron,
+	Iron_Core,
 }
 
 // Русские названия (F3: что под ногами).
@@ -51,7 +56,11 @@ BLOCK_NAMES := [Block]string {
 	.Limestone    = "известняк",
 	.Granite      = "гранит",
 	.Basalt       = "базальт",
-	.Peridotite   = "перидотит (мантия)",
+	.Peridotite   = "перидотит (верхняя мантия)",
+	.Ringwoodite  = "рингвудит (переходная зона)",
+	.Bridgmanite  = "бриджманит (нижняя мантия)",
+	.Molten_Iron  = "жидкое железо (внешнее ядро)",
+	.Iron_Core    = "железо с никелем (твёрдое ядро)",
 }
 
 Render_Kind :: enum u8 {
@@ -119,6 +128,10 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Granite] = cube(all_faces(.Granite))
 	BLOCK_INFO[.Basalt] = cube(all_faces(.Basalt))
 	BLOCK_INFO[.Peridotite] = cube(all_faces(.Peridotite))
+	BLOCK_INFO[.Ringwoodite] = cube(all_faces(.Ringwoodite))
+	BLOCK_INFO[.Bridgmanite] = cube(all_faces(.Bridgmanite))
+	BLOCK_INFO[.Molten_Iron] = cube(all_faces(.Molten_Iron))
+	BLOCK_INFO[.Iron_Core] = cube(all_faces(.Iron_Core))
 	BLOCK_INFO[.Oak_Log] = cube(column_faces(.Oak_Log, .Oak_Log_Top, .Oak_Log_Top))
 	BLOCK_INFO[.Birch_Log] = cube(column_faces(.Birch_Log, .Birch_Log_Top, .Birch_Log_Top))
 	BLOCK_INFO[.Water] = {

@@ -411,7 +411,7 @@ universe_report :: proc(u: ^Universe, info: ^Universe_Info, world_seed: u32, ini
 	universe_init(&u2, world_seed)
 	defer universe_destroy(&u2)
 	home2 := universe_find_home(&u2)
-	rep := home2.star.seed == st.seed && star_same(home2.star, st^)
+	rep := home2.star.seed == st.seed && star_same(home2.star, st^) && home2.planet == home.planet
 	a := stars_sorted(u, st.pos, 15)
 	b := stars_sorted(&u2, st.pos, 15)
 	rep = rep && lists_same(a, b)

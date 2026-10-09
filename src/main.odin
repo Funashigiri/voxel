@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.012"
+VERSION :: "0.013"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -44,6 +44,7 @@ Options :: struct {
 	lat, lon:      f64,
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
 	universe_report: bool, // напечатать отчёт о вселенной с проверками и выйти
+	planets_report: bool, // сверить модель планет с Солнечной системой, статистика систем — и выйти
 	timescale:     f64, // ускорение времени (отладка)
 	start_day:     int, // день года при высадке (0 — случайный)
 	look_at:       string, // sun | moon — сразу смотреть туда (отладка)
@@ -137,6 +138,8 @@ parse_options :: proc() -> (o: Options) {
 			o.timescale = max(0, strconv.parse_f64(val) or_else 1)
 		case "-day":
 			o.start_day = max(1, strconv.parse_int(val) or_else 1)
+		case "-planets":
+			o.planets_report = true
 		case "-universe":
 			o.universe_report = true
 		case "-spawn":
@@ -215,6 +218,11 @@ main :: proc() {
 		return
 	}
 
+	if opts.planets_report {
+		if planets_report() > 0 do os.exit(1)
+		return
+	}
+
 	if !opts.has_seed {
 		opts.seed = eng.hash_u32(u32(time.time_to_unix_nano(time.now())) ~ u32(time.time_to_unix_nano(time.now()) >> 32))
 	}
@@ -228,6 +236,8 @@ main :: proc() {
 	home := universe_find_home(&universe)
 	t2 := time.now()
 	system := star_system_generate(opts.seed, home.star, true)
+	star_system_set_home(&system, home.planet, opts.seed)
+	system.checked = home.checked
 	defer star_system_destroy(&system)
 	uinfo := universe_info_build(&universe, home)
 	defer universe_info_destroy(&uinfo)
@@ -236,8 +246,8 @@ main :: proc() {
 	defer starsky_destroy(&star_sky)
 	if !opts.sky_report && !opts.universe_report do starsky_start(&star_sky, opts.seed, home)
 	t3 := time.now()
-	fmt.printfln("Мир %d: галактика %s (%s), звезда %s (%s), планета %s, сутки %.1f ч, гравитация %.2f g",
-		opts.seed, uinfo.galaxy_name, GALAXY_KIND_NAMES[home.galaxy.kind], system.star.name, STAR_CLASS_NAMES[system.star.class],
+	fmt.printfln("Мир %d: галактика %s (%s), звезда %s (%s, проверено звёзд: %d), планета %s, сутки %.1f ч, гравитация %.2f g",
+		opts.seed, uinfo.galaxy_name, GALAXY_KIND_NAMES[home.galaxy.kind], system.star.name, STAR_CLASS_NAMES[system.star.class], home.checked,
 		home_planet(&system).name, system.home.day_hours, system.home.gravity_g)
 	if opts.universe_report {
 		ms :: proc(a, b: time.Time) -> f64 {return time.duration_milliseconds(time.diff(a, b))}
@@ -265,12 +275,14 @@ main :: proc() {
 	sky_init(&sky)
 
 	// планета-шар реального размера: выбираем грань и точку высадки
-	geo := geo_make(home_planet(&system).radius_km)
-	// рельеф настоящего масштаба: доля океана мира, высота гор по силе тяжести
-	relief_init(opts.seed, geo.radius, system.home.gravity_g)
-	// строение планеты (кора, мантия, ядро) — по массе, радиусу и свету звезды
-	interior := interior_make(home_planet(&system).radius_km, home_planet(&system).mass_earth, system.home.gravity_g,
-		system.star.luminosity / (home_planet(&system).orbit_au * home_planet(&system).orbit_au))
+	hp := home_planet(&system)
+	geo := geo_make(hp.radius_km)
+	// рельеф настоящего масштаба: океан — столько, сколько у планеты воды; высота гор — по силе тяжести
+	relief_init(opts.seed, geo.radius, system.home.gravity_g, hp.water * hp.mass_earth * M_EARTH_KG / 1000)
+	// строение планеты (кора, мантия, ядро) — из массы, состава, возраста; глубже коры блоки идут по нему
+	interior := interior_make(body_interior_input(&system, &hp.body))
+	defer free(interior)
+	deep_rock_init(interior)
 	lat, lon := system.home.latitude_deg, system.home.longitude_deg
 	if opts.has_latlon do lat, lon = opts.lat, opts.lon
 	site_x, site_z: f64
@@ -284,8 +296,10 @@ main :: proc() {
 			ridge, RIDGE1_MEAN, diff, diff_max)
 		fmt.printfln("рельеф: океан %.0f%% (задано %.0f%%), высоты от %.0f до %.0f м, горы ×%.2f (тяжесть %.2f g)",
 			ocean * 100, relief.ocean_frac * 100, h_lo, h_hi, relief.mountain_k, system.home.gravity_g)
-		fmt.printfln("недра: плотность %.2f г/см³, ядро %.0f км, в центре %.0f °C и %.0f ГПа, магнитное поле: %v",
-			interior.density, interior.core_km, interior.center_t, interior.center_p, interior.magnetic)
+		fmt.printfln("недра: плотность %.2f г/см³, ядро %.0f км (твёрдое %.0f км), в центре %.0f °C и %.0f ГПа, поле %.0f мкТл",
+			interior.density, interior.core_km, interior.inner_km, interior.center_t, interior.center_p, interior.magnetic_ut)
+		fmt.printfln("атмосфера: %.2f бар, %.1f °C, кислород %.0f кПа; суша и море: океан %.0f%% поверхности (оценка по воде %.0f%%)",
+			hp.atmo.pressure, hp.atmo.t_surface - 273.15, hp.atmo.o2_kpa, relief.ocean_frac * 100, hp.ocean_frac * 100)
 		return
 	}
 	// тесты: высадка у ребра или у вершины; взгляд — в их сторону
@@ -346,9 +360,12 @@ main :: proc() {
 	if !far_init(&far, world.geo, opts.seed) do os.exit(1)
 	defer far_destroy(&far)
 	if opts.view_km > 0 do far.max_dist = opts.view_km * 1000
+	// воздух: выше атмосфера — выше облака и дымка; плотнее — гуще дымка
 	clouds: Clouds
-	if !clouds_init(&clouds, opts.seed, system.home.gravity_g) do os.exit(1)
-	r.haze_height = f32(clamp(HAZE_HEIGHT / max(system.home.gravity_g, 0.1), 400, 6000))
+	air_scale := hp.atmo.scale_h / EARTH_SCALE_H
+	if !clouds_init(&clouds, opts.seed, air_scale) do os.exit(1)
+	r.haze_height = f32(clamp(HAZE_HEIGHT * air_scale, 400, 6000))
+	r.haze_beta = f32(HAZE_BETA * clamp(hp.atmo.density / EARTH_AIR_DENSITY, 0.1, 5))
 	r.seed = opts.seed
 	r.off_far = strings.contains(opts.off, "far")
 	r.off_clouds = strings.contains(opts.off, "clouds")
@@ -567,7 +584,7 @@ main :: proc() {
 		world_update(&world, player.pos, WORLD_BUDGET)
 
 		// небо этого кадра: солнце, луны, свет — по положению планеты и игрока на ней
-		sky_state := astro_sky_at(&astro, &world.geo, player.pos, clock.std_hours + f64(t) * clock_tick_hours(&clock), &star_sky)
+		sky_state := astro_sky_at(&astro, &world.geo, player.pos + {0, opts.alt, 0}, clock.std_hours + f64(t) * clock_tick_hours(&clock), &star_sky)
 
 		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
 		clouds_tick(&clouds, now - start)
@@ -623,7 +640,7 @@ main :: proc() {
 				landing = &landing,
 				globe = &globe,
 				far = &far,
-				interior = &interior,
+				interior = interior,
 				around = around,
 				clouds = &clouds,
 				cloud_shade = f32(cloud_shade),

@@ -35,6 +35,10 @@ Tex :: enum u8 {
 	Granite,
 	Basalt,
 	Peridotite,
+	Ringwoodite,
+	Bridgmanite,
+	Molten_Iron,
+	Iron_Core,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -376,6 +380,58 @@ gen_peridotite :: proc() -> (img: Pixels) {
 	return
 }
 
+// Рингвудит (переходная зона мантии, 410–660 км): оливин под давлением —
+// синеватый, с густо-синими кристаллами.
+@(private = "file")
+gen_ringwoodite :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(52, 58, 78), rgb(60, 68, 92), rgb(70, 78, 106), rgb(80, 90, 120)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.5 * vn(x, y, 4, 180) + 0.5 * h(x, y, 181)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		if h(x, y, 182) > 0.86 do c = rgb(70, 92, 196) // кристаллы
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Бриджманит с ферропериклазом (нижняя мантия): плотный, тёмно-бурый,
+// с тёмными зёрнами.
+@(private = "file")
+gen_bridgmanite :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(62, 50, 42), rgb(72, 58, 48), rgb(82, 66, 54), rgb(94, 76, 62)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.4 * vn(x, y, 2, 190) + 0.6 * h(x, y, 191)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		if h(x, y, 192) < 0.1 do c = rgb(38, 34, 32) // ферропериклаз
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Жидкое железо внешнего ядра: раскалённое добела, с более тёмными струями.
+@(private = "file")
+gen_molten_iron :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(214, 96, 24), rgb(238, 140, 40), rgb(252, 190, 70), rgb(255, 232, 150)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.7 * vn(x, y, 4, 200) + 0.3 * vn(x, y, 2, 201)
+		img[y * TEX_SIZE + x] = pick(pal, stretch(n, 0.15, 0.85))
+	}
+	return
+}
+
+// Железо с никелем (твёрдое внутреннее ядро): металл с отблесками кристаллов.
+@(private = "file")
+gen_iron_core :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(118, 116, 112), rgb(136, 134, 130), rgb(154, 152, 148), rgb(176, 174, 170)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.6 * vn(x, y, 8, 210) + 0.4 * h(x, y, 211)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		if h(x, y, 212) > 0.93 do c = rgb(214, 212, 206) // блеск граней
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
 @(private = "file")
 gen_water :: proc(frame: int) -> (img: Pixels) {
 	pal := []RGBA{{38, 76, 184, 168}, {50, 94, 206, 168}, {66, 114, 222, 172}, {94, 142, 236, 178}}
@@ -457,6 +513,14 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_granite()
 	case .Basalt:
 		return gen_basalt()
+	case .Ringwoodite:
+		return gen_ringwoodite()
+	case .Bridgmanite:
+		return gen_bridgmanite()
+	case .Molten_Iron:
+		return gen_molten_iron()
+	case .Iron_Core:
+		return gen_iron_core()
 	case .Peridotite:
 		return gen_peridotite()
 	case .Water:

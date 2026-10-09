@@ -117,6 +117,10 @@ Astro :: struct {
 	star_r:     f64, // км
 	star_lum:   f64,
 	star_color: [3]f32,
+	star_teff:  f64,
+	// воздух нашей планеты: рассеяние у моря относительно Земли, высота однородной атмосферы, м
+	air_k:      f64,
+	air_h:      f64,
 	// остальные планеты системы (видны на небе блуждающими точками)
 	others:     [MAX_PLANETS]Orbit,
 	other_d:    [MAX_PLANETS]f64, // диаметр, км
@@ -212,6 +216,9 @@ astro_init :: proc(a: ^Astro, s: ^Star_System, start_hour: f64, start_day: int, 
 	a.star_r = s.star.radius * SUN_RADIUS_KM
 	a.star_lum = s.star.luminosity
 	a.star_color = s.star.color
+	a.star_teff = s.star.temperature
+	a.air_k = hp.atmo.rayleigh
+	a.air_h = hp.atmo.scale_h
 
 	// остальные планеты — в той же плоскости, со своими эллипсами
 	for i in 0 ..< s.planet_count {
@@ -222,7 +229,7 @@ astro_init :: proc(a: ^Astro, s: ^Star_System, start_hour: f64, start_day: int, 
 		a.other_d[k] = 2 * p.radius_km
 		a.other_kind[k] = p.kind
 		a.other_idx[k] = i
-		a.other_p[k] = p.kind == .Rocky ? 0.25 : p.kind == .Gas_Giant ? 0.5 : 0.45
+		a.other_p[k] = p.phys ? p.atmo.albedo : p.kind == .Rocky ? 0.25 : p.kind == .Gas_Giant ? 0.5 : 0.45
 		a.other_n += 1
 	}
 
@@ -311,7 +318,8 @@ angle_between :: proc(a, b: [3]f64) -> f64 {
 // Состояние неба в момент T для игрока в точке d (единичный вектор в осях
 // планеты). ex, ez — куда смотрят оси x и z кадра в этой точке (в осях планеты).
 // sky — звёздное небо (свет безлунной ночи); nil — пока не готово.
-astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64, sky: ^Star_Sky = nil) -> (st: Sky_State) {
+// alt — высота наблюдателя над морем, м (выше — воздуха над головой меньше).
+astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64, sky: ^Star_Sky = nil, alt: f64 = 0) -> (st: Sky_State) {
 	theta := a.theta0 + 2 * math.PI * T / a.sidereal
 	xb := a.x0 * math.cos(theta) - a.z0 * math.sin(theta)
 	zb := a.z0 * math.cos(theta) + a.x0 * math.sin(theta)
@@ -418,9 +426,15 @@ astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64, sky: ^Star_Sky = nil)
 	}
 	st.planet_n = a.other_n
 
+	// --- воздух над наблюдателем: рассеяние относительно Земли у моря
+	// (выше — воздуха над головой меньше: небо темнее, закаты бледнее)
+	air := a.air_k > 0 ? a.air_k * math.exp(-max(alt, 0) / max(a.air_h, 100)) : 1
+	h := st.sun_elev
+
 	// --- свет: днём солнце, в сумерках рассеянный свет, ночью луны и звёзды
 	// при полном затмении светят корона и небо за краем тени — как в глубоких сумерках
-	sun_lux := sun_curve(st.sun_elev) * flux * max(st.sun_visible, 1e-5)
+	sun_lux := sun_curve(h) * flux * max(st.sun_visible, 1e-5)
+	if h < 0 do sun_lux *= math.pow(clamp(air, 0.05, 4), 0.7) // сумерки — свет, рассеянный воздухом
 	// безлунная ночь: настоящие звёзды и полоса галактики (пока небо считается — средняя оценка)
 	st.night_lux = sky != nil && sky.ready ? starsky_night_lux(sky, st.uni_to_frame) : NIGHT_LUX
 	st.lux = sun_lux + moon_lux + st.night_lux
@@ -431,41 +445,48 @@ astro_update :: proc(a: ^Astro, T: f64, d, ex, ez: [3]f64, sky: ^Star_Sky = nil)
 	level := clamp((math.log10(st.lux) + 3.2) / 8.2, 0, 1)
 	bright := math.pow(level, 1.6)
 	st.brightness = f32(bright)
-	// цвет: звезда (глаз наполовину привыкает к её цвету), у горизонта — краснее;
-	// в сумерках — синеватый рассеянный свет; луна — голубоватая
+	// цвет: звезда (глаз наполовину привыкает к её цвету), у горизонта — краснее
+	// (свет идёт сквозь толщу воздуха: синий рассеивается); в сумерках —
+	// синеватый рассеянный свет; луна — голубоватая
 	star_c := [3]f64{f64(a.star_color.r), f64(a.star_color.g), f64(a.star_color.b)}
 	star_c = [3]f64{1, 1, 1} * 0.65 + star_c / max(star_c.r, star_c.g, star_c.b) * 0.35
-	redden := 1 - smooth(0, 12, st.sun_elev)
+	redden := 1 - smooth(0, 12, h)
 	sun_c := star_c * ([3]f64{1, 1, 1} * (1 - redden * 0.6) + [3]f64{1, 0.55, 0.3} * redden * 0.6)
+	sun_c *= air_tint(air, airmass(h), 0.5)
 	twilight_c := [3]f64{0.62, 0.7, 1.0}
-	sun_w := st.sun_elev > 0 ? sun_lux : 0
-	tw_w := st.sun_elev > 0 ? 0 : sun_lux
+	sun_w := h > 0 ? sun_lux : 0
+	tw_w := h > 0 ? 0 : sun_lux
 	col := sun_c * sun_w + twilight_c * tw_w + [3]f64{0.65, 0.75, 1.0} * moon_lux + [3]f64{0.55, 0.6, 0.85} * st.night_lux
 	col /= max(col.r * 0.3 + col.g * 0.59 + col.b * 0.11, 1e-9)
 	for k in 0 ..< 3 do st.light[k] = f32(min(col[k] * bright, 1))
 	st.desat = f32(1 - smooth(0.03, 0.3, bright))
 	st.sun_color = {f32(sun_c.r), f32(sun_c.g), f32(sun_c.b)}
 
-	// --- цвета неба
-	h := st.sun_elev
+	// --- цвета неба: рассеяние света нашей звезды в нашем воздухе (относительно
+	// Земли и Солнца — у них цвета прежние): разреженный воздух — небо темнее
+	// и глубже, плотный — бледнее и белее у горизонта; у красной звезды небо
+	// менее синее, у горячей — густо-синее
 	day_k := smooth(-4, 10, h) * st.sun_visible
 	tw_k := smooth(-18, -4, h) * (0.3 + 0.7 * st.sun_visible)
 	moon_k := min(moon_lux / FULL_MOON_LUX, 2) * 0.5
-	tint := [3]f64{1, 1, 1} * 0.75 + star_c * 0.25
-	night_top := [3]f64{0.004, 0.006, 0.012} + [3]f64{0.03, 0.045, 0.09} * moon_k
-	night_hor := [3]f64{0.008, 0.01, 0.02} + [3]f64{0.05, 0.065, 0.11} * moon_k
-	tw_top := [3]f64{0.07, 0.1, 0.22}
-	tw_hor := [3]f64{0.4, 0.33, 0.4}
-	day_top := [3]f64{f64(SKY_TOP.r), f64(SKY_TOP.g), f64(SKY_TOP.b)} * tint
-	day_hor := [3]f64{f64(SKY_HORIZON.r), f64(SKY_HORIZON.g), f64(SKY_HORIZON.b)} * tint
+	sky_top_k, sky_hor_k := sky_ratio(air, a.star_teff, airmass(max(h, 5)))
+	tw_air := math.pow(clamp(air, 0.05, 4), 0.3)
+	night_top := [3]f64{0.004, 0.006, 0.012} + [3]f64{0.03, 0.045, 0.09} * moon_k * tw_air
+	night_hor := [3]f64{0.008, 0.01, 0.02} + [3]f64{0.05, 0.065, 0.11} * moon_k * tw_air
+	tw_top := [3]f64{0.07, 0.1, 0.22} * tw_air
+	tw_hor := [3]f64{0.4, 0.33, 0.4} * tw_air
+	day_top := [3]f64{f64(SKY_TOP.r), f64(SKY_TOP.g), f64(SKY_TOP.b)} * sky_top_k
+	day_hor := [3]f64{f64(SKY_HORIZON.r), f64(SKY_HORIZON.g), f64(SKY_HORIZON.b)} * sky_hor_k
 	top := math.lerp(math.lerp(night_top, tw_top, tw_k), day_top, day_k)
 	hor := math.lerp(math.lerp(night_hor, tw_hor, tw_k), day_hor, day_k)
-	st.sky_top = {f32(top.r), f32(top.g), f32(top.b)}
-	st.sky_horizon = {f32(hor.r), f32(hor.g), f32(hor.b)}
+	st.sky_top = {f32(min(top.r, 1)), f32(min(top.g, 1)), f32(min(top.b, 1))}
+	st.sky_horizon = {f32(min(hor.r, 1)), f32(min(hor.g, 1)), f32(min(hor.b, 1))}
+	// зарево заката: свет солнца сквозь всю толщу воздуха вдоль горизонта
 	g := math.exp(-((h - 0.5) / 4.5) * ((h - 0.5) / 4.5)) * st.sun_visible
 	if h > 0 do g += (1 - st.sun_visible) * 0.6 // затмение: горизонт светится по кругу
-	gc := [3]f64{1.0, 0.42, 0.12} * 0.7 + star_c * [3]f64{1.0, 0.42, 0.12} * 0.3
-	st.glow = {f32(gc.r), f32(gc.g), f32(gc.b), f32(g * 0.85)}
+	g *= math.sqrt(clamp(air, 0.05, 3))
+	gc := ([3]f64{1.0, 0.42, 0.12} * 0.7 + star_c * [3]f64{1.0, 0.42, 0.12} * 0.3) * air_tint(air, 20, 0.5)
+	st.glow = {f32(gc.r), f32(gc.g), f32(gc.b), f32(min(g * 0.85, 1.2))}
 
 	// --- время: среднее местное время по долготе игрока
 	lam := math.atan2(d.x, d.z) // долгота, (-PI, PI]: на 180° — линия перемены дат
@@ -536,7 +557,7 @@ astro_sky_at :: proc(a: ^Astro, g: ^Planet_Geo, pos: [3]f64, T: f64, sky: ^Star_
 	d := geo_frame_dir(g, pos.x, pos.z)
 	ex := norm3(geo_frame_dir(g, pos.x + 8, pos.z) - d)
 	ez := norm3(geo_frame_dir(g, pos.x, pos.z + 8) - d)
-	return astro_update(a, T, d, ex, ez, sky)
+	return astro_update(a, T, d, ex, ez, sky, pos.y - Y_SEA)
 }
 
 SEASON_NAMES := [4]string{"весна", "лето", "осень", "зима"}
@@ -554,4 +575,61 @@ moon_phase_name :: proc(m: ^Sky_Moon) -> string {
 		return m.waxing ? "растущий серп" : "убывающий серп"
 	}
 	return m.waxing ? "растущая" : "убывающая"
+}
+
+// ---------------------------------------------------------------- цвет воздуха
+
+// Рэлеевское рассеяние у Земли (у моря, в зенит) в красном, зелёном и синем: τ ∝ λ^−4.
+@(private = "file")
+TAU_EARTH := [3]f64{0.042, 0.0986, 0.245}
+@(private = "file")
+BAND_UM := [3]f64{0.68, 0.55, 0.44}
+
+// Сколько воздуха на пути луча от солнца на высоте h (градусы): 1 — в зените, ~38 — у горизонта.
+@(private = "file")
+airmass :: proc(h: f64) -> f64 {
+	hh := max(h, -1)
+	return min(1 / (math.sin(math.to_radians(hh)) + 0.50572 * math.pow(hh + 6.07995, -1.6364)), 40)
+}
+
+// Свет звезды в трёх цветах относительно Солнца (по Планку).
+@(private = "file")
+star_bands :: proc(teff: f64) -> (out: [3]f64) {
+	b :: proc(l, t: f64) -> f64 {return 1 / (math.pow(l, 5) * (math.exp(14388 / (l * t)) - 1))}
+	t := teff > 0 ? teff : 5772
+	for k in 0 ..< 3 do out[k] = b(BAND_UM[k], t) / b(BAND_UM[k], 5772)
+	return
+}
+
+// Как пропускание воздуха air (Земля = 1) окрашивает солнце при пути m —
+// относительно Земли; soft смягчает (глаз привыкает). Ярче всех — 1.
+@(private = "file")
+air_tint :: proc(air, m, soft: f64) -> [3]f64 {
+	out: [3]f64
+	for k in 0 ..< 3 do out[k] = math.exp(-(air - 1) * TAU_EARTH[k] * m * soft)
+	return out / max(out[0], out[1], out[2])
+}
+
+// Цвет неба в зените и у горизонта относительно земного (однократное
+// рассеяние): воздух air, звезда teff, солнце на пути m. Яркость меняется
+// мягче, чем в жизни, — глаз привыкает.
+@(private = "file")
+sky_ratio :: proc(air, teff, m: f64) -> (top, hor: [3]f64) {
+	zenith :: proc(tau, m: f64) -> f64 {
+		if abs(m - 1) < 1e-3 do return tau * math.exp(-tau)
+		return math.exp(-tau) * (1 - math.exp(-tau * (m - 1))) / (m - 1)
+	}
+	horizon :: proc(tau, m: f64) -> f64 {
+		return (1 - math.exp(-tau * 12)) * math.exp(-tau * m * 0.5)
+	}
+	star := star_bands(teff)
+	for k in 0 ..< 3 {
+		light := math.sqrt(star[k]) // глаз наполовину привыкает к цвету звезды
+		top[k] = light * zenith(TAU_EARTH[k] * air, m) / zenith(TAU_EARTH[k], m)
+		hor[k] = light * horizon(TAU_EARTH[k] * air, m) / horizon(TAU_EARTH[k], m)
+	}
+	lum :: proc(c: [3]f64) -> f64 {return max(c[0] * 0.3 + c[1] * 0.59 + c[2] * 0.11, 1e-6)}
+	top /= math.sqrt(lum(top))
+	hor /= math.sqrt(lum(hor))
+	return
 }

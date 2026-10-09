@@ -247,7 +247,7 @@ strata :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
 		band := i32(math.floor((f32(y) + col.warp[i]) / 7))
 		return eng.hash2(band, 0, seed + 77) % 3 == 0 ? .Limestone : .Sandstone
 	}
-	if y < col.moho do return .Peridotite
+	if y < col.moho do return deep_block(y)
 	return col.oceanic ? .Basalt : .Granite
 }
 
@@ -429,4 +429,46 @@ find_mountain_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
 	search(w, &best, &best_h, best.x, best.y, 300, 10)
 	search(w, &best, &best_h, best.x, best.y, 16, 1)
 	return {f64(best.x) + 0.5, f64(best_h) + 1, f64(best.y) + 0.5}
+}
+
+// Глубже коры — по строению планеты (interior.odin): глубины границ под
+// уровнем моря, м. Задаются один раз при старте, до фоновых потоков.
+Deep_Rock :: struct {
+	transition, lower, core, inner: f64,
+}
+
+deep_rock := Deep_Rock{1e18, 1e18, 1e18, 1e18}
+
+deep_rock_init :: proc(pi: ^Planet_Interior) {
+	deep_rock = {1e18, 1e18, 1e18, 1e18}
+	for l in pi.layers[:pi.n] {
+		d := l.top_km * 1000
+		#partial switch l.kind {
+		case .Transition:
+			deep_rock.transition = min(deep_rock.transition, d)
+		case .Lower_Mantle, .D2:
+			deep_rock.lower = min(deep_rock.lower, d)
+		case .Outer_Core, .Core_Liquid:
+			deep_rock.core = min(deep_rock.core, d)
+		case .Inner_Core, .Core_Solid:
+			deep_rock.core = min(deep_rock.core, d)
+			deep_rock.inner = min(deep_rock.inner, d)
+		}
+	}
+}
+
+// Порода мантии и ядра на высоте y (ниже коры).
+deep_block :: proc(y: i32) -> Block {
+	d := Y_SEA - f64(y)
+	switch {
+	case d >= deep_rock.inner:
+		return .Iron_Core
+	case d >= deep_rock.core:
+		return .Molten_Iron
+	case d >= deep_rock.lower:
+		return .Bridgmanite
+	case d >= deep_rock.transition:
+		return .Ringwoodite
+	}
+	return .Peridotite
 }

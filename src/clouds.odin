@@ -38,7 +38,8 @@ Clouds :: struct {
 	time:        f64,
 }
 
-clouds_init :: proc(c: ^Clouds, seed: u32, gravity_g: f64) -> bool {
+// air_scale — высота однородной атмосферы относительно Земли (облака выше на «высокой» атмосфере).
+clouds_init :: proc(c: ^Clouds, seed: u32, air_scale: f64) -> bool {
 	p := eng.shader_create("clouds", CLOUD_VS, CLOUD_FS) or_return
 	loc :: eng.uniform_loc
 	c.prog = p
@@ -51,7 +52,7 @@ clouds_init :: proc(c: ^Clouds, seed: u32, gravity_g: f64) -> bool {
 		pcs       = loc(p, "u_pcs"),
 	}
 	r := eng.rng_make(u64(seed) * 0x5DEECE66D + 77)
-	c.height = clamp(1600 / max(gravity_g, 0.1), 800, 4000) * eng.rng_range(&r, 0.85, 1.15)
+	c.height = clamp(1600 * air_scale, 800, 4000) * eng.rng_range(&r, 0.85, 1.15)
 	c.cover = eng.rng_range(&r, 0.25, 0.7)
 	c.offset = {eng.rng_range(&r, 0, 997), eng.rng_range(&r, 0, 997), eng.rng_range(&r, 0, 997)}
 	w := [3]f64{eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1)}

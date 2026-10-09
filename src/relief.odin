@@ -4,7 +4,7 @@ package main
 //
 // Высота поверхности над уровнем моря в метрах — функция точки шара:
 //  * поле материков (тысячи км): выше порога — суша, ниже — океан; порог
-//    подобран так, чтобы доля океана была такой, какая выпала миру;
+//    подобран так, чтобы вода планеты (её объём) заполнила впадины (0.013);
 //  * океан: шельф 100–200 м у берегов, материковый склон, равнины дна на
 //    3–5 км, редкие жёлоба до ~10 км, холмы дна;
 //  * суша: низменности и равнины, плато в 1–2 км, горные пояса — длинные
@@ -20,7 +20,7 @@ import "core:slice"
 import eng "engine"
 
 Relief :: struct {
-	ocean_frac: f64, // доля поверхности под океаном (у каждого мира своя)
+	ocean_frac: f64, // доля поверхности под океаном (из запаса воды планеты)
 	thr:        f64, // порог поля материков: выше — суша
 	mountain_k: f64, // масштаб гор: на лёгкой планете — выше
 	depth_k:    f64, // масштаб глубин океана
@@ -34,7 +34,9 @@ relief: Relief
 ROCK_LINE :: 2800.0 // выше — голые скалы, м над морем
 TREE_LINE :: 2400.0 // выше деревья не растут
 
-relief_init :: proc(seed: u32, radius: f64, gravity_g: f64) {
+// water_m3 — объём воды на поверхности: доля океана выходит такой, чтобы
+// вода заполнила впадины рельефа (0 — случайная, как до 0.013).
+relief_init :: proc(seed: u32, radius: f64, gravity_g: f64, water_m3: f64 = 0) {
 	r := eng.rng_make(u64(seed) ~ 0x0CEA_11F5)
 	relief.ocean_frac = eng.rng_range(&r, 0.1, 0.92)
 	relief.mountain_k = clamp(1 / gravity_g, 0.55, 2.5)
@@ -43,6 +45,7 @@ relief_init :: proc(seed: u32, radius: f64, gravity_g: f64) {
 	relief.h_min = -12000 * relief.depth_k
 	// порог — квантиль поля материков по равномерным точкам шара
 	N :: 4096
+	pts := make([][3]f64, N, context.temp_allocator)
 	vals := make([]f64, N, context.temp_allocator)
 	s := i64(seed)
 	for i in 0 ..< N {
@@ -50,10 +53,30 @@ relief_init :: proc(seed: u32, radius: f64, gravity_g: f64) {
 		y := 1 - (f64(i) + 0.5) / N * 2
 		rr := math.sqrt(1 - y * y)
 		a := f64(i) * 2.399963229728653
-		vals[i] = continent(s, {math.cos(a) * rr, y, math.sin(a) * rr} * radius, 20_000)
+		pts[i] = {math.cos(a) * rr, y, math.sin(a) * rr} * radius
+		vals[i] = continent(s, pts[i], 20_000)
 	}
 	slice.sort(vals)
 	relief.thr = vals[clamp(int(relief.ocean_frac * N), 0, N - 1)]
+	if water_m3 <= 0 do return
+	// объём впадин ниже уровня моря при данной доле океана — растёт с ней
+	volume :: proc(s: i64, pts: [][3]f64, radius: f64) -> f64 {
+		sum := 0.0
+		for i := 0; i < len(pts); i += 2 do sum += max(-elevation(s, pts[i], 20_000), 0)
+		return sum / f64(len(pts) / 2) * 4 * math.PI * radius * radius
+	}
+	lo, hi := N / 50, N - N / 50
+	for hi - lo > 1 {
+		mid := (lo + hi) / 2
+		relief.thr = vals[mid]
+		if volume(s, pts, radius) < water_m3 {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	relief.ocean_frac = f64(hi) / N
+	relief.thr = vals[hi]
 }
 
 @(private = "file")
