@@ -205,7 +205,7 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 				p.blocks[pidx(px, y, pz)] = column_guess(col, ci, wy)
 			}
 		}
-		p.light_h[(pz + 1) * P + (px + 1)] = col.sky[ci] - y0
+		p.light_h[(pz + 1) * P + (px + 1)] = (w.bare ? col.sky_bare[ci] : col.sky[ci]) - y0
 		p.tint[(pz + 1) * P + (px + 1)] = col.tint[ci]
 	}
 }
@@ -218,12 +218,14 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 		chunk_mesh_upload(&c.opaque_mesh, opaque_verts[:])
 		chunk_mesh_upload(&c.water_mesh, water_verts[:])
 		c.meshed = true
+		c.stale = false
 		return
 	}
 	p := &scratch
 	fill_padded(w, c, p)
 
 	x0 := c.key.x * CHUNK_SIZE
+	y0 := c.key.y * CHUNK_SIZE
 	z0 := c.key.z * CHUNK_SIZE
 	for y in i32(0) ..< CHUNK_SIZE do for z in i32(0) ..< CHUNK_SIZE do for x in i32(0) ..< CHUNK_SIZE {
 		b := p.blocks[pidx(x, y, z)]
@@ -232,11 +234,15 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 		switch info.render {
 		case .None:
 		case .Cube, .Leaves:
+			// у листвы — свой номер блока (0…15): листопад идёт блоками
+			flags: u16 = info.render == .Leaves ? u16(eng.hash3(x0 + x, y0 + y, z0 + z, w.seed ~ 0x1EAF) & 15) << 1 : 0
 			for face in Face {
 				d := FACE_DIR[face]
 				nb := pb(p, x + d.x, y + d.y, z + d.z)
 				if BLOCK_INFO[nb].opaque do continue
-				emit_cube_face(&opaque_verts, p, x, y, z, face, u8(info.tex[face]), 0, 16)
+				// внутри вечнозелёной кроны грани между листьями не видны (голых веток зимой нет)
+				if nb == b && evergreen_leaves(b) do continue
+				emit_cube_face(&opaque_verts, p, x, y, z, face, u8(info.tex[face]), flags, 16)
 			}
 		case .Cross:
 			emit_cross(&opaque_verts, p, x, y, z, u8(info.tex[.Up]), x0 + x, z0 + z, w.seed)
@@ -254,6 +260,7 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 	chunk_mesh_upload(&c.opaque_mesh, opaque_verts[:])
 	chunk_mesh_upload(&c.water_mesh, water_verts[:])
 	c.meshed = true
+	c.stale = false
 }
 
 // Общий индексный буфер для квадов: 0,1,2, 0,2,3 со сдвигом 4.

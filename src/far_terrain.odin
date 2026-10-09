@@ -385,19 +385,16 @@ far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_
 	broad := mix3(grass_tint_rgb(pal.oak, dry * 0.5, cold * 0.5), grass_tint_rgb(pal.birch, dry * 0.5, cold * 0.5), birch)
 	crown := broad
 	spruce := 0.0
-	rise := 5.5
+	rise := canopy_height(bc) // высота полога — та же, что у деревьев из блоков (trees.odin)
 	#partial switch biome {
 	case .Taiga:
 		spruce = 0.85
-		rise = 8
 	case .Temperate_Forest:
 		if bc.k.code[0] == 'D' do spruce = 0.35
 	case .Savanna:
 		crown = pal.acacia
-		rise = 4
 	case .Rainforest:
 		crown = pal.jungle
-		rise = 13
 	}
 	crown = mix3(crown, pal.spruce, spruce)
 	col = mix3(col, crown * 0.85, crowns * 0.9)

@@ -24,7 +24,7 @@ CHUNK_VOLUME :: CHUNK_AREA * CHUNK_SIZE
 SEA_LEVEL :: 62
 VIEW_ABOVE :: 192 // поверхность выше игрока грузится до стольких блоков
 VIEW_BELOW :: 400 // ниже — до стольких (из капсулы на 360 м земля уже из блоков)
-MAX_COL_TREES :: 32
+MAX_COL_TREES :: 96
 
 Chunk_Key :: struct {
 	face:    Cube_Face,
@@ -41,15 +41,22 @@ Chunk :: struct {
 	blocks:      ^[CHUNK_VOLUME]Block, // nil — вся секция из fill
 	fill:        Block,
 	meshed:      bool,
+	stale:       bool, // меш есть, но свет изменился (облетели кроны) — перестроить, когда будет время
 	opaque_mesh: Chunk_Mesh,
 	water_mesh:  Chunk_Mesh,
 }
 
+// Дерево (trees.odin): форма строится из этих чисел и зерна.
 Tree :: struct {
-	x, z:   i32, // клетка ствола (сетка грани)
-	base:   i32, // первый блок ствола
-	height: i32,
-	kind:   Tree_Kind,
+	x, z:       i32, // клетка ствола (сетка грани); у толстого — младший угол 2×2
+	base:       i32, // первый блок ствола (над землёй)
+	height:     f32, // высота, м
+	crown:      f32, // радиус кроны, м
+	crown_base: f32, // низ кроны над землёй, м
+	kind:       Tree_Kind,
+	girth:      u8, // толщина ствола, блоков (1 или 2)
+	fins:       u8, // досковидные корни (тропические великаны)
+	seed:       u32,
 }
 
 Tree_Kind :: enum u8 {
@@ -69,6 +76,7 @@ Column :: struct {
 	monolith: [CHUNK_AREA]bool, // столп аномалии
 	points:   [CHUNK_AREA][3]f64, // точки шара (шум трав и цветов)
 	sky:      [CHUNK_AREA]i32, // первый y, куда достаёт небесный свет
+	sky_bare: [CHUNK_AREA]i32, // то же, когда лиственные кроны голые (зима)
 	trees:    [MAX_COL_TREES]Tree, // деревья, чья листва задевает колонку
 	tree_n:   int,
 	lo, hi:   i32, // полоса поверхности, блоки
@@ -97,6 +105,7 @@ World :: struct {
 	edits:       map[Chunk_Key][dynamic]Block_Edit,
 	gravity:     f64, // сила тяжести планеты, g (1 — земная)
 	jump_apex:   f64, // высота прыжка при этой силе тяжести, блоков
+	bare:        bool, // лиственные кроны вокруг игрока сейчас голые — свет неба проходит сквозь них
 }
 
 // Сила тяжести планеты: падение и прыжки. Высота прыжка считается теми же
@@ -238,7 +247,8 @@ world_sky_light :: proc(w: ^World, x, y, z: i32) -> f32 {
 	if !ok do return 1
 	col := world_column(w, column_key_of(face, gx, gz))
 	if col == nil do return 1
-	return y >= col.sky[column_index(gx, gz)] ? 1 : SHADOW_LIGHT
+	sky := w.bare ? col.sky_bare[column_index(gx, gz)] : col.sky[column_index(gx, gz)]
+	return y >= sky ? 1 : SHADOW_LIGHT
 }
 
 ensure_column :: proc(w: ^World, key: Column_Key) -> (col: ^Column, created: bool) {
@@ -305,15 +315,18 @@ world_set_block :: proc(w: ^World, x, y, z: i32, b: Block) {
 	col.lo = min(col.lo, y)
 	col.hi = max(col.hi, y)
 	i := column_index(gx, gz)
-	if BLOCK_INFO[b].blocks_light {
-		col.sky[i] = max(col.sky[i], y + 1)
-	} else if y == col.sky[i] - 1 {
-		yy := y - 1
-		for ; yy > y - 512; yy -= 1 {
-			bb, _ := global_get_block(w, face, gx, yy, gz)
-			if BLOCK_INFO[bb].blocks_light do break
+	for bare in ([2]bool{false, true}) {
+		sky := bare ? &col.sky_bare[i] : &col.sky[i]
+		if BLOCK_INFO[b].blocks_light && !(bare && deciduous_leaves(b)) {
+			sky^ = max(sky^, y + 1)
+		} else if y == sky^ - 1 {
+			yy := y - 1
+			for ; yy > y - 512; yy -= 1 {
+				bb, _ := global_get_block(w, face, gx, yy, gz)
+				if BLOCK_INFO[bb].blocks_light && !(bare && deciduous_leaves(bb)) do break
+			}
+			sky^ = yy + 1
 		}
-		col.sky[i] = yy + 1
 	}
 	// соседи тоже: их AO и грани на границе зависят от этого блока
 	for dy in i32(-1) ..= 1 do for dz in i32(-1) ..= 1 do for dx in i32(-1) ..= 1 {
@@ -361,8 +374,8 @@ world_update :: proc(w: ^World, center: [3]f64, budget_sec: f64) -> (all_ready: 
 			covered = true
 			key := Chunk_Key{col.key.face, col.key.x, sy, col.key.z}
 			c, _ := ensure_chunk(w, key)
-			if c.meshed do continue
-			done = false
+			if c.meshed && !c.stale do continue
+			if !c.meshed do done = false // устаревший меш пока рисуется — дальний рельеф здесь не нужен
 			all_ready = false
 			// для сетки нужны соседи (AO и грани на границе), в т.ч. через рёбра;
 			// вне полосы поверхности сосед сплошной — его строить не нужно

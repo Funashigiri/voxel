@@ -884,6 +884,7 @@ page_climate :: proc(p: ^Panel, fp: ^Frame_Params) {
 		wind := lc.cp.wind > 0 ? "с востока" : "с запада"
 		panel_line(p, WHITE, fmt.tprintf("граница леса здесь ~%s, вечные снега ~%s над морем; от моря: материковость %.0f%%, ветер чаще %s",
 			dist_text(max(tree, 0)), dist_text(max(snowline, 0)), lc.cp.cont * 100, wind))
+		if s := zone_trees_text(&lc.bc); s != "" do panel_line(p, WHITE, s)
 		panel_gap(p)
 		// по месяцам года планеты
 		p.cols = MONTH_COLS[:]

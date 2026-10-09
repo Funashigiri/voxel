@@ -54,6 +54,9 @@ Tex :: enum u8 {
 	Cactus_Side,
 	Cactus_Top,
 	Dead_Bush,
+	// деревья (0.016): голые ветви в кроне зимой
+	Oak_Twigs,
+	Birch_Twigs,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -232,6 +235,37 @@ gen_leaves :: proc(pal: []RGBA, seed: u32) -> (img: Pixels) {
 		img[y * TEX_SIZE + x] = c
 	}
 	return
+}
+
+// Голая крона: тонкие веточки (в пиксель) ветвятся от нескольких побегов.
+// Прозрачные пиксели — того же цвета, чтобы вдали (в мипмапах) крона была
+// цвета веточек, а не тёмной каймой.
+@(private = "file")
+gen_twigs :: proc(pal: []RGBA, seed: u32) -> (img: Pixels) {
+	bg := pal[1]
+	for &px in img do px = {bg.r, bg.g, bg.b, 0}
+	r := eng.rng_make(u64(seed))
+	for _ in 0 ..< 3 {
+		twig(&img, &r, pal, eng.rng_range(&r, 0, TEX_SIZE), eng.rng_range(&r, 0, TEX_SIZE), eng.rng_range(&r, 0, math.TAU), 12, 2)
+	}
+	return
+}
+
+@(private = "file")
+twig :: proc(img: ^Pixels, r: ^eng.Rng, pal: []RGBA, x, y, ang: f64, n, depth: int) {
+	px, py, a := x, y, ang
+	for _ in 0 ..< n {
+		ix := int(math.floor(px)) & (TEX_SIZE - 1)
+		iy := int(math.floor(py)) & (TEX_SIZE - 1)
+		img[iy * TEX_SIZE + ix] = pal[eng.rng_int(r, 0, len(pal) - 1)]
+		if depth > 0 && eng.rng_f64(r) < 0.25 {
+			side := eng.rng_f64(r) < 0.5 ? -1.0 : 1.0
+			twig(img, r, pal, px, py, a + side * eng.rng_range(r, 0.5, 1.0), n / 2, depth - 1)
+		}
+		a += eng.rng_range(r, -0.3, 0.3)
+		px += math.cos(a)
+		py += math.sin(a)
+	}
 }
 
 @(private = "file")
@@ -632,6 +666,10 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_cactus_top()
 	case .Dead_Bush:
 		return gen_dead_bush()
+	case .Oak_Twigs:
+		return gen_twigs([]RGBA{rgb(78, 70, 60), rgb(92, 82, 70), rgb(104, 93, 80), rgb(118, 106, 92)}, 330)
+	case .Birch_Twigs:
+		return gen_twigs([]RGBA{rgb(70, 44, 36), rgb(84, 54, 44), rgb(98, 64, 52), rgb(112, 76, 62)}, 340)
 	case .Water:
 		return gen_water(0)
 	}

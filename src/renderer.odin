@@ -14,7 +14,7 @@ Chunk_Shader :: struct {
 	prog:                                                 u32,
 	u_view_proj, u_origin, u_time, u_atlas, u_alpha_cutoff: i32,
 	u_fog, u_rot, u_side_shade:                           i32,
-	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c: i32,
+	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c, u_layer_d, u_chunk_id: i32,
 }
 
 Entity_Shader :: struct {
@@ -120,6 +120,8 @@ renderer_init :: proc(r: ^Renderer) -> bool {
 			u_layer_a      = loc(p, "u_layer_a"),
 			u_layer_b      = loc(p, "u_layer_b"),
 			u_layer_c      = loc(p, "u_layer_c"),
+			u_layer_d      = loc(p, "u_layer_d"),
+			u_chunk_id     = loc(p, "u_chunk_id"),
 		}
 	}
 	{
@@ -392,6 +394,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_vec4(r.chunk.u_layer_a, {f32(Tex.Grass_Top), f32(Tex.Grass_Side), f32(Tex.Tall_Grass), f32(Tex.Oak_Leaves)})
 	eng.set_vec4(r.chunk.u_layer_b, {f32(Tex.Birch_Leaves), f32(Tex.Spruce_Leaves), f32(Tex.Acacia_Leaves), f32(Tex.Jungle_Leaves)})
 	eng.set_vec4(r.chunk.u_layer_c, {f32(Tex.Dandelion), f32(Tex.Poppy), -1, -1})
+	eng.set_vec4(r.chunk.u_layer_d, {f32(Tex.Oak_Twigs), f32(Tex.Birch_Twigs), -1, -1})
 	set_sky_uniforms(r, r.chunk.prog)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.atlas)
@@ -419,6 +422,8 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		eng.set_vec4(r.chunk.u_rot, v.rot)
 		eng.set_vec4(r.chunk.u_season, v.season)
 		eng.set_f32(r.chunk.u_chunk_alt, f32(f64(v.chunk.key.y * CHUNK_SIZE) - Y_SEA))
+		k := v.chunk.key
+		eng.set_vec3(r.chunk.u_chunk_id, {f32(k.x & 1023), f32(k.y & 1023), f32(k.z & 1023)})
 		chunk_mesh_draw(&v.chunk.opaque_mesh)
 	}
 	r.chunks_drawn = len(visible)

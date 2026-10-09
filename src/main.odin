@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.015"
+VERSION :: "0.016"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -40,6 +40,7 @@ Options :: struct {
 	water_spawn:   bool, // появиться над водой
 	mountain_spawn: bool, // появиться над горами
 	cliff_spawn:   bool, // у самого крутого обрыва (слои пород)
+	tree_spawn:    bool, // у большого лиственного дерева, лицом к нему
 	has_latlon:    bool, // высадка в заданной точке планеты
 	lat, lon:      f64,
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
@@ -155,6 +156,7 @@ parse_options :: proc() -> (o: Options) {
 			o.water_spawn = val == "water"
 			o.mountain_spawn = val == "mountain"
 			o.cliff_spawn = val == "cliff"
+			o.tree_spawn = val == "tree"
 		case "-latlon":
 			las, _, los := strings.partition(val, ",")
 			o.lat = strconv.parse_f64(las) or_else 40
@@ -302,6 +304,7 @@ main :: proc() {
 		climate_key = {home.star.seed, u64(home.planet)}
 	}
 	world_climate_reset()
+	trees_reset()
 	// строение планеты (кора, мантия, ядро) — из массы, состава, возраста; глубже коры блоки идут по нему
 	interior := interior_make(body_interior_input(&system, &hp.body))
 	defer free(interior)
@@ -338,6 +341,10 @@ main :: proc() {
 		sk, _, _ := climate_classify(&climate, &scp)
 		fmt.printfln("климат: в среднем %.1f °C, экватор %.1f, полюса %.1f и %.1f; ячейка Хэдли до %.0f°, осадков %.0f мм в год; место высадки (%.1f°, %.1f°) — %s, %s",
 			climate.global_t, climate.equator_t, climate.pole_n_t, climate.pole_s_t, climate.hadley, climate.global_p, lat, lon, koppen_text(sk), BIOME_NAMES[sk.biome])
+		tw: World
+		world_init(&tw, opts.seed, 1, geo)
+		defer world_destroy(&tw)
+		if trees_selftest(&tw, site_x, site_z) > 0 do os.exit(1)
 		return
 	}
 	// тесты: высадка у ребра или у вершины; взгляд — в их сторону
@@ -418,7 +425,15 @@ main :: proc() {
 		spawn, test_yaw = find_cliff_spawn(&world, sx, sz)
 		has_test_yaw = true
 	}
+	if opts.tree_spawn {
+		if p, yaw, ok := find_tree_spawn(&world, sx, sz); ok {
+			spawn, test_yaw = p, yaw
+			has_test_yaw = true
+		}
+	}
 	if opts.anomaly_dist > 0 || opts.edge_dist > 0 do spawn = spawn_at(&world, sx, sz)
+	// зимой лиственные кроны голые — свет неба под ними не гаснет
+	world.bare = leaves_bare_at(&world, spawn, climate_season(&astro, clock.std_hours))
 	for !spawn_area_ready(&world, spawn, 2) {
 		world_update(&world, spawn, 0.1)
 		free_all(context.temp_allocator)
@@ -625,6 +640,11 @@ main :: proc() {
 		// небо этого кадра: солнце, луны, свет — по положению планеты и игрока на ней
 		season := climate_season(&astro, clock.std_hours + f64(t) * clock_tick_hours(&clock))
 		sky_state := astro_sky_at(&astro, &world.geo, player.pos + {0, opts.alt, 0}, clock.std_hours + f64(t) * clock_tick_hours(&clock), &star_sky)
+		// облетели или распустились кроны — свет неба под ними другой: секции перестроятся
+		if b := leaves_bare_at(&world, player.pos, season); b != world.bare {
+			world.bare = b
+			for _, c in world.chunks do if c.meshed do c.stale = true
+		}
 
 		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
 		clouds_tick(&clouds, now - start)

@@ -42,6 +42,12 @@ Block :: enum u8 {
 	Jungle_Leaves,
 	Cactus,
 	Dead_Bush,
+	// деревья (0.016): сучья и ветви — кора со всех сторон
+	Oak_Wood,
+	Birch_Wood,
+	Spruce_Wood,
+	Acacia_Wood,
+	Jungle_Wood,
 }
 
 // Русские названия (F3: что под ногами).
@@ -82,6 +88,11 @@ BLOCK_NAMES := [Block]string {
 	.Jungle_Leaves = "листва тропического дерева",
 	.Cactus       = "кактус",
 	.Dead_Bush    = "сухой куст",
+	.Oak_Wood     = "ветвь дуба",
+	.Birch_Wood   = "ветвь берёзы",
+	.Spruce_Wood  = "ветвь ели",
+	.Acacia_Wood  = "ветвь акации",
+	.Jungle_Wood  = "ветвь тропического дерева",
 }
 
 Render_Kind :: enum u8 {
@@ -166,6 +177,11 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Dead_Bush] = {render = .Cross, tex = all_faces(.Dead_Bush)}
 	BLOCK_INFO[.Oak_Log] = cube(column_faces(.Oak_Log, .Oak_Log_Top, .Oak_Log_Top))
 	BLOCK_INFO[.Birch_Log] = cube(column_faces(.Birch_Log, .Birch_Log_Top, .Birch_Log_Top))
+	BLOCK_INFO[.Oak_Wood] = cube(all_faces(.Oak_Log))
+	BLOCK_INFO[.Birch_Wood] = cube(all_faces(.Birch_Log))
+	BLOCK_INFO[.Spruce_Wood] = cube(all_faces(.Spruce_Log))
+	BLOCK_INFO[.Acacia_Wood] = cube(all_faces(.Acacia_Log))
+	BLOCK_INFO[.Jungle_Wood] = cube(all_faces(.Jungle_Log))
 	BLOCK_INFO[.Water] = {
 		render       = .Liquid,
 		blocks_light = true,
@@ -191,7 +207,7 @@ blocks_init :: proc() {
 // Ствол дерева (или кактус) — не затирает листву соседей при генерации.
 is_log :: proc(b: Block) -> bool {
 	#partial switch b {
-	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus:
+	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood:
 		return true
 	}
 	return false
@@ -199,4 +215,14 @@ is_log :: proc(b: Block) -> bool {
 
 is_plant :: proc(b: Block) -> bool {
 	return BLOCK_INFO[b].render == .Cross
+}
+
+// Хвоя и вечнозелёная листва — не опадают.
+evergreen_leaves :: proc "contextless" (b: Block) -> bool {
+	return b == .Spruce_Leaves || b == .Acacia_Leaves || b == .Jungle_Leaves
+}
+
+// Листва, что опадает на зиму (дуб, берёза): голая крона не держит свет неба.
+deciduous_leaves :: proc "contextless" (b: Block) -> bool {
+	return b == .Oak_Leaves || b == .Birch_Leaves
 }

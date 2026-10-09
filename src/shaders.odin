@@ -158,16 +158,33 @@ vec3 grass_season(vec3 c, float t, float p) {
 	float dormant = max(smoothstep(4.0, -2.0, t), smoothstep(25.0, 5.0, p) * smoothstep(12.0, 18.0, t) * 0.8);
 	return mix(c, c * vec3(1.12, 0.92, 0.5), dormant);
 }
-// осень: при похолодании ниже ~12 °C листва желтеет и краснеет (h — у каждого дерева свой оттенок)
-vec3 leaf_autumn(vec3 c, float t, float trend, float h) {
-	float a = trend < 0.0 ? smoothstep(13.0, 5.0, t) : smoothstep(9.0, 3.0, t);
-	vec3 autumn = mix(vec3(0.95, 0.72, 0.18), vec3(0.85, 0.28, 0.1), h);
+// осень: при похолодании ниже ~13 °C листва желтеет (весной молодая листва зелёная)
+vec3 leaf_autumn(vec3 c, float t, float trend, vec3 autumn) {
+	float a = trend < 0.0 ? smoothstep(13.0, 7.0, t) : 0.0;
 	float lum = dot(c, vec3(0.3, 0.59, 0.11));
 	return mix(c, autumn * lum * 2.2, a);
 }
-// 0 — в листве, 1 — голые ветки
+// 0 — в листве, 1 — голые ветки: осенью листья опадают при 9…3 °C,
+// весной распускаются при 6…10 °C
 float leaves_bare(float t, float trend) {
-	return trend < 0.0 ? smoothstep(4.0, 0.0, t) : smoothstep(7.0, 3.0, t);
+	return trend < 0.0 ? smoothstep(9.0, 3.0, t) : smoothstep(10.0, 6.0, t);
+}
+// осенние цвета: берёза — золотая, дуб — от жёлто-бурого до рыжего
+vec3 autumn_color(bool birch, float h) {
+	return birch ? mix(vec3(0.98, 0.8, 0.2), vec3(0.92, 0.64, 0.16), h) : mix(vec3(0.8, 0.62, 0.2), vec3(0.66, 0.36, 0.12), h);
+}
+// гладкий шум (0…1) — у соседних блоков одного дерева почти одинаковый
+float hash13(vec3 p) {
+	p = fract(p * 0.1031);
+	p += dot(p, p.zyx + 31.32);
+	return fract((p.x + p.y) * p.z);
+}
+float vnoise3(vec3 p) {
+	vec3 i = floor(p);
+	vec3 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	return mix(mix(mix(hash13(i), hash13(i + vec3(1, 0, 0)), f.x), mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), f.x), f.y),
+	           mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), f.x), mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), f.x), f.y), f.z);
 }
 // снег: ложится в мороз и копится всю зиму (за несколько месяцев — даже при
 // скудных осадках), весной сходит с запаздыванием; в сухом климате его нет
@@ -189,7 +206,10 @@ uniform float u_chunk_alt; // низ чанка над уровнем моря, 
 uniform vec4 u_layer_a;    // слои: верх травы, бок травы, высокая трава, листва дуба
 uniform vec4 u_layer_b;    // листва берёзы, хвоя ели, листва акации, листва тропического дерева
 uniform vec4 u_layer_c;    // одуванчик, мак
+uniform vec3 u_chunk_id;   // номер секции (по модулю 1024) — для шума, привязанного к миру
 out vec3 v_uvl;
+out vec3 v_wpos; // позиция в сетке грани (по модулю), м
+flat out float v_bhash; // свой у каждого блока листвы (0…1, 16 ступеней)
 out float v_light;
 out vec3 v_rel;
 out float v_alt;
@@ -230,6 +250,8 @@ void main() {
 	v_kind = kind;
 	vec3 cell = floor(q - vec3(0.01));
 	v_hash = fract(sin(dot(cell + u_origin * 0.0, vec3(12.9898, 78.233, 37.719)) + u_chunk_alt * 0.37) * 43758.5453);
+	v_bhash = float((flags >> 1u) & 15u) / 15.0;
+	v_wpos = u_chunk_id * 16.0 + q;
 	gl_Position = u_view_proj * vec4(p, 1.0);
 }
 `
@@ -243,35 +265,57 @@ in vec2 v_tint;
 flat in int v_kind;
 flat in int v_face;
 flat in float v_hash;
+in vec3 v_wpos;
+flat in float v_bhash;
 uniform sampler2DArray u_atlas;
 uniform float u_alpha_cutoff;
 uniform vec2 u_fog; // туман под водой
 uniform vec4 u_season; // температура у моря сейчас (°C), её ход за месяц, осадки за месяц (мм); w — 1: климат есть
 uniform float u_lapse; // похолодание с высотой, К/м
+uniform vec4 u_layer_a;
+uniform vec4 u_layer_b;
+uniform vec4 u_layer_d; // веточки дуба и берёзы (голая крона)
 out vec4 o_color;
 ` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
 	vec4 c = texture(u_atlas, v_uvl);
-	if (c.a < u_alpha_cutoff) discard;
+	bool twigs = false;
+	float t = u_season.x - u_lapse * max(v_alt, 0.0);
+	float tree = 0.5; // у каждого дерева свой срок листопада и свой осенний цвет
+	if (u_season.w > 0.5 && v_kind == 4) {
+		tree = vnoise3(v_wpos / 5.0);
+		// лист опадает блоками: у каждого блока листвы свой день
+		if (leaves_bare(t + (tree - 0.5) * 4.0, u_season.y) > 0.03 + 0.94 * v_bhash) {
+			twigs = true;
+			vec2 uv = v_uvl.xy; // узор веточек повёрнут по-своему в каждом блоке
+			int hb = int(v_bhash * 15.0 + 0.5);
+			if ((hb & 1) != 0) uv.x = 1.0 - uv.x;
+			if ((hb & 2) != 0) uv = uv.yx;
+			if ((hb & 4) != 0) uv.y = 1.0 - uv.y;
+			c = texture(u_atlas, vec3(uv, v_uvl.z == u_layer_a.w ? u_layer_d.x : u_layer_d.y));
+			// вдали тонкие веточки не исчезают: в мипмапе прозрачность — доля
+			// веточек в клетке, и точка остаётся с такой вероятностью
+			float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+			if (c.a <= dither * 0.98 + 0.01) discard;
+		}
+	}
+	if (!twigs && c.a < u_alpha_cutoff) discard;
 	vec3 base = c.rgb;
 	if (u_season.w > 0.5 && v_kind > 0) {
-		float t = u_season.x - u_lapse * max(v_alt, 0.0);
 		float snow = snow_cover(t, u_season.y, u_season.z);
 		if (v_kind <= 3) base = grass_season(grass_tint(base, v_tint), t, u_season.z);
-		if (v_kind == 4) {
-			// листопадные: осенью желтеют и краснеют, зимой голые ветки
-			float bare = leaves_bare(t, u_season.y);
-			vec2 tx = floor(v_uvl.xy * 16.0);
-			float r = fract(sin(dot(tx, vec2(12.9898, 78.233)) + v_hash * 91.7) * 43758.5453);
-			if (r < bare * 0.82) discard; // опали — остались веточки
-			base = mix(leaf_autumn(grass_tint(base, v_tint * 0.5), t, u_season.y, v_hash), vec3(0.3, 0.25, 0.2), bare);
+		if (v_kind == 4 && !twigs) {
+			// листопадные: осенью желтеют, перед листопадом буреют
+			float bare = leaves_bare(t + (tree - 0.5) * 4.0, u_season.y);
+			vec3 autumn = autumn_color(v_uvl.z == u_layer_b.x, fract(tree * 3.7));
+			base = mix(leaf_autumn(grass_tint(base, v_tint * 0.5), t + (tree - 0.5) * 4.0, u_season.y, autumn), vec3(0.42, 0.3, 0.16), bare * 0.5);
 		}
 		if (v_kind == 3 && snow > 0.6) discard; // траву занесло
 		if (v_kind == 7 && (snow > 0.2 || t < 5.0 + 3.0 * v_hash)) discard; // цветы — только в тёплое время
 		bool top = v_face == 2 && v_kind != 3;
 		if (v_kind == 2 && v_uvl.y < 0.19) top = true; // снег свешивается с края, как у травы в Minecraft
-		if (top) base = mix(base, SNOW_COLOR, snow);
-		else if (v_kind == 5 || v_kind == 4) base = mix(base, SNOW_COLOR, snow * 0.35);
+		if (top) base = mix(base, SNOW_COLOR, twigs ? snow * 0.6 : snow);
+		else if (v_kind == 5 || v_kind == 4) base = mix(base, SNOW_COLOR, snow * (twigs ? 0.15 : 0.35));
 	}
 	vec3 col = apply_light(base * v_light * cloud_shadow(v_rel));
 	// под водой свет гаснет с глубиной: ниже ~200 м почти темно
@@ -509,7 +553,7 @@ void main() {
 		float conif = v_crowns.y;
 		base = mix(base, grass_season(base, t, v_season.z), max(1.0 - decid - conif, 0.0));
 		float bare = leaves_bare(t, v_season.y);
-		vec3 fall = mix(leaf_autumn(base, t, v_season.y, 0.5), vec3(0.3, 0.26, 0.21), bare * 0.7);
+		vec3 fall = mix(leaf_autumn(base, t, v_season.y, mix(autumn_color(true, 0.5), autumn_color(false, 0.5), 0.5)), vec3(0.3, 0.26, 0.21), bare * 0.7);
 		base = mix(base, fall, decid);
 		base = mix(base, SNOW_COLOR, snow_cover(t, v_season.y, v_season.z) * (1.0 - 0.65 * conif - 0.4 * decid * (1.0 - bare)));
 	}
