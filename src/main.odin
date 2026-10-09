@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.016"
+VERSION :: "0.017"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -41,6 +41,7 @@ Options :: struct {
 	mountain_spawn: bool, // появиться над горами
 	cliff_spawn:   bool, // у самого крутого обрыва (слои пород)
 	tree_spawn:    bool, // у большого лиственного дерева, лицом к нему
+	wx_want:       string, // -wx: начать в ближайший день с такой погодой (rain, snow, storm, clear, overcast)
 	has_latlon:    bool, // высадка в заданной точке планеты
 	lat, lon:      f64,
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
@@ -48,6 +49,7 @@ Options :: struct {
 	planets_report: bool, // сверить модель планет с Солнечной системой, статистика систем — и выйти
 	stars_report:  bool, // сверить модель звёзд с настоящими звёздами — и выйти
 	climate_report: bool, // сверить климат с Землёй — и выйти
+	weather_report: bool, // прогнать погоду на климате Земли — и выйти
 	biome:         string, // отладка: высадиться в природной зоне (forest, taiga, tundra, glacier, steppe, desert, savanna, rainforest…)
 	timescale:     f64, // ускорение времени (отладка)
 	start_day:     int, // день года при высадке (0 — случайный)
@@ -146,6 +148,10 @@ parse_options :: proc() -> (o: Options) {
 			o.biome = val
 		case "-climate":
 			o.climate_report = true
+		case "-wx":
+			o.wx_want = val
+		case "-weather":
+			o.weather_report = true
 		case "-stars":
 			o.stars_report = true
 		case "-planets":
@@ -229,6 +235,10 @@ main :: proc() {
 		return
 	}
 
+	if opts.weather_report {
+		if weather_report() > 0 do os.exit(1)
+		return
+	}
 	if opts.climate_report {
 		if climate_report() > 0 do os.exit(1)
 		return
@@ -409,6 +419,11 @@ main :: proc() {
 	clouds: Clouds
 	air_scale := hp.atmo.scale_h / EARTH_SCALE_H
 	if !clouds_init(&clouds, opts.seed, air_scale) do os.exit(1)
+	// погода (weather.odin): колебания вокруг климата; карта вокруг игрока считается в фоне
+	wx := new(Weather_State) // ~400 КБ — не на стеке
+	defer free(wx)
+	weather_state_init(wx, opts.seed, hp, system.home.day_hours)
+	defer weather_state_destroy(wx)
 	r.haze_height = f32(clamp(HAZE_HEIGHT * air_scale, 400, 6000))
 	r.haze_beta = f32(HAZE_BETA * clamp(hp.atmo.density / EARTH_AIR_DENSITY, 0.1, 5))
 	r.seed = opts.seed
@@ -432,6 +447,23 @@ main :: proc() {
 		}
 	}
 	if opts.anomaly_dist > 0 || opts.edge_dist > 0 do spawn = spawn_at(&world, sx, sz)
+	// отладка: начать в ближайший день, когда здесь такая погода (её не подгоняем — ищем)
+	if opts.wx_want != "" && climate.ok {
+		face, gx, gz, ok := world_resolve(&world, i32(spawn.x), i32(spawn.z))
+		if ok {
+			col, _ := ensure_column(&world, column_key_of(face, gx, gz))
+			cp := col.clim
+			cp.alt = max(spawn.y - Y_SEA, 0)
+			up := geo_frame_dir(&world.geo, spawn.x, spawn.z)
+			st := astro_sky_at(&astro, &world.geo, spawn, clock.std_hours, nil)
+			if shift, found := weather_find(wx, up, cp, &astro, clock.std_hours, st.local_hours, opts.wx_want); found {
+				clock.std_hours += shift
+				fmt.printfln("погода «%s»: через %.0f суток", opts.wx_want, shift / astro.day)
+			} else {
+				fmt.printfln("погоды «%s» здесь за 2000 суток не нашлось", opts.wx_want)
+			}
+		}
+	}
 	// зимой лиственные кроны голые — свет неба под ними не гаснет
 	world.bare = leaves_bare_at(&world, spawn, climate_season(&astro, clock.std_hours))
 	for !spawn_area_ready(&world, spawn, 2) {
@@ -525,7 +557,7 @@ main :: proc() {
 	around_time: f64 = -10
 	around: [2]f64
 
-	cover_set := false // облачность по климату: в первом кадре — сразу
+	cover_set := false // ветер облаков: в первом кадре — сразу
 	for !eng.window_should_close() {
 		eng.window_begin_frame()
 		now := eng.time_now()
@@ -646,19 +678,29 @@ main :: proc() {
 			for _, c in world.chunks do if c.meshed do c.stale = true
 		}
 
-		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
-		clouds_tick(&clouds, now - start)
-		// облачность — по климату там, где мы: во влажных поясах гуще, над пустынями ясно
+		// погода: там, где стоим, — каждый кадр, карта вокруг — в фоне; облака плывут по местному ветру
 		if climate.ok {
+			up := geo_frame_dir(&world.geo, player.pos.x, player.pos.z)
 			if face, gx, gz, ok := world_resolve(&world, i32(math.floor(player.pos.x)), i32(math.floor(player.pos.z))); ok {
 				if col := world_column(&world, column_key_of(face, gx, gz)); col != nil {
-					_, p_now := climate_at(&climate, &col.clim, season)
-					want := clamp(0.12 + 0.6 * math.smoothstep(5.0, 160.0, p_now) + clouds.weather, 0.04, 0.9)
-					clouds.cover += (want - clouds.cover) * (cover_set ? min(dt * 0.2, 1) : 1)
+					cp := col.clim
+					cp.alt = max(player.pos.y - Y_SEA, 0)
+					T := clock.std_hours + f64(t) * clock_tick_hours(&clock)
+					weather_update(wx, up, cp, weather_time(&astro, T), season, sky_state.local_hours, now - start)
+					east, north := wx_axes(up)
+					want := east * wx.here.wind.x + north * wx.here.wind.y
+					pv := planet_view_make(&world.geo, player.pos)
+					wx.wind_frame = pv.jinv * want
+					precip_tick(&wx.precip, wx.wind_frame, wx.here.rain, wx.here.snow, f64(dt))
+					clouds.wind += (want - clouds.wind) * (cover_set ? min(dt * 0.3, 1) : 1)
+					clouds.cover = wx.here.cover
 					cover_set = true
 				}
 			}
 		}
+		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
+		clouds_tick(&clouds, now - start)
+		weather_link_clouds(wx, &clouds)
 		cloud_shade, cloud_over: f64
 		{
 			up := geo_frame_dir(&world.geo, player.pos.x, player.pos.z)
@@ -715,6 +757,7 @@ main :: proc() {
 				star_st = &star_st,
 				around = around,
 				clouds = &clouds,
+				weather = wx,
 				cloud_shade = f32(cloud_shade),
 				cloud_over = cloud_over,
 				frame_ms = frame_ms,
@@ -739,7 +782,7 @@ main :: proc() {
 				if eng.save_screenshot(path, fbw, fbh) do fmt.println("Скриншот:", path)
 			}
 			// автоснимок ждёт, пока досчитаются звёздное небо и дальний рельеф
-			if auto_mode && (star_sky.ready || star_sky.worker == nil) && far.ready_all && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
+			if auto_mode && (star_sky.ready || star_sky.worker == nil) && far.ready_all && wx.front.ok && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
 				path := opts.shot_path
 				if opts.burst > 1 {
 					base := strings.trim_suffix(path, ".png")

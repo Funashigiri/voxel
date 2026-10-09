@@ -4,6 +4,8 @@ package main
 // Каждая вершина — 12 байт: позиция в 1/16 блока, освещение (AO + тень неба),
 // номер грани, UV в текселях и слой массива текстур.
 
+import "core:math"
+import "core:math/linalg"
 import eng "engine"
 import gl "vendor:OpenGL"
 
@@ -166,6 +168,121 @@ emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer:
 	}
 }
 
+// ---- тонкие стволы и ветви: брус сечением POST_W вдоль настоящей линии ветви
+// (отрезки дерева — trees.odin), по кусочку в каждой клетке, где блок ещё есть
+// (сломанный блок — дыра в ветви). Кусочки одного отрезка лежат на одной линии
+// и стыкуются без швов.
+
+@(private = "file")
+thin_segs: [dynamic][2][3]f64
+@(private = "file")
+thin_covered: [CHUNK_VOLUME]bool
+
+@(private = "file")
+Thin_Ctx :: struct {
+	out:    ^[dynamic]Chunk_Vertex,
+	p:      ^Padded,
+	o:      [3]i32, // угол секции (сетка грани)
+	a, d:   [3]f64, // отрезок: начало и направление (до конца)
+	e1, e2: [3]f64, // поперечные оси бруса (половина ширины)
+	side:   u8, // слой текстуры коры
+	top:    u8, // слой торца
+	len16:  f64, // длина отрезка в текселях
+}
+
+// Номер грани по нормали — для затенения граней, как у кубов.
+@(private = "file")
+face_of :: proc(n: [3]f64) -> Face {
+	ax := [3]f64{abs(n.x), abs(n.y), abs(n.z)}
+	if ax.y >= ax.x && ax.y >= ax.z do return n.y > 0 ? .Up : .Down
+	if ax.x >= ax.z do return n.x > 0 ? .East : .West
+	return n.z > 0 ? .South : .North
+}
+
+@(private = "file")
+thin_piece :: proc(ctx: ^Thin_Ctx, at: [3]i32, t0, t1: f64, cap0, cap1: bool) {
+	l := at - ctx.o
+	lv, _ := cell(ctx.p, l.x, l.y, l.z)
+	light := [4]f32{lv, lv, lv, lv}
+	tint := ctx.p.tint[(clamp(l.z, -1, CHUNK_SIZE) + 1) * P + (clamp(l.x, -1, CHUNK_SIZE) + 1)]
+	o := [3]f64{f64(ctx.o.x), f64(ctx.o.y), f64(ctx.o.z)}
+	p0 := ctx.a + ctx.d * t0 - o
+	p1 := ctx.a + ctx.d * t1 - o
+	vp :: proc(q: [3]f64) -> [3]i32 {
+		return {i32(math.round(q.x * 16)) + 16, i32(math.round(q.y * 16)) + 16, i32(math.round(q.z * 16)) + 16}
+	}
+	ring := [4][3]f64{ctx.e1 + ctx.e2, -ctx.e1 + ctx.e2, -ctx.e1 - ctx.e2, ctx.e1 - ctx.e2}
+	v0 := math.mod(t0 * ctx.len16, 16)
+	v1 := v0 + (t1 - t0) * ctx.len16
+	for k in 0 ..< 4 {
+		r0, r1 := ring[k], ring[(k + 1) % 4]
+		q := [4][3]f64{p0 + r0, p0 + r1, p1 + r1, p1 + r0}
+		n := r0 + r1
+		if linalg.dot(linalg.cross(q[1] - q[0], q[2] - q[0]), n) < 0 do q = {q[1], q[0], q[3], q[2]}
+		uv := [4][2]u8{{POST_LO, u8(16 - v0)}, {POST_HI, u8(16 - v0)}, {POST_HI, u8(max(16 - v1, 0))}, {POST_LO, u8(max(16 - v1, 0))}}
+		emit_quad(ctx.out, {vp(q[0]), vp(q[1]), vp(q[2]), vp(q[3])}, uv, light, u16(face_of(n)), ctx.side, 0, tint)
+	}
+	caps := [2]bool{cap0, cap1}
+	for end in 0 ..< 2 {
+		if !caps[end] do continue
+		pc := end == 0 ? p0 : p1
+		n := end == 0 ? -ctx.d : ctx.d
+		q := [4][3]f64{pc + ring[0], pc + ring[1], pc + ring[2], pc + ring[3]}
+		if linalg.dot(linalg.cross(q[1] - q[0], q[2] - q[0]), n) < 0 do q = {q[3], q[2], q[1], q[0]}
+		uv := [4][2]u8{{POST_LO, POST_HI}, {POST_HI, POST_HI}, {POST_HI, POST_LO}, {POST_LO, POST_LO}}
+		emit_quad(ctx.out, {vp(q[0]), vp(q[1]), vp(q[2]), vp(q[3])}, uv, light, u16(face_of(n)), ctx.top, 0, tint)
+	}
+}
+
+@(private = "file")
+emit_thin_wood :: proc(w: ^World, c: ^Chunk, p: ^Padded, out: ^[dynamic]Chunk_Vertex) {
+	o := [3]i32{c.key.x * CHUNK_SIZE, c.key.y * CHUNK_SIZE, c.key.z * CHUNK_SIZE}
+	thin_covered = {}
+	clear(&thin_segs)
+	if col := world_column(w, {c.key.face, c.key.x, c.key.z}); col != nil {
+		for t in col.trees[:col.tree_n] {
+			if tree_touches(t, o, o + CHUNK_SIZE) do tree_thin_segments(t, &thin_segs)
+		}
+	}
+	hw := f64(POST_W) / 32 // половина ширины, блоков
+	for sg in thin_segs {
+		lo := [3]f64{min(sg[0].x, sg[1].x), min(sg[0].y, sg[1].y), min(sg[0].z, sg[1].z)}
+		hi := [3]f64{max(sg[0].x, sg[1].x), max(sg[0].y, sg[1].y), max(sg[0].z, sg[1].z)}
+		if hi.x < f64(o.x) || hi.y < f64(o.y) || hi.z < f64(o.z) || lo.x >= f64(o.x + CHUNK_SIZE) || lo.y >= f64(o.y + CHUNK_SIZE) || lo.z >= f64(o.z + CHUNK_SIZE) do continue
+		d := sg[1] - sg[0]
+		L := linalg.length(d)
+		if L < 1e-6 do continue
+		u := d / L
+		h := abs(u.y) < 0.95 ? [3]f64{0, 1, 0} : [3]f64{1, 0, 0}
+		ctx := Thin_Ctx{out = out, p = p, o = o, a = sg[0], d = d, len16 = L * 16}
+		ctx.e1 = linalg.normalize(linalg.cross(u, h)) * hw
+		ctx.e2 = linalg.normalize(linalg.cross(u, ctx.e1)) * hw
+		seg_walk(sg[0], sg[1], &ctx, proc(data: rawptr, cell: [3]i32, t0, t1: f64) {
+			ctx := (^Thin_Ctx)(data)
+			l := cell - ctx.o
+			if l.x < 0 || l.y < 0 || l.z < 0 || l.x >= CHUNK_SIZE || l.y >= CHUNK_SIZE || l.z >= CHUNK_SIZE do return
+			b := pb(ctx.p, l.x, l.y, l.z)
+			info := &BLOCK_INFO[b]
+			if info.render != .Post do return // блок сломан — кусочка нет
+			thin_covered[block_index(l.x, l.y, l.z)] = true
+			ctx.side, ctx.top = u8(info.tex[.East]), u8(info.tex[.Up])
+			thin_piece(ctx, cell, t0, t1, t0 <= 0, t1 >= 1)
+		})
+	}
+	// тонкая древесина без своей ветви (поставлена вручную) — столбик
+	for y in i32(0) ..< CHUNK_SIZE do for z in i32(0) ..< CHUNK_SIZE do for x in i32(0) ..< CHUNK_SIZE {
+		b := pb(p, x, y, z)
+		if BLOCK_INFO[b].render != .Post || thin_covered[block_index(x, y, z)] do continue
+		info := &BLOCK_INFO[b]
+		cell := o + {x, y, z}
+		a := [3]f64{f64(cell.x) + 0.5, f64(cell.y), f64(cell.z) + 0.5}
+		ctx := Thin_Ctx{out = out, p = p, o = o, a = a, d = {0, 1, 0}, len16 = 16, side = u8(info.tex[.East]), top = u8(info.tex[.Up])}
+		ctx.e1 = {hw, 0, 0}
+		ctx.e2 = {0, 0, hw}
+		thin_piece(&ctx, cell, 0, 1, !is_woody(pb(p, x, y - 1, z)), !is_woody(pb(p, x, y + 1, z)))
+	}
+}
+
 @(private = "file")
 fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 	// колонки бортика берём через рёбра граней (сетка соседа может быть повёрнута)
@@ -227,6 +344,7 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 	x0 := c.key.x * CHUNK_SIZE
 	y0 := c.key.y * CHUNK_SIZE
 	z0 := c.key.z * CHUNK_SIZE
+	has_thin := false
 	for y in i32(0) ..< CHUNK_SIZE do for z in i32(0) ..< CHUNK_SIZE do for x in i32(0) ..< CHUNK_SIZE {
 		b := p.blocks[pidx(x, y, z)]
 		if b == .Air do continue
@@ -246,6 +364,8 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 			}
 		case .Cross:
 			emit_cross(&opaque_verts, p, x, y, z, u8(info.tex[.Up]), x0 + x, z0 + z, w.seed)
+		case .Post:
+			has_thin = true // рисуется по линиям ветвей, ниже
 		case .Liquid:
 			top16: i32 = pb(p, x, y + 1, z) == .Water ? 16 : 14
 			for face in Face {
@@ -256,6 +376,7 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 			}
 		}
 	}
+	if has_thin do emit_thin_wood(w, c, p, &opaque_verts)
 
 	chunk_mesh_upload(&c.opaque_mesh, opaque_verts[:])
 	chunk_mesh_upload(&c.water_mesh, water_verts[:])

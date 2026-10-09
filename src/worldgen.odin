@@ -200,8 +200,10 @@ generate_column :: proc(w: ^World, col: ^Column) {
 		tree_blocks(t, {x0, min(i32) / 2, z0}, {x0 + CHUNK_SIZE, max(i32) / 2, z0 + CHUNK_SIZE}, col, proc(data: rawptr, x, y, z: i32, b: Block) {
 			col := (^Column)(data)
 			i := (z - col.key.z * CHUNK_SIZE) * CHUNK_SIZE + (x - col.key.x * CHUNK_SIZE)
-			col.sky[i] = max(col.sky[i], y + 1)
-			if !deciduous_leaves(b) do col.sky_bare[i] = max(col.sky_bare[i], y + 1)
+			if BLOCK_INFO[b].blocks_light { // тонкий ствол почти не затеняет
+				col.sky[i] = max(col.sky[i], y + 1)
+				if !deciduous_leaves(b) do col.sky_bare[i] = max(col.sky_bare[i], y + 1)
+			}
 			col.hi = max(col.hi, y)
 		})
 	}

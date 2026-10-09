@@ -48,6 +48,12 @@ Block :: enum u8 {
 	Spruce_Wood,
 	Acacia_Wood,
 	Jungle_Wood,
+	// тонкие стволы и ветви (0.017): столбик в четверть блока
+	Oak_Pole,
+	Birch_Pole,
+	Spruce_Pole,
+	Acacia_Pole,
+	Jungle_Pole,
 }
 
 // Русские названия (F3: что под ногами).
@@ -93,6 +99,11 @@ BLOCK_NAMES := [Block]string {
 	.Spruce_Wood  = "ветвь ели",
 	.Acacia_Wood  = "ветвь акации",
 	.Jungle_Wood  = "ветвь тропического дерева",
+	.Oak_Pole     = "тонкий ствол дуба",
+	.Birch_Pole   = "тонкий ствол берёзы",
+	.Spruce_Pole  = "тонкий ствол ели",
+	.Acacia_Pole  = "тонкий ствол акации",
+	.Jungle_Pole  = "тонкий ствол тропического дерева",
 }
 
 Render_Kind :: enum u8 {
@@ -101,6 +112,7 @@ Render_Kind :: enum u8 {
 	Leaves, // куб с дырками (alpha-test), грани между листьями рисуются ("fancy")
 	Cross, // растения: две диагональные плоскости
 	Liquid, // полупрозрачная вода
+	Post, // тонкий ствол или ветвь: столбик POST_W, соединяется с соседними стволами и ветвями
 }
 
 // Порядок граней важен: от него зависят нормали, затенение и меш.
@@ -182,6 +194,14 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Spruce_Wood] = cube(all_faces(.Spruce_Log))
 	BLOCK_INFO[.Acacia_Wood] = cube(all_faces(.Acacia_Log))
 	BLOCK_INFO[.Jungle_Wood] = cube(all_faces(.Jungle_Log))
+	pole :: proc(side, top: Tex) -> Block_Info {
+		return {render = .Post, solid = true, tex = column_faces(side, top, top)}
+	}
+	BLOCK_INFO[.Oak_Pole] = pole(.Oak_Log, .Oak_Log_Top)
+	BLOCK_INFO[.Birch_Pole] = pole(.Birch_Log, .Birch_Log_Top)
+	BLOCK_INFO[.Spruce_Pole] = pole(.Spruce_Log, .Spruce_Log_Top)
+	BLOCK_INFO[.Acacia_Pole] = pole(.Acacia_Log, .Acacia_Log_Top)
+	BLOCK_INFO[.Jungle_Pole] = pole(.Jungle_Log, .Jungle_Log_Top)
 	BLOCK_INFO[.Water] = {
 		render       = .Liquid,
 		blocks_light = true,
@@ -207,7 +227,7 @@ blocks_init :: proc() {
 // Ствол дерева (или кактус) — не затирает листву соседей при генерации.
 is_log :: proc(b: Block) -> bool {
 	#partial switch b {
-	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood:
+	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood, .Oak_Pole, .Birch_Pole, .Spruce_Pole, .Acacia_Pole, .Jungle_Pole:
 		return true
 	}
 	return false
@@ -226,3 +246,18 @@ evergreen_leaves :: proc "contextless" (b: Block) -> bool {
 deciduous_leaves :: proc "contextless" (b: Block) -> bool {
 	return b == .Oak_Leaves || b == .Birch_Leaves
 }
+
+// Тонкий ствол: ширина столбика в 1/16 блока (25 см).
+POST_W :: 4
+POST_LO :: 8 - POST_W / 2
+POST_HI :: 8 + POST_W / 2
+
+// Древесина, к которой тянется тонкий ствол (стволы, ветви, другие тонкие стволы).
+is_woody :: proc "contextless" (b: Block) -> bool {
+	#partial switch b {
+	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood, .Oak_Pole, .Birch_Pole, .Spruce_Pole, .Acacia_Pole, .Jungle_Pole:
+		return true
+	}
+	return false
+}
+

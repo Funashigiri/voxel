@@ -55,6 +55,9 @@ Tree :: struct {
 	crown_base: f32, // низ кроны над землёй, м
 	kind:       Tree_Kind,
 	girth:      u8, // толщина ствола, блоков (1 или 2)
+	thin:       bool, // ствол тоньше 45 см — тонкий столбик (Post)
+	under:      bool, // подрост в тени крон соседей
+	dbh:        f32, // поперечник ствола, м
 	fins:       u8, // досковидные корни (тропические великаны)
 	seed:       u32,
 }
@@ -429,4 +432,18 @@ frame_pos :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (x, z: i32, ok: bo
 	if !placed do return 0, 0, false
 	x, z = xform_cell(m, cx * CHUNK_SIZE + CHUNK_SIZE / 2, cz * CHUNK_SIZE + CHUNK_SIZE / 2)
 	return x, z, true
+}
+
+// Коробки столкновений блока (мировые координаты кадра): целый куб или, у
+// тонкого ствола и ветви, столбик 25 см посередине. Незагруженное — целый куб.
+block_boxes :: proc(w: ^World, x, y, z: i32) -> (boxes: [5][2][3]f64, n: int) {
+	b, loaded := world_get_block(w, x, y, z)
+	o := [3]f64{f64(x), f64(y), f64(z)}
+	if loaded && BLOCK_INFO[b].render == .Post {
+		boxes[0] = {o + {POST_LO, 0, POST_LO} / 16.0, o + {POST_HI, 16, POST_HI} / 16.0}
+		return boxes, 1
+	}
+	if loaded && !BLOCK_INFO[b].solid do return
+	boxes[0] = {o, o + 1}
+	return boxes, 1
 }

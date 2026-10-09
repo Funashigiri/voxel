@@ -809,3 +809,13 @@ biome_from_name :: proc(s: string) -> (b: Biome, ok: bool) {
 	}
 	return
 }
+
+// Температура моря на широте lat в сезон s, °C (между полосами плавно).
+climate_sea_t :: proc(cm: ^Climate, lat, s: f64) -> f64 {
+	x := (clamp(lat, -89, 89) + 89) / 2
+	i0 := min(int(x), CLIM_LAT - 2)
+	f := x - f64(i0)
+	a, _, _, _ := climate_band_now(cm, i0, s)
+	b, _, _, _ := climate_band_now(cm, i0 + 1, s)
+	return math.lerp(a, b, f)
+}

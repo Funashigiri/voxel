@@ -14,7 +14,7 @@ Chunk_Shader :: struct {
 	prog:                                                 u32,
 	u_view_proj, u_origin, u_time, u_atlas, u_alpha_cutoff: i32,
 	u_fog, u_rot, u_side_shade:                           i32,
-	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c, u_layer_d, u_chunk_id: i32,
+	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c, u_layer_d, u_chunk_id, u_wind: i32,
 }
 
 Entity_Shader :: struct {
@@ -44,6 +44,11 @@ Renderer :: struct {
 	cloud_q0:       [3]f32, // облака для шейдеров (CLOUD_GLSL)
 	cloud_jq:       matrix[3, 3]f32,
 	cloud:          [4]f32,
+	wx_q0:          [3]f32, // карта погоды для шейдеров (weather_view.odin)
+	wx_e, wx_n:     [3]f32,
+	wx_on:          f32,
+	wx_mean:        [4]f32,
+	wx_fog:         [4]f32, // мгла от дождя и снега: ослабление (1/м), цвет
 	seed:           u32,
 	off_far:        bool, // отладка (-off:...): выключенные части — для замеров
 	off_clouds:     bool,
@@ -82,6 +87,7 @@ Frame_Params :: struct {
 	star_st:     ^Star_Structure, // строение нашей звезды (F3)
 	around:      [2]f64, // самая высокая и самая низкая точка в 40 км вокруг, м
 	clouds:      ^Clouds,
+	weather:     ^Weather_State, // погода вокруг (weather_view.odin)
 	cloud_shade: f32, // тень облака там, где стоит игрок (1 — нет)
 	cloud_over:  f64, // облачность прямо над головой, 0..1
 	frame_ms:    f64, // время кадра (сглаженное)
@@ -122,6 +128,7 @@ renderer_init :: proc(r: ^Renderer) -> bool {
 			u_layer_c      = loc(p, "u_layer_c"),
 			u_layer_d      = loc(p, "u_layer_d"),
 			u_chunk_id     = loc(p, "u_chunk_id"),
+			u_wind         = loc(p, "u_wind"),
 		}
 	}
 	{
@@ -220,6 +227,13 @@ set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
 	gl.UniformMatrix3fv(eng.uniform_loc(prog, "u_cloud_jq"), 1, false, &r.cloud_jq[0, 0])
 	eng.set_vec4(eng.uniform_loc(prog, "u_cloud"), r.cloud)
 	eng.set_i32(eng.uniform_loc(prog, "u_cloud_noise"), 3)
+	eng.set_i32(eng.uniform_loc(prog, "u_wx"), 5)
+	eng.set_vec3(eng.uniform_loc(prog, "u_wx_q0"), r.wx_q0)
+	eng.set_vec3(eng.uniform_loc(prog, "u_wx_e"), r.wx_e)
+	eng.set_vec3(eng.uniform_loc(prog, "u_wx_n"), r.wx_n)
+	eng.set_f32(eng.uniform_loc(prog, "u_wx_on"), r.wx_on)
+	eng.set_vec4(eng.uniform_loc(prog, "u_wx_mean"), r.wx_mean)
+	eng.set_vec4(eng.uniform_loc(prog, "u_wx_fog"), r.wx_fog)
 }
 
 // Дымка и облака этого кадра — для всех шейдеров.
@@ -236,6 +250,51 @@ update_air :: proc(r: ^Renderer, fp: ^Frame_Params) {
 		gl.ActiveTexture(gl.TEXTURE3)
 		gl.BindTexture(gl.TEXTURE_3D, c.noise_tex)
 		gl.ActiveTexture(gl.TEXTURE0)
+	}
+	// карта погоды: облачность и тучи для облаков и их теней
+	r.wx_on = 0
+	if ws, c := fp.weather, fp.clouds; ws != nil && c != nil && ws.front.ok {
+		r.wx_q0 = {f32(c.wx_q0.x), f32(c.wx_q0.y), f32(c.wx_q0.z)}
+		r.wx_e = {f32(c.wx_e.x), f32(c.wx_e.y), f32(c.wx_e.z)}
+		r.wx_n = {f32(c.wx_n.x), f32(c.wx_n.y), f32(c.wx_n.z)}
+		r.wx_on = 1
+		m := ws.front.mean
+		r.wx_mean = {f32(m[0]), f32(m[1]), f32(m[2]), f32(m[3])}
+		gl.ActiveTexture(gl.TEXTURE5)
+		gl.BindTexture(gl.TEXTURE_2D, ws.tex)
+		gl.ActiveTexture(gl.TEXTURE0)
+	}
+}
+
+// Ненастье над головой: под сплошными тучами темнее и небо серое; в дождь и
+// снег — мгла, видимость по силе осадков (дождь: ~11 км при 1 мм/ч, ~2 км при
+// 25 мм/ч; снег гуще: ~1,6 км при 1 мм/ч воды).
+@(private = "file")
+update_weather_light :: proc(r: ^Renderer, fp: ^Frame_Params) {
+	r.wx_fog = {}
+	ws := fp.weather
+	if ws == nil || !ws.here_ok || r.underwater do return
+	if c := fp.clouds; c != nil && r.pv.cam_h > c.height do return // над облаками — солнце
+	h := &ws.here
+	ov := f32(clamp(h.cover, 0, 1))
+	ov *= ov
+	st := f32(clamp(h.storm, 0, 1))
+	dim := 1 - 0.12 * ov - 0.18 * st * ov // тень облака на солнце уже есть (cloud_shadow); глаз привыкает к пасмурному свету
+	r.light.r *= dim
+	r.light.g *= dim
+	r.light.b *= dim
+	grey :: proc(c: [3]f32, k, dark: f32) -> [3]f32 {
+		l := c.r * 0.3 + c.g * 0.59 + c.b * 0.11
+		return (c + ([3]f32{0.93, 0.96, 1.0} * l - c) * k) * dark
+	}
+	r.sky_top = grey(r.sky_top, 0.75 * ov, 1 - 0.3 * st * ov)
+	r.sky_horizon = grey(r.sky_horizon, 0.75 * ov, 1 - 0.3 * st * ov)
+	if h.rain > 0.02 {
+		vr := 11_200 * math.pow(max(h.rain, 0.05), -0.6)
+		vs := 1_600 * math.pow(max(h.rain, 0.02), -0.7)
+		beta := 3.912 * ((1 - h.snow) / vr + h.snow / vs)
+		l := r.sky_horizon.r * 0.3 + r.sky_horizon.g * 0.59 + r.sky_horizon.b * 0.11
+		r.wx_fog = {f32(beta), l * 0.9, l * 0.92, l * 0.96}
 	}
 }
 
@@ -354,6 +413,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	r.sky_top, r.sky_horizon, r.sun_dir, r.glow = st.sky_top, st.sky_horizon, st.sun_frame, st.glow
 	r.light = {st.light.r, st.light.g, st.light.b, st.desat}
 	r.light_k = st.brightness
+	update_weather_light(r, &fp)
 	r.side_shade += (SIDE_SHADE - r.side_shade) * min(1, fp.dt * 1.5)
 	gl.ClearColor(r.sky_horizon.r, r.sky_horizon.g, r.sky_horizon.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
@@ -395,6 +455,11 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_vec4(r.chunk.u_layer_b, {f32(Tex.Birch_Leaves), f32(Tex.Spruce_Leaves), f32(Tex.Acacia_Leaves), f32(Tex.Jungle_Leaves)})
 	eng.set_vec4(r.chunk.u_layer_c, {f32(Tex.Dandelion), f32(Tex.Poppy), -1, -1})
 	eng.set_vec4(r.chunk.u_layer_d, {f32(Tex.Oak_Twigs), f32(Tex.Birch_Twigs), -1, -1})
+	if ws := fp.weather; ws != nil && ws.here_ok {
+		eng.set_vec4(r.chunk.u_wind, {f32(ws.wind_frame.x), f32(ws.wind_frame.z), f32(ws.here.gust), 0})
+	} else {
+		eng.set_vec4(r.chunk.u_wind, {})
+	}
 	set_sky_uniforms(r, r.chunk.prog)
 	gl.ActiveTexture(gl.TEXTURE0)
 	gl.BindTexture(gl.TEXTURE_2D_ARRAY, r.atlas)
@@ -465,8 +530,14 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	}
 	gl.Enable(gl.CULL_FACE)
 
-	// ---- частицы (дым и пыль, затем светящиеся — огонь, искры)
+	// ---- дождь и снег вокруг камеры (под облаками, не под водой)
 	gl.Disable(gl.CULL_FACE)
+	if ws := fp.weather; ws != nil && ws.here_ok && !r.underwater {
+		below := fp.clouds == nil || r.pv.cam_h < fp.clouds.height
+		if below do precip_draw(&ws.precip, fp.world, cam, ws.wind_frame, ws.here.rain, ws.here.snow, r.light.rgb, fp.time)
+	}
+
+	// ---- частицы (дым и пыль, затем светящиеся — огонь, искры)
 	if len(ld.particles.list) > 0 {
 		particles_draw(&ld.particles, cam, false, r.light.rgb)
 		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE)

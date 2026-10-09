@@ -157,7 +157,7 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 		panel_line(p, WHITE, fmt.tprintf("тайлов рельефа: %d на экране, %d в памяти, строится %d", ft.drawn, len(ft.tiles), ft.pending))
 	}
 	if c := fp.clouds; c != nil {
-		panel_line(p, WHITE, fmt.tprintf("облака: нижняя кромка %.0f м, облачность мира %.0f%%, над нами %.0f%%", c.height, c.cover * 100, fp.cloud_over * 100))
+		panel_line(p, WHITE, fmt.tprintf("облака: нижняя кромка %.0f м, облачность здесь %.0f%%, прямо над головой %.0f%%", c.height, c.cover * 100, fp.cloud_over * 100))
 	}
 	panel_line(p, WHITE, fmt.tprintf("кадр: %.1f мс", fp.frame_ms))
 	panel_gap(p)
@@ -843,6 +843,7 @@ local_climate :: proc(fp: ^Frame_Params) -> (lc: Local_Climate) {
 	dry := f64(lc.bc.tint & 15) / 15
 	lc.amp = (4 + 9 * dry) * clamp(math.sqrt(fp.clock.day_hours / 24), 0.6, 2.5)
 	lc.t_now = lc.t_day + lc.amp / 2 * math.cos((fp.sky_state.local_hours - 15) / 24 * math.TAU)
+	if ws := fp.weather; ws != nil && ws.here_ok do lc.t_now = ws.here.t_air // по погоде: под облаками суточный ход меньше
 	// снег — как в шейдере (snow_cover): копится в мороз, весной сходит с запаздыванием
 	t1, _ := climate_at(&climate, &lc.cp, fp.season + 1.0 / 24)
 	t0, _ := climate_at(&climate, &lc.cp, fp.season - 1.0 / 24)
@@ -861,6 +862,21 @@ page_climate :: proc(p: ^Panel, fp: ^Frame_Params) {
 	if !climate.ok do return
 	lc := local_climate(fp)
 	cm := &climate
+	if ws := fp.weather; ws != nil && ws.here_ok {
+		w := &ws.here
+		sky, precip := wx_describe(w)
+		panel_line(p, GOLD, fmt.tprintf("Погода сейчас: %s, %s; воздух %s °C", sky, precip, celsius(w.t_air)))
+		speed := math.sqrt(w.wind.x * w.wind.x + w.wind.y * w.wind.y)
+		dp := w.press - ws.press_3h
+		trend := dp < -1 ? "падает" : dp > 1 ? "растёт" : "почти не меняется"
+		vis := wx_visibility(w.rain, w.snow)
+		vis_s := vis > 0 ? fmt.tprintf("видимость ~%s", dist_text(vis)) : "видимость — по дымке"
+		panel_line(p, WHITE, fmt.tprintf("ветер %s %.0f м/с, порывы до %.0f м/с; давление %.0f гПа, %s (%+.1f за 3 ч); %s",
+			wx_wind_from(w.wind.x, w.wind.y), speed, w.gust, w.press, trend, dp, vis_s))
+		syn := w.syn > 1 ? "циклон" : w.syn < -1 ? "антициклон" : "между системами"
+		panel_line(p, GRAY, fmt.tprintf("над нами %s; облачность и осадки колеблются вокруг климата места — за месяц выпадает столько, сколько в климате", syn))
+		panel_gap(p)
+	}
 	if lc.ok {
 		k := lc.bc.k
 		if k.biome == .Ocean || k.biome == .Sea_Ice {

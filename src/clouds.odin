@@ -30,13 +30,16 @@ Clouds :: struct {
 	index_count: i32,
 	noise_tex:   u32, // 3D-текстура шума (NOISE_N³)
 	height:      f64, // нижняя кромка над уровнем моря, м
-	cover:       f64, // облачность здесь сейчас (0..1): по климату и погоде мира
-	weather:     f64, // погода мира: насколько облачнее или яснее климата (−0,2…+0,2)
+	cover:       f64, // облачность там, где мы, сейчас (0..1) — по погоде
 	offset:      [3]f64, // сдвиг узора этого мира (единицы шума)
 	wind:        [3]f64, // ветер (оси планеты), м/с
 	drift:       [3]f64, // накопленный снос узора, единицы шума
 	last_time:   f64,
 	time:        f64,
+	// погода (0.017): облачность и тучи по карте погоды вокруг игрока
+	wx:          ^Wx_Grid,
+	wx_q0:       [3]f64, // середина карты в координатах шума
+	wx_e, wx_n:  [3]f64, // оси карты: (q − wx_q0)·wx_e — доля карты к востоку
 }
 
 // air_scale — высота однородной атмосферы относительно Земли (облака выше на «высокой» атмосфере).
@@ -55,7 +58,6 @@ clouds_init :: proc(c: ^Clouds, seed: u32, air_scale: f64) -> bool {
 	r := eng.rng_make(u64(seed) * 0x5DEECE66D + 77)
 	c.height = clamp(1600 * air_scale, 800, 4000) * eng.rng_range(&r, 0.85, 1.15)
 	c.cover = eng.rng_range(&r, 0.25, 0.7)
-	c.weather = c.cover - 0.475
 	c.offset = {eng.rng_range(&r, 0, 997), eng.rng_range(&r, 0, 997), eng.rng_range(&r, 0, 997)}
 	w := [3]f64{eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1), eng.rng_range(&r, -1, 1)}
 	c.wind = w / max(len3(w), 1e-6) * CLOUD_WIND * eng.rng_range(&r, 0.6, 1.4)
@@ -164,11 +166,18 @@ cloud_density :: proc(c: ^Clouds, q: [3]f64, octaves := CLOUD_OCTAVES) -> f64 {
 		f *= 2
 	}
 	n := sum / 0.96875
-	// облачность меняется от места к месту (скопления ~70 км) и медленно во времени
-	cov := c.cover + 0.45 * (cloud_vnoise(q / 40 + {0, c.time / 1800, 0}) - 0.5) * 2
+	cov, _ := cloud_wx(c, q) // облачность — по карте погоды (как в шейдере)
 	thr := 0.5 + 0.2 * (0.5 - cov) * 2
 	t := clamp((n - thr) / 0.14, 0, 1)
 	return t * t * (3 - 2 * t)
+}
+
+// Облачность и тучи в точке шума q — по карте погоды (как wx_at в шейдере).
+cloud_wx :: proc(c: ^Clouds, q: [3]f64) -> (cover, storm: f64) {
+	if c.wx == nil || !c.wx.ok do return c.cover, 0
+	dq := q - c.wx_q0
+	v := wx_sample_far(c.wx, {0.5 + dq.x * c.wx_e.x + dq.y * c.wx_e.y + dq.z * c.wx_e.z, 0.5 + dq.x * c.wx_n.x + dq.y * c.wx_n.y + dq.z * c.wx_n.z})
+	return v[0], v[1]
 }
 
 // Непрозрачность облака (как в шейдере облаков).
@@ -182,8 +191,10 @@ cloud_shadow_at :: proc(c: ^Clouds, p, up, sun: [3]f64, h: f64) -> f64 {
 	sy := sun.x * up.x + sun.y * up.y + sun.z * up.z
 	if sy <= 0 || h > c.height do return 1 // выше облаков — тени нет
 	t := (c.height - h) / max(sy, 0.05) // до слоя облаков по лучу к солнцу
-	a := cloud_alpha(cloud_density(c, cloud_q(c, p + sun * t), 3)) * smooth01(sy / 0.1)
-	return 1 - CLOUD_SHADOW * a
+	q := cloud_q(c, p + sun * t)
+	a := cloud_alpha(cloud_density(c, q, 3)) * smooth01(sy / 0.1)
+	_, storm := cloud_wx(c, q) // под тучами темнее
+	return 1 - (CLOUD_SHADOW + 0.12 * storm) * a
 }
 
 @(private = "file")

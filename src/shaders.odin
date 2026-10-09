@@ -48,9 +48,12 @@ float haze_tau(vec3 rel) {
 	float e1 = exp(-max(h1, -50.0) * u_haze.y);
 	return u_haze.x * d * (e0 + 4.0 * em + e1) / 6.0;
 }
+uniform vec4 u_wx_fog; // дождь и снег: ослабление (1/м) и цвет мглы
 vec3 apply_haze(vec3 col, vec3 rel) {
 	float t = haze_tau(rel);
-	return mix(col, sky_color(normalize(rel)), 1.0 - exp(-t));
+	col = mix(col, sky_color(normalize(rel)), 1.0 - exp(-t));
+	if (u_wx_fog.x > 0.0) col = mix(col, u_wx_fog.yzw, 1.0 - exp(-u_wx_fog.x * length(rel)));
+	return col;
 }
 `
 
@@ -61,6 +64,18 @@ uniform vec3 u_cloud_q0; // камера в координатах шума об
 uniform mat3 u_cloud_jq; // оси кадра -> координаты шума
 uniform vec4 u_cloud;    // x — облачность мира, y — время (медленные перемены), z — высота облаков над морем (м), w — 1: облака есть
 uniform sampler3D u_cloud_noise; // значения в узлах решётки (128³, повторяется)
+uniform sampler2D u_wx;     // карта погоды вокруг (weather_view.odin): облачность, тучи, осадки, снег
+uniform vec3 u_wx_q0;       // середина карты в координатах шума
+uniform vec3 u_wx_e;        // оси карты: (q − u_wx_q0)·u_wx_e — доля карты к востоку
+uniform vec3 u_wx_n;
+uniform float u_wx_on;      // 1 — карта погоды готова
+uniform vec4 u_wx_mean;    // средняя по карте — за её краем
+vec4 wx_at(vec3 q) {
+	vec3 dq = q - u_wx_q0;
+	vec2 uv = vec2(0.5) + vec2(dot(dq, u_wx_e), dot(dq, u_wx_n));
+	vec2 e = abs(uv - 0.5);
+	return mix(texture(u_wx, uv), u_wx_mean, smoothstep(0.42, 0.5, max(e.x, e.y)));
+}
 // Value noise: текстура сама смешивает 8 узлов — нужно лишь сдвинуть точку
 // внутри клетки по плавной кривой (smoothstep), как в clouds.odin.
 float cloud_vnoise(vec3 p) {
@@ -80,7 +95,7 @@ float cloud_density(vec3 q, float fp, int octaves) {
 		f *= 2.0;
 	}
 	float n = sum / 0.96875;
-	float cov = u_cloud.x + 0.45 * (cloud_vnoise(q / 40.0 + vec3(0.0, u_cloud.y, 0.0)) - 0.5) * 2.0;
+	float cov = u_wx_on > 0.5 ? wx_at(q).r : u_cloud.x; // облачность — по карте погоды
 	float thr = 0.5 + 0.2 * (0.5 - cov) * 2.0;
 	return smoothstep(thr, thr + 0.14, n);
 }
@@ -96,7 +111,8 @@ float cloud_shadow(vec3 rel) {
 	float t = (u_cloud.z - h) / max(sy, 0.05);
 	vec3 q = u_cloud_q0 + u_cloud_jq * (rel + u_sun_dir * t);
 	float a = cloud_alpha(cloud_density(q, 0.0, 3)) * smoothstep(0.0, 1.0, sy / 0.1);
-	return 1.0 - 0.55 * a;
+	float storm = u_wx_on > 0.5 ? wx_at(q).g : 0.0; // под тучами темнее
+	return 1.0 - (0.55 + 0.12 * storm) * a;
 }
 `
 
@@ -207,6 +223,7 @@ uniform vec4 u_layer_a;    // слои: верх травы, бок травы, 
 uniform vec4 u_layer_b;    // листва берёзы, хвоя ели, листва акации, листва тропического дерева
 uniform vec4 u_layer_c;    // одуванчик, мак
 uniform vec3 u_chunk_id;   // номер секции (по модулю 1024) — для шума, привязанного к миру
+uniform vec4 u_wind;       // ветер у земли: xy — по осям x, z кадра (м/с), z — порывы (м/с)
 out vec3 v_uvl;
 out vec3 v_wpos; // позиция в сетке грани (по модулю), м
 flat out float v_bhash; // свой у каждого блока листвы (0…1, 16 ступеней)
@@ -252,6 +269,27 @@ void main() {
 	v_hash = fract(sin(dot(cell + u_origin * 0.0, vec3(12.9898, 78.233, 37.719)) + u_chunk_alt * 0.37) * 43758.5453);
 	v_bhash = float((flags >> 1u) & 15u) / 15.0;
 	v_wpos = u_chunk_id * 16.0 + q;
+	// ветер: трава и цветы клонятся (верх стебля), листва колышется; сдвиг зависит
+	// от места в мире — соседние блоки листвы сдвигаются одинаково, щелей нет
+	float ws = length(u_wind.xy);
+	if (ws > 0.3 && (kind == 3 || kind == 7 || kind == 4 || kind == 5)) {
+		vec2 wd = u_wind.xy / ws;
+		float gust = 0.5 + 0.5 * sin(u_time * 1.7 + dot(v_wpos.xz, wd) * 0.35 + v_wpos.x * 0.13);
+		float k = ws + (u_wind.z - ws) * gust * gust;
+		if (kind == 3 || kind == 7) {
+			if (a_tex.y == 0u) { // верх стебля
+				float bend = clamp(k / 14.0, 0.0, 0.45) * (0.75 + 0.25 * sin(u_time * 5.0 + v_wpos.x * 1.3 + v_wpos.z));
+				p.xz += wd * bend;
+				p.y -= bend * bend * 0.6;
+			}
+		} else {
+			float a = clamp(k / 20.0, 0.0, 1.0) * 0.06;
+			vec3 w = v_wpos;
+			p.xz += wd * a * (0.6 + 0.4 * sin(u_time * 2.3 + w.x * 0.5 + w.y * 0.4 + w.z * 0.6));
+			p.y += a * 0.5 * sin(u_time * 3.1 + w.x * 0.7 - w.z * 0.5 + w.y);
+		}
+	}
+	v_rel = p;
 	gl_Position = u_view_proj * vec4(p, 1.0);
 }
 `
@@ -617,8 +655,10 @@ void main() {
 	vec3 view = v_rel / dist;
 	// размер пикселя на слое (у горизонта луч скользит — пиксель вытянут); 1800 м — CLOUD_SCALE
 	float fp = dist * u_px / max(abs(view.y), 0.02) / 1800.0;
-	float d = cloud_density(u_pcs + v_v / 1800.0, fp, 5);
-	float a = cloud_alpha(d) * (1.0 - smoothstep(0.92, 1.0, v_t));
+	vec3 qc = u_pcs + v_v / 1800.0;
+	float d = cloud_density(qc, fp, 5);
+	float storm = u_wx_on > 0.5 ? wx_at(qc).g : 0.0; // дождевые и грозовые тучи — толще и темнее
+	float a = cloud_alpha(d * (1.0 + storm)) * (1.0 - smoothstep(0.92, 1.0, v_t));
 	if (a < 0.003) discard;
 	float mu = dot(view, u_sun_dir);
 	float sun_up = smoothstep(-0.05, 0.1, u_sun_dir.y);
@@ -628,9 +668,9 @@ void main() {
 		col = vec3(mix(0.84, 1.02, d)) * (0.75 + 0.25 * sun_up);
 	} else {
 		// низ облака освещён небом (серо-голубой), тонкие края пропускают солнце
-		vec3 shadow = vec3(0.64, 0.68, 0.78);
-		col = mix(vec3(1.0, 0.99, 0.97), shadow, d * (0.55 + 0.25 * sun_up));
-		col += vec3(1.0, 0.97, 0.9) * sun_up * pow(max(mu, 0.0), 6.0) * (1.0 - d) * 1.2;
+		vec3 shadow = mix(vec3(0.64, 0.68, 0.78), vec3(0.33, 0.35, 0.4), storm);
+		col = mix(vec3(1.0, 0.99, 0.97), shadow, min(d * (0.55 + 0.25 * sun_up) + 0.45 * storm, 1.0));
+		col += vec3(1.0, 0.97, 0.9) * sun_up * pow(max(mu, 0.0), 6.0) * (1.0 - d) * (1.0 - storm) * 1.2;
 	}
 	col = apply_light(col);
 	// заря подсвечивает тонкие края и низ со стороны солнца

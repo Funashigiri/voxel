@@ -93,7 +93,13 @@ box_collides :: proc(w: ^World, b: AABB) -> bool {
 	y0, y1 := cell_range(b.min.y, b.max.y)
 	z0, z1 := cell_range(b.min.z, b.max.z)
 	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
-		if world_is_solid(w, x, y, z) do return true
+		if !world_is_solid(w, x, y, z) do continue
+		bx, n := block_boxes(w, x, y, z)
+		for c in bx[:n] {
+			inside := true
+			for a in 0 ..< 3 do if b.max[a] <= c[0][a] + EPS || b.min[a] >= c[1][a] - EPS do inside = false
+			if inside do return true
+		}
 	}
 	return false
 }
@@ -114,18 +120,20 @@ clip_axis :: proc(w: ^World, b: AABB, d: f64, axis: int) -> f64 {
 	d := d
 	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
 		if !world_is_solid(w, x, y, z) do continue
-		cmin := [3]f64{f64(x), f64(y), f64(z)}
-		cmax := cmin + 1
-		overlap := true
-		for a in 0 ..< 3 {
-			if a == axis do continue
-			if b.max[a] <= cmin[a] + EPS || b.min[a] >= cmax[a] - EPS do overlap = false
-		}
-		if !overlap do continue
-		if d > 0 && b.max[axis] <= cmin[axis] + EPS {
-			d = min(d, cmin[axis] - b.max[axis])
-		} else if d < 0 && b.min[axis] >= cmax[axis] - EPS {
-			d = max(d, cmax[axis] - b.min[axis])
+		bx, n := block_boxes(w, x, y, z) // у тонкого ствола — его настоящая форма
+		for c in bx[:n] {
+			cmin, cmax := c[0], c[1]
+			overlap := true
+			for a in 0 ..< 3 {
+				if a == axis do continue
+				if b.max[a] <= cmin[a] + EPS || b.min[a] >= cmax[a] - EPS do overlap = false
+			}
+			if !overlap do continue
+			if d > 0 && b.max[axis] <= cmin[axis] + EPS {
+				d = min(d, cmin[axis] - b.max[axis])
+			} else if d < 0 && b.min[axis] >= cmax[axis] - EPS {
+				d = max(d, cmax[axis] - b.min[axis])
+			}
 		}
 	}
 	return d

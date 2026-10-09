@@ -112,22 +112,22 @@ tree_kind_for :: proc(bc: ^Block_Climate, roll, birch_noise: f64) -> Tree_Kind {
 }
 
 // Блоки вида: ствол (кольца сверху), ветви (кора со всех сторон), листва.
-tree_blocks_of :: proc(k: Tree_Kind) -> (log, wood, leaves: Block) {
+tree_blocks_of :: proc(k: Tree_Kind) -> (log, wood, pole, leaves: Block) {
 	switch k {
 	case .Oak:
-		return .Oak_Log, .Oak_Wood, .Oak_Leaves
+		return .Oak_Log, .Oak_Wood, .Oak_Pole, .Oak_Leaves
 	case .Birch:
-		return .Birch_Log, .Birch_Wood, .Birch_Leaves
+		return .Birch_Log, .Birch_Wood, .Birch_Pole, .Birch_Leaves
 	case .Spruce:
-		return .Spruce_Log, .Spruce_Wood, .Spruce_Leaves
+		return .Spruce_Log, .Spruce_Wood, .Spruce_Pole, .Spruce_Leaves
 	case .Acacia:
-		return .Acacia_Log, .Acacia_Wood, .Acacia_Leaves
+		return .Acacia_Log, .Acacia_Wood, .Acacia_Pole, .Acacia_Leaves
 	case .Jungle:
-		return .Jungle_Log, .Jungle_Wood, .Jungle_Leaves
+		return .Jungle_Log, .Jungle_Wood, .Jungle_Pole, .Jungle_Leaves
 	case .Cactus:
-		return .Cactus, .Cactus, .Air
+		return .Cactus, .Cactus, .Cactus, .Air
 	}
-	return .Oak_Log, .Oak_Wood, .Oak_Leaves
+	return .Oak_Log, .Oak_Wood, .Oak_Pole, .Oak_Leaves
 }
 
 // ---------------------------------------------------------------- деревья по клеткам
@@ -138,21 +138,77 @@ Tree_Cell :: struct {
 	ok:   bool,
 }
 
-// Клетки общие у соседних колонок — дерево считается один раз (генерация — в главном потоке).
+// Клетки общие у соседних колонок — дерево считается один раз (генерация — в
+// главном потоке). raw — каким выросло бы дерево без соседей, tree — с ними.
 @(private = "file")
 tree_cache: map[[3]i32]Tree_Cell
+@(private = "file")
+raw_cache: map[[3]i32]Tree_Cell
 
 trees_reset :: proc() {
 	clear(&tree_cache)
+	clear(&raw_cache)
+}
+
+// Теневыносливость: доля деревьев вида, что выживают подростом под чужой кроной.
+TREE_SHADE := [Tree_Kind]f64 {
+	.Oak    = 0.35,
+	.Birch  = 0.1,
+	.Spruce = 0.85,
+	.Acacia = 0.05,
+	.Jungle = 0.9,
+	.Cactus = 1,
 }
 
 // Дерево клетки (cx, cz) грани face — одно и то же, из какой колонки ни спроси.
+//
+// Конкуренция за свет: если ствол накрывает крона соседа, что выше, дерево в
+// тени — растёт медленно, остаётся невысоким (ниже полога соседа), с маленькой
+// кроной и тонким стволом. Светолюбивые виды в тени гибнут (TREE_SHADE). Так в
+// пологе остаётся столько деревьев, сколько помещается крон.
 tree_in_cell :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (Tree, bool) {
 	key := [3]i32{i32(face), cx, cz}
 	if c, ok := tree_cache[key]; ok do return c.tree, c.ok
 	if len(tree_cache) > 400_000 do clear(&tree_cache)
-	t, ok := make_tree(w, face, cx, cz)
+	t, ok := raw_tree(w, face, cx, cz)
+	if ok && t.kind != .Cactus {
+		top := 1.0e9 // низ полога над деревом (от его основания), м
+		for dz in i32(-2) ..= 2 do for dx in i32(-2) ..= 2 {
+			if dx == 0 && dz == 0 do continue
+			o, has := raw_tree(w, face, cx + dx, cz + dz)
+			if !has || o.kind == .Cactus do continue
+			if o.height < t.height || (o.height == t.height && o.seed < t.seed) do continue
+			ex, ez := f64(o.x - t.x), f64(o.z - t.z)
+			if ex * ex + ez * ez > f64(o.crown * o.crown) * 0.8 do continue
+			top = min(top, f64(o.base) + f64(o.crown_base) - f64(t.base))
+		}
+		if top < 1.0e9 {
+			if f64(eng.hash2f(cx, cz, w.seed + 503)) > TREE_SHADE[t.kind] {
+				ok = false // не выжило в тени
+			} else {
+				H := min(f64(t.height), max(1.6, 0.6 * top))
+				t.height = f32(H)
+				t.crown = f32(min(f64(t.crown), 0.8 + 0.15 * H))
+				t.crown_base = f32(0.45 * H)
+				t.dbh *= 0.35 // в тени ствол почти не толстеет
+				t.under = true
+				t.fins = 0
+				t.girth = 1
+				t.thin = t.dbh < 0.45
+			}
+		}
+	}
 	tree_cache[key] = {t, ok}
+	return t, ok
+}
+
+@(private = "file")
+raw_tree :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (Tree, bool) {
+	key := [3]i32{i32(face), cx, cz}
+	if c, ok := raw_cache[key]; ok do return c.tree, c.ok
+	if len(raw_cache) > 400_000 do clear(&raw_cache)
+	t, ok := make_tree(w, face, cx, cz)
+	raw_cache[key] = {t, ok}
 	return t, ok
 }
 
@@ -214,6 +270,8 @@ make_tree :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (t: Tree, ok: bool
 		crown_base = f32(H - crown_len),
 		kind       = kind,
 		girth      = D >= 1.3 ? 2 : 1,
+		thin       = D < 0.45,
+		dbh        = f32(D),
 		seed       = hsh,
 	}
 	if kind == .Jungle && D >= 0.6 && H >= 15 do t.fins = u8(3 + eng.rng_int(&r, 0, 2))
@@ -262,6 +320,7 @@ Raster :: struct {
 	lo, hi: [3]i32, // куда рисуем (hi — не включая)
 	data:   rawptr,
 	put:    Tree_Put,
+	blk:    Block, // блок отрезка, что рисуется сейчас (seg_walk)
 }
 
 @(private = "file")
@@ -336,6 +395,16 @@ draw_seg :: proc(r: ^Raster, s: Seg) {
 	steps := int(math.ceil(max(abs(d.x), abs(d.y), abs(d.z)) * 2)) + 1
 	cur := fl(s.a)
 	put_cell(r, cur, s.blk)
+	// тонкая ветвь — во всех клетках, через которые проходит её линия (сетку
+	// рисует сама линия); толстая — лесенкой через грани
+	if BLOCK_INFO[s.blk].render == .Post {
+		r.blk = s.blk
+		seg_walk(s.a, s.b, r, proc(data: rawptr, cell: [3]i32, t0, t1: f64) {
+			rr := (^Raster)(data)
+			put_cell(rr, cell, rr.blk)
+		})
+		return
+	}
 	for i in 1 ..= steps {
 		c := fl(s.a + d * (f64(i) / f64(steps)))
 		for axis in 0 ..< 3 {
@@ -364,10 +433,9 @@ draw_blob :: proc(r: ^Raster, b: Blob, leaves: Block, seed: u32) {
 }
 
 // Ель: хвоя ярусами-мутовками, конусом от низа кроны к макушке; концы ветвей
-// мутовки свисают — ярусом ниже лежит их край. Ниже кроны на стволе остаются
-// сухие сучья (в тени ветви отмирают, но долго не опадают).
+// мутовки свисают — ярусом ниже лежит их край (сухие сучья ниже кроны — в tree_shape).
 @(private = "file")
-draw_spruce :: proc(r: ^Raster, t: Tree, c: [3]f64, leaves, wood: Block) {
+draw_spruce :: proc(r: ^Raster, t: Tree, c: [3]f64, leaves: Block) {
 	top := t.base + i32(f64(t.height))
 	ylo := t.base + i32(f64(t.crown_base))
 	span := f64(top - ylo) + 1
@@ -395,58 +463,80 @@ draw_spruce :: proc(r: ^Raster, t: Tree, c: [3]f64, leaves, wood: Block) {
 			if f64(eng.hash3f(x, y, z, t.seed)) < keep do r.put(r.data, x, y, z, leaves)
 		}
 	}
-	// сухие сучья под кроной
-	g := i32(t.girth)
-	for y in max(t.base + 2, r.lo.y) ..< min(ylo - 1, r.hi.y) {
-		h := eng.hash3(t.x, y, t.z, t.seed)
-		if h % 100 >= 16 do continue
-		sides := [4][2]i32{{-1, 0}, {g, 0}, {0, -1}, {0, g}}
-		side := sides[(h >> 8) % 4]
-		put_cell(r, {t.x + side.x, y, t.z + side.y}, wood)
+}
+
+// Форма дерева: отрезки древесины и облака листвы (ель — свою хвою рисует сама).
+// Тонкий ствол — тоже отрезок; у толстого ствол — колонна блоков до trunk_top.
+@(private = "file")
+tree_shape :: proc(t: Tree) -> (s: Shape, trunk_top: f64, c: [3]f64) {
+	log, wood, pole, _ := tree_blocks_of(t.kind)
+	_ = log
+	// главные сучья толщиной в блок — только у толстых деревьев, мелкие ветви,
+	// сухие сучки и корни — тонкие
+	limb := t.dbh >= 0.9 ? wood : pole
+	g := f64(t.girth)
+	c = {f64(t.x) + g / 2, f64(t.base), f64(t.z) + g / 2}
+	rng := eng.rng_make(u64(t.seed) * 0x9E37_79B9_7F4A_7C15 + 1)
+	switch t.kind {
+	case .Oak:
+		trunk_top = shape_oak(&s, t, c, &rng, limb, pole)
+	case .Birch:
+		trunk_top = shape_birch(&s, t, c, &rng, limb, pole)
+	case .Spruce:
+		trunk_top = f64(t.height) - 1
+		// сухие сучья под кроной: в тени ветви отмирают, но долго не опадают
+		ylo := t.base + i32(f64(t.crown_base))
+		for y in t.base + 2 ..< ylo - 1 {
+			h := eng.hash3(t.x, y, t.z, t.seed)
+			if h % 100 >= 16 do continue
+			az := f64(h >> 8 & 1023) / 1024 * math.TAU
+			p := c + V{0, f64(y - t.base) + 0.5, 0}
+			add_seg(&s, p, p + V{math.cos(az), -0.15, math.sin(az)} * (g / 2 + 0.9), pole)
+		}
+	case .Acacia:
+		trunk_top = shape_acacia(&s, t, c, &rng, limb, pole)
+	case .Jungle:
+		trunk_top = shape_jungle(&s, t, c, &rng, limb, pole)
+	case .Cactus:
 	}
+	// тонкий ствол — отрезок от земли (с запасом вниз — на склоне не висит) до развилки
+	if t.thin do add_seg(&s, c + V{0, -3, 0}, c + V{0, trunk_top, 0}, pole)
+	return
+}
+
+// Тонкие отрезки дерева (стволы, ветви, сучья, корни) — для их сетки (mesher.odin).
+tree_thin_segments :: proc(t: Tree, out: ^[dynamic][2][3]f64) {
+	if t.kind == .Cactus do return
+	s, _, _ := tree_shape(t)
+	for sg in s.segs[:s.nseg] do if BLOCK_INFO[sg.blk].render == .Post do append(out, [2][3]f64{sg.a, sg.b})
 }
 
 // Блоки дерева в области [lo, hi): сначала листва, потом дерево (брёвна вытесняют листву).
 tree_blocks :: proc(t: Tree, lo, hi: [3]i32, data: rawptr, put: Tree_Put) {
 	if !tree_touches(t, lo, hi) do return
-	r := Raster{lo, hi, data, put}
-	log, wood, leaves := tree_blocks_of(t.kind)
+	r := Raster{lo = lo, hi = hi, data = data, put = put}
 	if t.kind == .Cactus {
 		for dy in 0 ..< i32(t.height) do put_cell(&r, {t.x, t.base + dy, t.z}, .Cactus)
 		return
 	}
-	g := f64(t.girth)
-	c := [3]f64{f64(t.x) + g / 2, f64(t.base), f64(t.z) + g / 2}
-	s: Shape
-	rng := eng.rng_make(u64(t.seed) * 0x9E37_79B9_7F4A_7C15 + 1)
-	trunk_top: f64
-	switch t.kind {
-	case .Oak:
-		trunk_top = shape_oak(&s, t, c, &rng, wood)
-	case .Birch:
-		trunk_top = shape_birch(&s, t, c, &rng, wood)
-	case .Spruce:
-		trunk_top = f64(t.height) - 1
-	case .Acacia:
-		trunk_top = shape_acacia(&s, t, c, &rng, wood)
-	case .Jungle:
-		trunk_top = shape_jungle(&s, t, c, &rng, wood)
-	case .Cactus:
-	}
-	if t.kind == .Spruce do draw_spruce(&r, t, c, leaves, wood)
+	log, _, _, leaves := tree_blocks_of(t.kind)
+	s, trunk_top, c := tree_shape(t)
+	if t.kind == .Spruce do draw_spruce(&r, t, c, leaves)
 	for b in s.blobs[:s.nblob] do draw_blob(&r, b, leaves, t.seed)
-	// ствол: от земли (с запасом вниз — на склоне не висит в воздухе) до развилки
-	for dz in i32(0) ..< i32(t.girth) do for dx in i32(0) ..< i32(t.girth) {
-		x, z := t.x + dx, t.z + dz
-		if x < lo.x || z < lo.z || x >= hi.x || z >= hi.z do continue
-		for y in max(t.base - 3, lo.y) ..< min(t.base + i32(math.ceil(trunk_top)), hi.y) do put(data, x, y, z, log)
+	// толстый ствол: колонна блоков от земли (с запасом вниз) до развилки
+	if !t.thin {
+		for dz in i32(0) ..< i32(t.girth) do for dx in i32(0) ..< i32(t.girth) {
+			x, z := t.x + dx, t.z + dz
+			if x < lo.x || z < lo.z || x >= hi.x || z >= hi.z do continue
+			for y in max(t.base - 3, lo.y) ..< min(t.base + i32(math.ceil(trunk_top)), hi.y) do put(data, x, y, z, log)
+		}
 	}
 	for sg in s.segs[:s.nseg] do draw_seg(&r, sg)
 }
 
 // Дуб: ствол делится на несколько толстых кривых сучьев, крона широкая, округлая.
 @(private = "file")
-shape_oak :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> (trunk: f64) {
+shape_oak :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: Block) -> (trunk: f64) {
 	H, R, cb := f64(t.height), f64(t.crown), f64(t.crown_base)
 	if H < 6 {
 		add_blob(s, c + V{0, H - max(R * 0.7, 1), 0}, max(R, 1.2), max(R * 0.8, 1.2), 0.9)
@@ -461,11 +551,15 @@ shape_oak :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> 
 	for i in 0 ..< n {
 		az := az0 + math.TAU * f64(i) / f64(n) + rr(rng, -0.4, 0.4)
 		start := c + V{0, bole + rr(rng, 0, (H - bole) * 0.3), 0}
-		incl := rr(rng, 0.45, 0.8) + 0.3 * clamp((R / H - 0.22) / 0.2, 0, 1) // в лесу сучья круче вверх, на просторе — шире
+		// сук сначала отходит от ствола полого (иначе в блоках он шёл бы вплотную к
+		// стволу), у локтя заворачивает вверх; в лесу — круче, на просторе — шире
+		open := clamp((R / H - 0.22) / 0.2, 0, 1)
 		reach := max(R - rl * 0.6, 0.8) * rr(rng, 0.75, 1.0)
-		end := start + dir_at(az, incl) * (reach / math.sin(incl))
+		incl1 := rr(rng, 0.9, 1.2)
+		mid := start + dir_at(az, incl1) * (reach * 0.5 / math.sin(incl1))
+		incl2 := rr(rng, 0.35, 0.65) + 0.4 * open
+		end := mid + dir_at(az + rr(rng, -0.3, 0.3), incl2) * (reach * 0.5 / math.sin(incl2))
 		end.y = min(end.y, c.y + H - rl * 0.7)
-		mid := (start + end) * 0.5 + V{rr(rng, -0.7, 0.7), rr(rng, -0.3, 0.5), rr(rng, -0.7, 0.7)}
 		add_seg(s, start, mid, wood)
 		add_seg(s, mid, end, wood)
 		add_blob(s, end + V{0, rl * 0.25, 0}, rl, rl * 0.75, 0.92)
@@ -473,7 +567,7 @@ shape_oak :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> 
 		az2 := az + (eng.rng_f64(rng) < 0.5 ? -1.0 : 1.0) * rr(rng, 0.6, 1.1)
 		e2 := mid + dir_at(az2, rr(rng, 0.7, 1.1)) * (reach * 0.55)
 		e2.y = min(e2.y, c.y + H - rl * 0.6)
-		if H >= 12 do add_seg(s, mid, e2, wood)
+		if H >= 12 do add_seg(s, mid, e2, twig)
 		add_blob(s, e2 + V{0, rl * 0.2, 0}, rl * 0.8, rl * 0.65, 0.9)
 	}
 	add_blob(s, lead + V{0, 0.3, 0}, rl * 1.05, rl * 0.8, 0.92)
@@ -482,7 +576,7 @@ shape_oak :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> 
 
 // Берёза: тонкий ствол почти до макушки, ветви круто вверх, концы свисают.
 @(private = "file")
-shape_birch :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> (trunk: f64) {
+shape_birch :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: Block) -> (trunk: f64) {
 	H, R, cb := f64(t.height), f64(t.crown), f64(t.crown_base)
 	if H < 6 {
 		add_blob(s, c + V{0, H - max(R * 1.2, 1), 0}, max(R, 1), max(R * 1.4, 1.3), 0.9)
@@ -495,11 +589,11 @@ shape_birch :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -
 		az += 2.39996 + rr(rng, -0.3, 0.3) // золотой угол — ветви не друг над другом
 		f := (f64(i) + rr(rng, 0.2, 0.8)) / f64(n) // 0 — низ кроны, 1 — верх
 		start := c + V{0, cb + (H * 0.88 - cb) * f, 0}
-		incl := rr(rng, 0.4, 0.7)
+		incl := rr(rng, 0.8, 1.05) // в блоках круче 45° ветвь шла бы вплотную к стволу
 		reach := max(R - rl * 0.5, 0.6) * (1.05 - 0.6 * f) * rr(rng, 0.8, 1.0)
 		end := start + dir_at(az, incl) * (reach / math.sin(incl))
 		end.y = min(end.y, c.y + H - 1)
-		if H >= 10 do add_seg(s, start, start + (end - start) * 0.7, wood)
+		if H >= 10 do add_seg(s, start, start + (end - start) * 0.7, twig)
 		add_blob(s, end + V{0, -rl * 0.35, 0}, rl, rl * 1.35, 0.85) // концы ветвей свисают
 	}
 	add_blob(s, c + V{0, H - 1.7, 0}, rl * 0.9, rl * 1.4, 0.9)
@@ -508,7 +602,7 @@ shape_birch :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -
 
 // Акация: короткий ствол расходится на несколько наклонных ветвей, сверху — плоский зонтик.
 @(private = "file")
-shape_acacia :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> (trunk: f64) {
+shape_acacia :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: Block) -> (trunk: f64) {
 	H, R := f64(t.height), f64(t.crown)
 	if H < 3.5 {
 		add_blob(s, c + V{0, H - 0.8, 0}, max(R, 1.2), 0.9, 0.85)
@@ -531,7 +625,7 @@ shape_acacia :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) 
 		for k in 0 ..< 2 {
 			az2 := az + (k == 0 ? -1.0 : 1.0) * rr(rng, 0.4, 0.9)
 			e2 := end + V{math.cos(az2) * R * 0.3, 0.6, math.sin(az2) * R * 0.3}
-			if H >= 9 do add_seg(s, end, e2, wood)
+			if H >= 9 do add_seg(s, end, e2, twig)
 		}
 		add_blob(s, end + V{0, 1.0, 0}, R * rr(rng, 0.45, 0.6), rr(rng, 0.9, 1.2), 0.9)
 	}
@@ -542,23 +636,21 @@ shape_acacia :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) 
 // Дерево тропического леса: прямой гладкий ствол на две трети высоты, у
 // великанов — досковидные корни; наверху раскидистые сучья и широкая крона.
 @(private = "file")
-shape_jungle :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) -> (trunk: f64) {
+shape_jungle :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: Block) -> (trunk: f64) {
 	H, R, cb := f64(t.height), f64(t.crown), f64(t.crown_base)
 	if H < 8 {
 		add_blob(s, c + V{0, H - max(R * 0.6, 1), 0}, max(R, 1.3), max(R * 0.7, 1.2), 0.9)
 		return H - 1
 	}
-	// досковидные корни: стенки от ствола, к краю ниже
+	// досковидные корни и корни-подпорки: тонкие тяжи от ствола наискось к земле
 	az := rr(rng, 0, math.TAU)
 	g := f64(t.girth)
 	for _ in 0 ..< int(t.fins) {
 		az += math.TAU / f64(t.fins) + rr(rng, -0.3, 0.3)
-		n := 2 + eng.rng_int(rng, 0, 2)
+		dir := V{math.cos(az), 0, math.sin(az)}
 		fh := rr(rng, 2.5, 4.5)
-		for k in 1 ..= n {
-			p := c + V{math.cos(az), 0, math.sin(az)} * (g / 2 + f64(k) - 0.5)
-			add_seg(s, p + V{0, -3, 0}, p + V{0, fh * (1 - f64(k) / f64(n + 1)), 0}, wood)
-		}
+		reach := g / 2 + rr(rng, 1.5, 3.2)
+		add_seg(s, c + dir * (g / 2) + V{0, fh, 0}, c + dir * reach + V{0, -1, 0}, twig)
 	}
 	bole := max(cb, H * 0.6)
 	lead := c + V{rr(rng, -0.5, 0.5), H - 2.5, rr(rng, -0.5, 0.5)}
@@ -569,18 +661,19 @@ shape_jungle :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood: Block) 
 	for i in 0 ..< n {
 		a := az0 + math.TAU * f64(i) / f64(n) + rr(rng, -0.4, 0.4)
 		start := c + V{0, bole + rr(rng, 0, (H - bole) * 0.25), 0}
-		incl := rr(rng, 0.7, 1.1)
 		reach := max(R - rl * 0.6, 1) * rr(rng, 0.75, 1.0)
-		end := start + dir_at(a, incl) * (reach / math.sin(incl))
+		incl1 := rr(rng, 0.95, 1.25) // от ствола полого, потом вверх
+		mid := start + dir_at(a, incl1) * (reach * 0.55 / math.sin(incl1))
+		incl2 := rr(rng, 0.55, 0.9)
+		end := mid + dir_at(a + rr(rng, -0.3, 0.3), incl2) * (reach * 0.45 / math.sin(incl2))
 		end.y = min(end.y, c.y + H - rl * 0.45 - 0.5)
-		mid := (start + end) * 0.5 + V{rr(rng, -0.6, 0.6), rr(rng, -0.2, 0.4), rr(rng, -0.6, 0.6)}
 		add_seg(s, start, mid, wood)
 		add_seg(s, mid, end, wood)
 		add_blob(s, end + V{0, rl * 0.2, 0}, rl, rl * 0.5, 0.92)
 		a2 := a + (eng.rng_f64(rng) < 0.5 ? -1.0 : 1.0) * rr(rng, 0.6, 1.0)
 		e2 := mid + dir_at(a2, rr(rng, 0.9, 1.3)) * (reach * 0.5)
 		e2.y = min(e2.y, c.y + H - rl * 0.4)
-		if H >= 15 do add_seg(s, mid, e2, wood)
+		if H >= 15 do add_seg(s, mid, e2, twig)
 		add_blob(s, e2 + V{0, rl * 0.15, 0}, rl * 0.75, rl * 0.45, 0.9)
 	}
 	add_blob(s, lead + V{0, 0.5, 0}, rl, rl * 0.55, 0.92)
@@ -666,7 +759,8 @@ trees_selftest :: proc(w: ^World, cx, cz: f64) -> (errors: int) {
 	face := w.geo.face
 	HALF :: 300
 	x0, z0 := i32(cx) - HALF, i32(cz) - HALF
-	count, thick, fins, checked: int
+	count, thick, fins, checked, canopy, under, thin: int
+	canopy_h: f64
 	h_sum, h_max: f64
 	kinds: [Tree_Kind]int
 	Collect :: struct {
@@ -685,6 +779,12 @@ trees_selftest :: proc(w: ^World, cx, cz: f64) -> (errors: int) {
 			h_sum += f64(t.height)
 			h_max = max(h_max, f64(t.height))
 			if t.girth == 2 do thick += 1
+			if t.under do under += 1
+			if t.thin do thin += 1
+			if !t.under && t.kind != .Cactus {
+				canopy += 1
+				canopy_h += f64(t.height)
+			}
 			if t.fins > 0 do fins += 1
 			if checked >= 60 || t.height < 6 do continue
 			checked += 1
@@ -726,8 +826,45 @@ trees_selftest :: proc(w: ^World, cx, cz: f64) -> (errors: int) {
 	ha := f64(2 * HALF) * f64(2 * HALF) / 10_000
 	sb := make([dynamic]u8, context.temp_allocator)
 	for k in Tree_Kind do if kinds[k] > 0 do append(&sb, ..transmute([]u8)fmt.tprintf(" %s %d,", TREE_NAMES[k], kinds[k]))
-	fmt.printfln("деревья (%.0f га вокруг): %.0f стволов на гектар, высота в среднем %.1f м, до %.1f м; толстых стволов (2×2) %.1f%%, с досковидными корнями %.1f%%;%s формы %d деревьев по секциям, в колонке до %d деревьев (предел %d), ошибок %d",
-		ha, f64(count) / ha, h_sum / max(f64(count), 1), h_max, f64(thick) * 100 / max(f64(count), 1), f64(fins) * 100 / max(f64(count), 1),
+	fmt.printfln("деревья (%.0f га вокруг): %.0f стволов на гектар — в пологе %.0f (высота в среднем %.1f м), подрост в тени %.0f; высота до %.1f м; тонких стволов (<45 см) %.0f%%, толстых (2×2) %.1f%%, с досковидными корнями %.1f%%;%s формы %d деревьев по секциям, в колонке до %d деревьев (предел %d), ошибок %d",
+		ha, f64(count) / ha, f64(canopy) / ha, canopy_h / max(f64(canopy), 1), f64(under) / ha, h_max, f64(thin) * 100 / max(f64(count), 1), f64(thick) * 100 / max(f64(count), 1), f64(fins) * 100 / max(f64(count), 1),
 		string(sb[:]), checked, most, MAX_COL_TREES, errors)
 	return
+}
+
+// Клетки, через которые проходит отрезок a–b (все, по порядку; 3D DDA), и доля
+// отрезка [t0, t1] внутри каждой — для тонких ветвей: блоки и их сетка
+// совпадают с настоящей линией ветви.
+seg_walk :: proc(a, b: [3]f64, data: rawptr, visit: proc(data: rawptr, cell: [3]i32, t0, t1: f64)) {
+	d := b - a
+	cell := [3]i32{i32(math.floor(a.x)), i32(math.floor(a.y)), i32(math.floor(a.z))}
+	last := [3]i32{i32(math.floor(b.x)), i32(math.floor(b.y)), i32(math.floor(b.z))}
+	step: [3]i32
+	t_max, t_delta: [3]f64
+	for k in 0 ..< 3 {
+		if d[k] > 1e-12 {
+			step[k] = 1
+			t_max[k] = (f64(cell[k]) + 1 - a[k]) / d[k]
+			t_delta[k] = 1 / d[k]
+		} else if d[k] < -1e-12 {
+			step[k] = -1
+			t_max[k] = (f64(cell[k]) - a[k]) / d[k]
+			t_delta[k] = -1 / d[k]
+		} else {
+			t_max[k] = 1.0e30
+			t_delta[k] = 1.0e30
+		}
+	}
+	t := 0.0
+	for _ in 0 ..< 512 {
+		k := 0
+		if t_max[1] < t_max[k] do k = 1
+		if t_max[2] < t_max[k] do k = 2
+		t1 := min(t_max[k], 1)
+		if t1 > t do visit(data, cell, t, t1)
+		if cell == last || t_max[k] >= 1 do return
+		t = t_max[k]
+		cell[k] += step[k]
+		t_max[k] += t_delta[k]
+	}
 }
