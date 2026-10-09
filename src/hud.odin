@@ -107,8 +107,8 @@ lon_text :: proc(lon: f64) -> string {
 	return lon <= 180 ? fmt.tprintf("%.1f° в.д.", lon) : fmt.tprintf("%.1f° з.д.", 360 - lon)
 }
 
-PAGE_TITLES := [F3_PAGES + 1]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо", "строение планеты", "атмосфера"}
-F3_PAGES :: 6
+PAGE_TITLES := [F3_PAGES + 1]string{"", "мир и планета", "звёздная система", "галактика и вселенная", "звёздное небо", "строение планеты", "атмосфера", "звезда"}
+F3_PAGES :: 7
 
 // Шапка любой страницы F3.
 @(private = "file")
@@ -586,6 +586,228 @@ hud_draw_cutaway :: proc(fp: ^Frame_Params, ortho: matrix[4, 4]f32) {
 	eng.imm_flush(ortho)
 }
 
+@(private = "file")
+STAR_ZONE_COLS := [?]f32{0, 172, 264, 420, 504}
+
+// Время: годы, тысячи, миллионы, миллиарды лет.
+@(private = "file")
+years_text :: proc(y: f64) -> string {
+	switch {
+	case y < 1:
+		return fmt.tprintf("%.0f сут", y * 365.25)
+	case y < 1e3:
+		return fmt.tprintf("%.0f лет", y)
+	case y < 1e6:
+		return fmt.tprintf("%.0f тыс. лет", y / 1e3)
+	case y < 1e9:
+		return fmt.tprintf("%.0f млн лет", y / 1e6)
+	case y < 1e12:
+		return fmt.tprintf("%.1f млрд лет", y / 1e9)
+	}
+	return fmt.tprintf("%s лет", sci_text(y))
+}
+
+// Радиус слоя от центра: тысячи км или км.
+@(private = "file")
+star_r_text :: proc(r, radius_km: f64) -> string {
+	km := r * radius_km
+	switch {
+	case km >= 1e6:
+		return fmt.tprintf("%.1f млн км", km / 1e6)
+	case km >= 1e4:
+		return fmt.tprintf("%.0f тыс. км", km / 1e3)
+	}
+	return fmt.tprintf("%.1f км", km)
+}
+
+// Страница 7: наша звезда — строение, центр, горение, активность, будущее.
+@(private = "file")
+page_star :: proc(p: ^Panel, fp: ^Frame_Params) {
+	st := fp.star_st
+	if st == nil do return
+	s := fp.system
+	star := &s.star
+	radius_km := star.radius * SUN_RADIUS_KM
+	panel_line(p, GOLD, fmt.tprintf("Звезда %s — %s, %.0f K", star.name, STAR_CLASS_NAMES[star.class], star.temperature))
+	panel_line(p, WHITE, STAR_STAGE_NAMES[st.stage])
+	panel_line(p, WHITE, fmt.tprintf("масса %.2f, радиус %.2f (%s), светимость %.2f (Солнце = 1); у поверхности тяжесть %.0f g, убегание %.0f км/с",
+		star.mass, star.radius, star_r_text(1, radius_km), star.luminosity, st.g / 9.80665, st.v_esc))
+	if st.stage == .Main_Sequence {
+		panel_line(p, WHITE, fmt.tprintf("возраст %.1f млрд лет: в ядре сгорело %.0f%% водорода, гореть ещё ~%s; при рождении светила на %.0f%% слабее",
+			s.age_gyr, st.burned * 100, years_text(st.remaining * 1e9), (1 - st.birth_lum) * 100))
+	} else {
+		panel_line(p, WHITE, fmt.tprintf("возраст %.1f млрд лет", s.age_gyr))
+	}
+	panel_gap(p)
+
+	// центр
+	atm := st.pc / 101325
+	panel_line(p, GOLD, fmt.tprintf("В центре: %s, %s, давление %s Па (%s атмосфер)", star_temp_text(st.tc), star_rho_text(st.rhoc), sci_text(st.pc), sci_text(atm)))
+	switch st.stage {
+	case .Main_Sequence:
+		panel_line(p, WHITE, fmt.tprintf("горит водород: протон-протонная цепочка %.0f%%, CNO-цикл %.0f%%; 99%% энергии — внутри %.2f радиуса",
+			st.pp_share * 100, st.cno_share * 100, st.core_r))
+		if st.fully_conv do panel_line(p, WHITE, "звезда перемешана целиком: сгорит почти весь её водород, а не только в ядре")
+		if st.beta < 0.99 do panel_line(p, WHITE, fmt.tprintf("давление света держит %.0f%% веса звезды", (1 - st.beta) * 100))
+		// путь света из ядра наружу: свет поглощается и излучается заново (случайное блуждание)
+		R := star.radius * SUN_RADIUS_M
+		walk := R * R * st.mean_rho * 2 / C_LIGHT / 3.156e7
+		panel_line(p, WHITE, fmt.tprintf("свет из ядра пробирается наружу ~%s, а от поверхности до нас — %.1f мин", years_text(walk), fp.sky_state.sun_dist * AU_KM / 299792.458 / 60))
+		d := fp.sky_state.sun_dist * AU_KM * 1000
+		nu := 2 * star.luminosity * SUN_LUM_W / (26.73 * 1.602e-13) / (4 * math.PI * d * d) / 1e4
+		panel_line(p, WHITE, fmt.tprintf("нейтрино из ядра: каждую секунду сквозь каждый см² нашего тела — %s", sci_text(nu)))
+	case .Red_Giant, .Clump, .Bright_Giant:
+		panel_line(p, WHITE, fmt.tprintf("ядро %.2f массы Солнца размером с Землю; водород горит в слое при %s", st.core_mass, star_temp_text(st.shell_t)))
+	case .White_Dwarf:
+		panel_line(p, WHITE, fmt.tprintf("горения нет — остывает уже %.2f млрд лет; ложка вещества весит ~%.0f т", st.cool_gyr, st.rhoc * 5e-6 / 1000))
+	case .Neutron:
+		panel_line(p, WHITE, fmt.tprintf("%.1f ядерной плотности; поле %s Тл; оборот за %.3f с; время у поверхности течёт ×%.2f", st.rhoc / NUCLEAR_DENSITY, sci_text(st.b_tesla), st.spin_s, st.redshift))
+	case .Black_Hole:
+		panel_line(p, WHITE, fmt.tprintf("горизонт %.1f км (вращение %.2f), фотонная сфера %.0f км, последняя орбита %.0f км", st.horizon_km, st.bh_spin, st.photon_km, st.isco_km))
+		panel_line(p, WHITE, fmt.tprintf("температура Хокинга %s К, испарится через %s; человека разорвёт приливом ближе %.0f км",
+			sci_text(st.hawking_k), years_text(st.evaporate_yr), st.tidal_km))
+	}
+	panel_gap(p)
+
+	// слои
+	if st.stage != .Black_Hole {
+		p.cols = STAR_ZONE_COLS[:]
+		panel_line(p, GRAY, "слой", "от центра", "температура", "плотность", "что там")
+		for z in st.zones[:st.n] {
+			from := z.r1 > 1.0001 ? fmt.tprintf("+%s", star_r_text(z.r1 - 1, radius_km)) : star_r_text(z.r1, radius_km)
+			if z.kind == .Corona || z.kind == .Wind do from = "3 радиусов"
+			panel_line(p, WHITE, STAR_ZONE_NAMES[z.kind], fmt.tprintf("до %s", from),
+				fmt.tprintf("%s → %s", star_temp_text(z.t0), star_temp_text(z.t1)), star_rho_text(z.rho0), STAR_ZONE_STATES[z.kind])
+		}
+		p.cols = nil
+		panel_gap(p)
+	}
+
+	// активность
+	if st.rot_days > 0 {
+		if star.temperature < 7500 {
+			flare := st.flare_years < 1 ? fmt.tprintf("%.0f в год", 1 / st.flare_years) : fmt.tprintf("раз в %s", years_text(st.flare_years))
+			panel_line(p, WHITE, fmt.tprintf("оборот за %.1f сут; корона %s; пятна ~%.1f%% поверхности; вспышки силы Кэррингтона: %s",
+				st.rot_days, star_temp_text(st.corona_k), st.spots * 100, flare))
+		} else {
+			panel_line(p, WHITE, fmt.tprintf("оборот за %.1f сут; конвекции у поверхности нет — пятен, вспышек и короны тоже", st.rot_days))
+		}
+		panel_line(p, WHITE, fmt.tprintf("ветер уносит %s массы Солнца в год", sci_text(st.wind)))
+	}
+
+	// будущее
+	hp := home_planet(s)
+	switch st.stage {
+	case .Main_Sequence:
+		switch {
+		case star.mass < 0.25:
+			panel_line(p, GOLD, fmt.tprintf("Будущее: через %s медленно станет голубым карликом, потом — белым", years_text(st.remaining * 1e9)))
+		case star.mass < 8:
+			fate := hp.orbit_au < st.giant_au ? "поглотит нашу планету" : "планета уцелеет, но выгорит"
+			panel_line(p, GOLD, fmt.tprintf("Будущее: через %s — гигант до ~%.1f а.е. (%s), затем белый карлик в %.2f Солнца",
+				years_text(st.remaining * 1e9), st.giant_au, fate, st.fate_mass))
+		case star.mass < 25:
+			panel_line(p, GOLD, fmt.tprintf("Будущее: через %s — сверхновая; останется нейтронная звезда", years_text(st.remaining * 1e9)))
+		case:
+			panel_line(p, GOLD, fmt.tprintf("Будущее: через %s — сверхновая; останется чёрная дыра", years_text(st.remaining * 1e9)))
+		}
+	case .Red_Giant:
+		panel_line(p, GOLD, "Будущее: ядро растёт; при 100 млн К вспыхнет гелий, потом — сброс оболочки и белый карлик")
+	case .Clump, .Bright_Giant:
+		panel_line(p, GOLD, fmt.tprintf("Будущее: сбросит оболочку (планетарная туманность), останется белый карлик в %.2f Солнца", st.fate_mass))
+	case .White_Dwarf:
+		panel_line(p, GOLD, "Будущее: остывает; через сотни миллиардов лет станет холодным чёрным карликом")
+	case .Neutron:
+		panel_line(p, GOLD, "Будущее: остывает и замедляется — миллиарды лет")
+	case .Black_Hole:
+		panel_line(p, GOLD, "Будущее: растёт, поглощая вещество; испаряться начнёт, когда вселенная станет холоднее её")
+	}
+}
+
+// Цвет слоя звезды на разрезе.
+@(private = "file")
+STAR_ZONE_COLORS := [Star_Zone_Kind][4]u8 {
+	.Core           = {255, 250, 220, 255},
+	.Conv_Core      = {255, 240, 170, 255},
+	.Radiative      = {255, 190, 90, 255},
+	.Convective     = {235, 120, 50, 255},
+	.Photosphere    = {255, 220, 150, 255},
+	.Chromosphere   = {240, 90, 110, 255},
+	.Corona         = {200, 210, 255, 60},
+	.Wind           = {180, 200, 255, 40},
+	.He_Core        = {255, 255, 255, 255},
+	.He_Burning     = {255, 255, 230, 255},
+	.CO_Core        = {230, 240, 255, 255},
+	.H_Shell        = {255, 230, 150, 255},
+	.He_Shell       = {255, 245, 200, 255},
+	.Envelope       = {220, 100, 50, 255},
+	.Degenerate     = {210, 225, 255, 255},
+	.Crystal        = {170, 200, 255, 255},
+	.He_Layer       = {235, 240, 255, 255},
+	.H_Atmosphere   = {250, 250, 255, 255},
+	.NS_Outer_Crust = {150, 150, 170, 255},
+	.NS_Inner_Crust = {120, 120, 160, 255},
+	.NS_Outer_Core  = {90, 100, 170, 255},
+	.NS_Inner_Core  = {170, 120, 220, 255},
+	.BH_Singularity = {0, 0, 0, 255},
+	.BH_Horizon     = {0, 0, 0, 255},
+	.BH_Photon      = {255, 200, 120, 255},
+	.BH_ISCO        = {255, 140, 60, 255},
+}
+
+// Разрез звезды в правом нижнем углу.
+@(private = "file")
+hud_draw_star_cutaway :: proc(fp: ^Frame_Params, ortho: matrix[4, 4]f32) {
+	st := fp.star_st
+	if st == nil do return
+	g := gui_scale(fp.height)
+	size := 116 * g
+	cx := f32(fp.width) - size / 2 - 6 * g
+	cy := f32(fp.height) - size / 2 - 18 * g
+	eng.imm_rect(cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2 + 12 * g, {0, 0, 0, 120})
+	disc :: proc(cx, cy, r: f32, color: [4]u8, half: bool) {
+		SEG :: 64
+		for k in 0 ..< SEG {
+			a0 := f32(k) / SEG * math.TAU
+			a1 := f32(k + 1) / SEG * math.TAU
+			if half && math.cos((a0 + a1) / 2) < 0 do continue
+			p0 := eng.Vec3{cx + r * math.cos(a0), cy + r * math.sin(a0), 0}
+			p1 := eng.Vec3{cx + r * math.cos(a1), cy + r * math.sin(a1), 0}
+			eng.imm_quad({cx, cy, 0}, p0, p1, p1, color)
+		}
+	}
+	R := size / 2 - 14 * g // место для короны
+	if st.stage == .Black_Hole {
+		// кольца: последняя орбита, фотонная сфера, горизонт
+		R = size / 2 - 4 * g
+		isco := st.isco_km
+		for z in ([3]Star_Zone_Kind{.BH_ISCO, .BH_Photon, .BH_Horizon}) {
+			km := z == .BH_ISCO ? isco : z == .BH_Photon ? st.photon_km : st.horizon_km
+			disc(cx, cy, R * f32(km / isco), STAR_ZONE_COLORS[z], false)
+		}
+	} else {
+		// корона и поверхность, затем слои внутрь — половина разреза
+		for z in st.zones[:st.n] {
+			if z.kind == .Corona || z.kind == .Wind do disc(cx, cy, R * 1.2, STAR_ZONE_COLORS[z.kind], false)
+		}
+		surface := STAR_ZONE_COLORS[.Photosphere]
+		if fp.system != nil {
+			c := fp.system.star.color
+			surface = {u8(c.r * 255), u8(c.g * 255), u8(c.b * 255), 255}
+		}
+		disc(cx, cy, R, surface, false)
+		for i := st.n - 1; i >= 0; i -= 1 {
+			z := st.zones[i]
+			if z.r1 > 1.0001 do continue
+			disc(cx, cy, max(R * f32(z.r1), 1.5 * g), STAR_ZONE_COLORS[z.kind], true)
+		}
+	}
+	name := "разрез"
+	nw := eng.text_width(name, g)
+	eng.draw_text(name, cx - nw / 2, cy + size / 2 + 2 * g, g, GOLD)
+	eng.imm_flush(ortho)
+}
+
 // Рисует весь текстовый интерфейс (вызывать с включённым смешиванием).
 hud_draw :: proc(fp: ^Frame_Params) {
 	ortho := linalg.matrix_ortho3d_f32(0, f32(fp.width), f32(fp.height), 0, -1, 1)
@@ -607,11 +829,14 @@ hud_draw :: proc(fp: ^Frame_Params) {
 			page_interior(&p, fp)
 		case 6:
 			page_atmosphere(&p, fp)
+		case 7:
+			page_star(&p, fp)
 		}
 	}
 	eng.imm_flush(ortho)
 	if fp.debug_page == 1 do hud_draw_globe(fp, ortho)
 	if fp.debug_page == 5 do hud_draw_cutaway(fp, ortho)
+	if fp.debug_page == 7 do hud_draw_star_cutaway(fp, ortho)
 }
 
 // Глобус планеты в правом верхнем углу (под часами) с отметкой "мы здесь".

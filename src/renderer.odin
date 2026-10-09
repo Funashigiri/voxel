@@ -78,6 +78,7 @@ Frame_Params :: struct {
 	globe:       ^Globe,
 	far:         ^Far_Terrain, // рельеф до горизонта
 	interior:    ^Planet_Interior, // строение планеты (F3)
+	star_st:     ^Star_Structure, // строение нашей звезды (F3)
 	around:      [2]f64, // самая высокая и самая низкая точка в 40 км вокруг, м
 	clouds:      ^Clouds,
 	cloud_shade: f32, // тень облака там, где стоит игрок (1 — нет)

@@ -234,7 +234,7 @@ surface_temp :: proc(t_eq, p, p_co2, p_ch4: f64, wet: bool) -> (ts, tau: f64) {
 	return
 }
 
-@(private = "file")
+
 smooth01 :: proc(e0, e1, x: f64) -> f64 {
 	t := clamp((x - e0) / (e1 - e0), 0, 1)
 	return t * t * (3 - 2 * t)

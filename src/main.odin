@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.013"
+VERSION :: "0.014"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -45,6 +45,7 @@ Options :: struct {
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
 	universe_report: bool, // напечатать отчёт о вселенной с проверками и выйти
 	planets_report: bool, // сверить модель планет с Солнечной системой, статистика систем — и выйти
+	stars_report:  bool, // сверить модель звёзд с настоящими звёздами — и выйти
 	timescale:     f64, // ускорение времени (отладка)
 	start_day:     int, // день года при высадке (0 — случайный)
 	look_at:       string, // sun | moon — сразу смотреть туда (отладка)
@@ -138,6 +139,8 @@ parse_options :: proc() -> (o: Options) {
 			o.timescale = max(0, strconv.parse_f64(val) or_else 1)
 		case "-day":
 			o.start_day = max(1, strconv.parse_int(val) or_else 1)
+		case "-stars":
+			o.stars_report = true
 		case "-planets":
 			o.planets_report = true
 		case "-universe":
@@ -218,6 +221,10 @@ main :: proc() {
 		return
 	}
 
+	if opts.stars_report {
+		if stars_report() > 0 do os.exit(1)
+		return
+	}
 	if opts.planets_report {
 		if planets_report() > 0 do os.exit(1)
 		return
@@ -283,6 +290,8 @@ main :: proc() {
 	interior := interior_make(body_interior_input(&system, &hp.body))
 	defer free(interior)
 	deep_rock_init(interior)
+	// строение нашей звезды (её блеск, цвет и размер — прежние)
+	star_st := star_structure_make(system.star, system.age_gyr, system.metal)
 	lat, lon := system.home.latitude_deg, system.home.longitude_deg
 	if opts.has_latlon do lat, lon = opts.lat, opts.lon
 	site_x, site_z: f64
@@ -641,6 +650,7 @@ main :: proc() {
 				globe = &globe,
 				far = &far,
 				interior = interior,
+				star_st = &star_st,
 				around = around,
 				clouds = &clouds,
 				cloud_shade = f32(cloud_shade),
