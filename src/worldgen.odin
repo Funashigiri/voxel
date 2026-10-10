@@ -173,6 +173,7 @@ generate_column :: proc(w: ^World, col: ^Column) {
 			col.sky[i] = SEA_LEVEL + 1 // вода гасит свет неба
 		}
 		col.sky_bare[i] = col.sky[i]
+		col.sky_snow[i] = col.sky[i]
 		col.lo = min(col.lo, col.height[i] - 4)
 		col.hi = max(col.hi, col.height[i] + 1) // +1 — трава и цветы
 	}
@@ -203,6 +204,7 @@ generate_column :: proc(w: ^World, col: ^Column) {
 			if BLOCK_INFO[b].blocks_light { // тонкий ствол почти не затеняет
 				col.sky[i] = max(col.sky[i], y + 1)
 				if !deciduous_leaves(b) do col.sky_bare[i] = max(col.sky_bare[i], y + 1)
+				if snow_blocker(b) do col.sky_snow[i] = max(col.sky_snow[i], y + 1)
 			}
 			col.hi = max(col.hi, y)
 		})

@@ -48,11 +48,18 @@ Renderer :: struct {
 	wx_e, wx_n:     [3]f32,
 	wx_on:          f32,
 	wx_mean:        [4]f32,
-	wx_fog:         [4]f32, // мгла от дождя и снега: ослабление (1/м), цвет
+	wx_fog:         [4]f32, // мгла от дождя, снега и дымки: ослабление (1/м), цвет
+	fog_cam:        [4]f32, // туман у камеры: низ, верх слоя (м над морем), ослабление; w — верх самого высокого слоя на карте
+	snow_q0:        [3]f32, // сетка снега для шейдеров (snow.odin)
+	snow_e, snow_n: [3]f32,
+	snow_lv:        [4]f32,
+	flash:          [4][4]f32, // вспышки молний для облаков: где (относительно камеры), сила
 	seed:           u32,
 	off_far:        bool, // отладка (-off:...): выключенные части — для замеров
 	off_clouds:     bool,
 	off_shadows:    bool,
+	off_fog:        bool, // отладка: без тумана в шейдерах
+	off_snow:       bool, // отладка: без снега по погоде (как в 0.017 — по климату)
 	player_light:   f32,
 	// небо и свет этого кадра (из Sky_State)
 	sky_top:        [3]f32,
@@ -88,6 +95,8 @@ Frame_Params :: struct {
 	around:      [2]f64, // самая высокая и самая низкая точка в 40 км вокруг, м
 	clouds:      ^Clouds,
 	weather:     ^Weather_State, // погода вокруг (weather_view.odin)
+	snow:        ^Snow_State, // снег вокруг (snow.odin)
+	lightning:   ^Lightning, // молнии (lightning.odin)
 	cloud_shade: f32, // тень облака там, где стоит игрок (1 — нет)
 	cloud_over:  f64, // облачность прямо над головой, 0..1
 	frame_ms:    f64, // время кадра (сглаженное)
@@ -234,6 +243,14 @@ set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
 	eng.set_f32(eng.uniform_loc(prog, "u_wx_on"), r.wx_on)
 	eng.set_vec4(eng.uniform_loc(prog, "u_wx_mean"), r.wx_mean)
 	eng.set_vec4(eng.uniform_loc(prog, "u_wx_fog"), r.wx_fog)
+	eng.set_i32(eng.uniform_loc(prog, "u_fogmap"), 7)
+	eng.set_vec4(eng.uniform_loc(prog, "u_fog_cam"), r.fog_cam)
+	eng.set_i32(eng.uniform_loc(prog, "u_snow"), 6)
+	eng.set_vec3(eng.uniform_loc(prog, "u_snow_q0"), r.snow_q0)
+	eng.set_vec3(eng.uniform_loc(prog, "u_snow_e"), r.snow_e)
+	eng.set_vec3(eng.uniform_loc(prog, "u_snow_n"), r.snow_n)
+	eng.set_vec4(eng.uniform_loc(prog, "u_snow_lv"), r.snow_lv)
+	gl.Uniform4fv(eng.uniform_loc(prog, "u_flash"), 4, &r.flash[0][0])
 }
 
 // Дымка и облака этого кадра — для всех шейдеров.
@@ -262,6 +279,25 @@ update_air :: proc(r: ^Renderer, fp: ^Frame_Params) {
 		r.wx_mean = {f32(m[0]), f32(m[1]), f32(m[2]), f32(m[3])}
 		gl.ActiveTexture(gl.TEXTURE5)
 		gl.BindTexture(gl.TEXTURE_2D, ws.tex)
+		gl.ActiveTexture(gl.TEXTURE7)
+		gl.BindTexture(gl.TEXTURE_2D, ws.fog_tex)
+		gl.ActiveTexture(gl.TEXTURE0)
+	}
+	// туман у камеры (по карте, как в шейдере); w — верх самого высокого слоя
+	r.fog_cam = {-1000, -1000, 0, -2000}
+	if ws := fp.weather; ws != nil && ws.front.ok && !r.underwater && !r.off_fog {
+		r.fog_cam = {f32(ws.fog_cam.x), f32(ws.fog_cam.y), f32(ws.fog_cam.z), ws.front.fog_top}
+	}
+	// снег: сетка вокруг игрока
+	r.snow_lv = {}
+	if ss := fp.snow; ss != nil && ss.front.ok && fp.clouds != nil && !r.off_snow {
+		q0, e, n, lv := snow_shader_params(ss, fp.clouds)
+		r.snow_q0 = {f32(q0.x), f32(q0.y), f32(q0.z)}
+		r.snow_e = {f32(e.x), f32(e.y), f32(e.z)}
+		r.snow_n = {f32(n.x), f32(n.y), f32(n.z)}
+		r.snow_lv = {f32(lv[0]), f32(lv[1]), f32(lv[2]), f32(lv[3])}
+		gl.ActiveTexture(gl.TEXTURE6)
+		gl.BindTexture(gl.TEXTURE_3D, ss.tex)
 		gl.ActiveTexture(gl.TEXTURE0)
 	}
 }
@@ -289,10 +325,14 @@ update_weather_light :: proc(r: ^Renderer, fp: ^Frame_Params) {
 	}
 	r.sky_top = grey(r.sky_top, 0.75 * ov, 1 - 0.3 * st * ov)
 	r.sky_horizon = grey(r.sky_horizon, 0.75 * ov, 1 - 0.3 * st * ov)
+	// мгла: дождь и снег, дымка во влажном воздухе
+	beta := h.rain > 0.02 ? 0 : wx_mist(h.rh) // в дождь мгла — от самого дождя
 	if h.rain > 0.02 {
 		vr := 11_200 * math.pow(max(h.rain, 0.05), -0.6)
 		vs := 1_600 * math.pow(max(h.rain, 0.02), -0.7)
-		beta := 3.912 * ((1 - h.snow) / vr + h.snow / vs)
+		beta += 3.912 * ((1 - h.snow) / vr + h.snow / vs)
+	}
+	if beta > 0 {
 		l := r.sky_horizon.r * 0.3 + r.sky_horizon.g * 0.59 + r.sky_horizon.b * 0.11
 		r.wx_fog = {f32(beta), l * 0.9, l * 0.92, l * 0.96}
 	}
@@ -382,6 +422,14 @@ draw_far :: proc(r: ^Renderer, fp: ^Frame_Params) {
 		gl.DepthMask(true)
 		gl.DepthFunc(gl.LESS)
 	}
+	// молнии вдали — после рельефа (горы их закрывают) и облаков: канал не пишет
+	// глубину, и облака позади легли бы поверх него. Над облаками канал под ними не виден.
+	if lt := fp.lightning; lt != nil && (fp.clouds == nil || r.pv.cam_h < fp.clouds.height) {
+		gl.UseProgram(lt.prog)
+		set_sky_uniforms(r, lt.prog)
+		lightning_draw(lt, fp.time, &r.pv, vp, false, 2 * math.tan(math.to_radians(cam.fov) / 2) / f32(max(fp.height, 1)))
+		gl.Disable(gl.CULL_FACE)
+	}
 	gl.Enable(gl.CULL_FACE)
 }
 
@@ -414,6 +462,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	r.light = {st.light.r, st.light.g, st.light.b, st.desat}
 	r.light_k = st.brightness
 	update_weather_light(r, &fp)
+	if lt := fp.lightning; lt != nil && !r.underwater do lightning_light(lt, fp.time, &r.pv, &r.light, &r.sky_top, &r.sky_horizon, &r.flash, f64(r.wx_fog.x))
 	r.side_shade += (SIDE_SHADE - r.side_shade) * min(1, fp.dt * 1.5)
 	gl.ClearColor(r.sky_horizon.r, r.sky_horizon.g, r.sky_horizon.b, 1)
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
@@ -428,7 +477,12 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	gl.BindVertexArray(fp.sky.empty_vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, 3)
 	// звёзды и планеты — поверх неба, под землёй и облаками
-	if fp.star_sky != nil && !r.underwater do starsky_draw(fp.star_sky, fp.sky_state, cam.view_proj, fp.time, fp.height, r.anomaly)
+	if fp.star_sky != nil && !r.underwater {
+		// туман над головой: звёздные величины гаснут на 1,086·τ
+		up_tau: f32 = 0
+		if r.fog_cam.w > -999 && f64(r.fog_cam.x) < r.pv.cam_h do up_tau = r.fog_cam.z * max(r.fog_cam.y - f32(r.pv.cam_h), 0)
+		starsky_draw(fp.star_sky, fp.sky_state, cam.view_proj, fp.time, fp.height, r.anomaly, 1.086 * up_tau)
+	}
 	gl.Enable(gl.DEPTH_TEST)
 	gl.DepthFunc(gl.LESS)
 	gl.DepthMask(true)
@@ -512,6 +566,13 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 		if ld.pods[i + 1].rider_out do draw_character(r, &fp, &c.body, c.skin_tex, c.light)
 	}
 	draw_pods(r, &fp)
+	// молния рядом — вместе с блоками
+	if lt := fp.lightning; lt != nil && !r.underwater {
+		gl.UseProgram(lt.prog)
+		set_sky_uniforms(r, lt.prog)
+		lightning_draw(lt, fp.time, &r.pv, cam.view_proj, true, 2 * math.tan(math.to_radians(cam.fov) / 2) / f32(max(fp.height, 1)))
+		gl.Enable(gl.CULL_FACE)
+	}
 
 	// ---- вода (сзади вперёд, полупрозрачная)
 	gl.UseProgram(r.chunk.prog)

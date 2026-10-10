@@ -457,11 +457,11 @@ mat3_f32 :: proc(m: matrix[3, 3]f64) -> (r: matrix[3, 3]f32) {
 }
 
 // Звёзды и планеты — точки поверх неба (рисовать сразу после неба, до земли).
-starsky_draw :: proc(sky: ^Star_Sky, st: ^Sky_State, view_proj: eng.Mat4, time: f64, height: i32, anomaly: [4]f32) {
+starsky_draw :: proc(sky: ^Star_Sky, st: ^Sky_State, view_proj: eng.Mat4, time: f64, height: i32, anomaly: [4]f32, extinct: f32 = 0) {
 	if !sky.ready do return
 	gl.UseProgram(sky.prog)
 	eng.set_mat4(sky.u_view_proj, view_proj)
-	eng.set_f32(sky.u_mlim, f32(st.mag_limit))
+	eng.set_f32(sky.u_mlim, f32(st.mag_limit) - extinct) // туман над головой гасит звёзды
 	eng.set_f32(sky.u_time, f32(time))
 	eng.set_f32(sky.u_scale, max(1, f32(height) / 720))
 	eng.set_vec4(eng.uniform_loc(sky.prog, "u_anomaly"), anomaly) // в тумане аномалии звёзд не видно

@@ -12,7 +12,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.017"
+VERSION :: "0.018"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -41,7 +41,7 @@ Options :: struct {
 	mountain_spawn: bool, // появиться над горами
 	cliff_spawn:   bool, // у самого крутого обрыва (слои пород)
 	tree_spawn:    bool, // у большого лиственного дерева, лицом к нему
-	wx_want:       string, // -wx: начать в ближайший день с такой погодой (rain, snow, storm, clear, overcast)
+	wx_want:       string, // -wx: начать в ближайший день с такой погодой (rain, snow, firstsnow, storm, clear, overcast, fog, thunder, nightstorm)
 	has_latlon:    bool, // высадка в заданной точке планеты
 	lat, lon:      f64,
 	debug_page:    int, // сразу открыть страницу F3 (1..3)
@@ -422,14 +422,27 @@ main :: proc() {
 	// погода (weather.odin): колебания вокруг климата; карта вокруг игрока считается в фоне
 	wx := new(Weather_State) // ~400 КБ — не на стеке
 	defer free(wx)
-	weather_state_init(wx, opts.seed, hp, system.home.day_hours)
+	weather_state_init(wx, opts.seed, hp, system.home.day_hours, clouds.height)
 	defer weather_state_destroy(wx)
+	// снег копится и тает по погоде (snow.odin): сетка вокруг игрока, считается в фоне
+	snow := new(Snow_State)
+	defer free(snow)
+	snow_state_init(snow, &wx.model, opts.seed, system.home.day_hours)
+	defer snow_state_destroy(snow)
+	world.snow = snow
+	// молнии в грозах вокруг (lightning.odin)
+	lightning := new(Lightning)
+	defer free(lightning)
+	if !lightning_init(lightning, opts.seed) do os.exit(1)
+	defer lightning_destroy(lightning)
 	r.haze_height = f32(clamp(HAZE_HEIGHT * air_scale, 400, 6000))
 	r.haze_beta = f32(HAZE_BETA * clamp(hp.atmo.density / EARTH_AIR_DENSITY, 0.1, 5))
 	r.seed = opts.seed
 	r.off_far = strings.contains(opts.off, "far")
 	r.off_clouds = strings.contains(opts.off, "clouds")
 	r.off_shadows = strings.contains(opts.off, "shadows")
+	r.off_fog = strings.contains(opts.off, "fog")
+	r.off_snow = strings.contains(opts.off, "snow")
 	if strings.contains(opts.off, "haze") do r.haze_beta = 0
 
 	sx, sz := i32(site_x), i32(site_z)
@@ -552,12 +565,13 @@ main :: proc() {
 	fps_frames: int
 	shots_taken := 0
 	last_fps: f64
-	bench_frames, bench_time: f64 // замер для отчёта: кадры после 3-й секунды
+	bench_frames, bench_time: f64 // замер для отчёта: кадры после 3-й секунды и расчёта снега
 	frame_ms: f64 = 16
 	around_time: f64 = -10
 	around: [2]f64
 
 	cover_set := false // ветер облаков: в первом кадре — сразу
+	bolt_shot_at := -1.0 // отладка (-look:bolt): когда снять удар молнии
 	for !eng.window_should_close() {
 		eng.window_begin_frame()
 		now := eng.time_now()
@@ -686,7 +700,8 @@ main :: proc() {
 					cp := col.clim
 					cp.alt = max(player.pos.y - Y_SEA, 0)
 					T := clock.std_hours + f64(t) * clock_tick_hours(&clock)
-					weather_update(wx, up, cp, weather_time(&astro, T), season, sky_state.local_hours, now - start)
+					weather_update(wx, snow, up, cp, weather_time(&astro, T), season, sky_state.local_hours, now - start)
+					snow_update(snow, up, weather_time(&astro, T), season, sky_state.local_hours)
 					east, north := wx_axes(up)
 					want := east * wx.here.wind.x + north * wx.here.wind.y
 					pv := planet_view_make(&world.geo, player.pos)
@@ -701,6 +716,18 @@ main :: proc() {
 		// облака плывут; тень облака там, где стоит игрок (для персонажей и освещённости)
 		clouds_tick(&clouds, now - start)
 		weather_link_clouds(wx, &clouds)
+		lightning_update(lightning, wx, &world, &clouds, player.pos, now - start, clock.std_hours * 3600, 3600 / REAL_SECONDS_PER_STD_HOUR * clock.timescale)
+		// отладка (-look:bolt): повернуться к удару молнии ближе 30 км — и снять его
+		if opts.look_at == "bolt" && bolt_shot_at < 0 {
+			pv := planet_view_make(&world.geo, player.pos + {0, 1.6 + opts.alt, 0}) // от камеры (с -alt — выше)
+			vis := wx_visibility(wx.here.rain, wx.here.snow)
+			if d, ok := lightning_fresh_strike(lightning, &pv, i64(opts.seed), now - start, 30_000, vis > 0 ? 3.912 / vis : 0); ok {
+				player.yaw = math.atan2(-d.x, d.z)
+				player.pitch = -math.asin(clamp(d.y, -1, 1))
+				player.body_yaw, player.prev_body_yaw = player.yaw, player.yaw
+				bolt_shot_at = now - start + 0.005
+			}
+		}
 		cloud_shade, cloud_over: f64
 		{
 			up := geo_frame_dir(&world.geo, player.pos.x, player.pos.z)
@@ -758,6 +785,8 @@ main :: proc() {
 				around = around,
 				clouds = &clouds,
 				weather = wx,
+				snow = snow,
+				lightning = lightning,
 				cloud_shade = f32(cloud_shade),
 				cloud_over = cloud_over,
 				frame_ms = frame_ms,
@@ -782,7 +811,9 @@ main :: proc() {
 				if eng.save_screenshot(path, fbw, fbh) do fmt.println("Скриншот:", path)
 			}
 			// автоснимок ждёт, пока досчитаются звёздное небо и дальний рельеф
-			if auto_mode && (star_sky.ready || star_sky.worker == nil) && far.ready_all && wx.front.ok && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
+			bolt_ok := opts.look_at != "bolt" || (bolt_shot_at >= 0 && now - start >= bolt_shot_at)
+			if auto_mode && bolt_ok && (star_sky.ready || star_sky.worker == nil) && far.ready_all && wx.front.ok && snow.front.ok && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
+				bolt_shot_at = -1
 				path := opts.shot_path
 				if opts.burst > 1 {
 					base := strings.trim_suffix(path, ".png")
@@ -805,7 +836,7 @@ main :: proc() {
 
 		fps_frames += 1
 		fps_timer += dt
-		if now - start > 3 {
+		if now - start > 3 && snow.front.ok && !snow.spin { // после расчёта прошлого года снега (он грузит все ядра)
 			bench_frames += 1
 			bench_time += dt
 		}

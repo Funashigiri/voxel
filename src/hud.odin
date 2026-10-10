@@ -96,6 +96,12 @@ lat_text :: proc(lat: f64) -> string {
 	return fmt.tprintf("%.1f° %s", abs(lat), lat >= 0 ? "с.ш." : "ю.ш.")
 }
 
+// Глубина снега: сантиметры, от метра — метры.
+@(private = "file")
+depth_text :: proc(d: f64) -> string {
+	return d < 1 ? fmt.tprintf("%.0f см", d * 100) : fmt.tprintf("%.2f м", d)
+}
+
 // Расстояние: до километра — в метрах, дальше — в км.
 @(private = "file")
 dist_text :: proc(d: f64) -> string {
@@ -874,6 +880,52 @@ page_climate :: proc(p: ^Panel, fp: ^Frame_Params) {
 		panel_line(p, WHITE, fmt.tprintf("ветер %s %.0f м/с, порывы до %.0f м/с; давление %.0f гПа, %s (%+.1f за 3 ч); %s",
 			wx_wind_from(w.wind.x, w.wind.y), speed, w.gust, w.press, trend, dp, vis_s))
 		syn := w.syn > 1 ? "циклон" : w.syn < -1 ? "антициклон" : "между системами"
+		warm := w.t_anom > 1 ? fmt.tprintf("теплее климата на %.0f °C (воздух с юга или облака)", w.t_anom) : w.t_anom < -1 ? fmt.tprintf("холоднее климата на %.0f °C", -w.t_anom) : "как в климате"
+		panel_line(p, WHITE, fmt.tprintf("влажность %.0f%%, точка росы %s °C; сегодня %s", w.rh * 100, celsius(w.td), warm))
+		// туман у камеры — по карте, как его видит шейдер
+		if f := ws.fog_cam; f.w > 0.5 && f.z > 1e-4 {
+			h := fp.player.pos.y + 1.6 - Y_SEA
+			name := FOG_NAMES[ws.fog_kind]
+			if name == "" do name = "туман"
+			where_ := h > f.y ? fmt.tprintf("слой ниже нас: верх на %.0f м над морем", f.y) : h < f.x ? fmt.tprintf("слой выше нас: от %.0f м над морем", f.x) : fmt.tprintf("мы в нём, видимость ~%s", dist_text(3.912 / f.z))
+			panel_line(p, WHITE, fmt.tprintf("%s; %s", name, where_))
+		} else if m := wx_mist(w.rh); m > 0 {
+			panel_line(p, WHITE, fmt.tprintf("дымка во влажном воздухе: видимость ~%s", dist_text(3.912 / (m + 3.912 / 40_000))))
+		}
+		// снег
+		if ss := fp.snow; ss != nil {
+			if !ss.front.ok {
+				panel_line(p, GRAY, "снег: считается погода прошлого года…")
+			} else {
+				up := geo_frame_dir(&fp.world.geo, fp.player.pos.x, fp.player.pos.z)
+				sh := snow_here(ss, up, fp.player.pos.y - Y_SEA)
+				if sh.ok && sh.depth >= 0.005 {
+					when_ := sh.last < 1 ? "идёт или только что выпал" : sh.last < 48 ? fmt.tprintf("выпал %.0f ч назад", sh.last) : fmt.tprintf("выпал %.0f сут назад", sh.last / 24)
+					_, _, support, _ := snow_at_feet(fp.world, fp.player.pos)
+					cover := sh.cover > 0.97 ? "" : fmt.tprintf(", лежит пятнами — %.0f%% земли", sh.cover * 100)
+					panel_line(p, WHITE, fmt.tprintf("снег %s (воды %.0f мм, %.0f кг/м³, белизна %.0f%%%s), %s; держит %s — ноги вязнут на %s",
+						depth_text(sh.depth), sh.swe, sh.rho, sh.albedo * 100, cover, when_, depth_text(support), depth_text(max(min(sh.depth, SNOW_LIFT_MAX) - support, 0))))
+					if sh.canopy > 0.5 do panel_line(p, WHITE, fmt.tprintf("на хвое снега %.0f мм воды — кроны белые; в оттепель и ветер он падает", sh.canopy))
+				} else if sh.ok && sh.canopy > 0.5 {
+					panel_line(p, WHITE, fmt.tprintf("на земле снега нет, на хвое — %.0f мм воды", sh.canopy))
+				} else if sh.ok {
+					panel_line(p, WHITE, "снега нет")
+				}
+			}
+		}
+		// грозы
+		if lt := fp.lightning; lt != nil {
+			n := lightning_per_minute(lt, fp.time)
+			if n > 0 || (lt.last_t >= 0 && fp.time - lt.last_t < 120) {
+				s := fmt.tprintf("гроза: вспышек ближе 20 км за минуту — %d", n)
+				if lt.last_t >= 0 && fp.time - lt.last_t < 120 {
+					s = fmt.tprintf("%s; последний удар в землю в %s — гром через %.0f с (звук ~340 м/с)", s, dist_text(lt.last_dist), lt.last_dist / 340)
+				}
+				panel_line(p, GOLD, s)
+			} else if w.flash > 0.01 {
+				panel_line(p, WHITE, fmt.tprintf("грозовые ливни: ~%.2f молнии на км² в час", w.flash))
+			}
+		}
 		panel_line(p, GRAY, fmt.tprintf("над нами %s; облачность и осадки колеблются вокруг климата места — за месяц выпадает столько, сколько в климате", syn))
 		panel_gap(p)
 	}
@@ -887,7 +939,8 @@ page_climate :: proc(p: ^Panel, fp: ^Frame_Params) {
 		st := fp.sky_state
 		season := st.season
 		if st.latitude < 0 do season = (season + 2) % 4
-		snow := lc.snow > 0.5 ? "лежит снег" : lc.snow > 0.05 ? "снег тает или только выпал" : "снега нет"
+		snow := lc.snow > 0.5 ? "обычно лежит снег" : lc.snow > 0.05 ? "снег обычно тает или только выпал" : "снега обычно нет"
+		if ss := fp.snow; ss != nil && ss.front.ok do snow = "снег сейчас — выше, по погоде"
 		panel_line(p, WHITE, fmt.tprintf("сейчас %s: днём до %s °C, ночью до %s °C, сейчас %s °C; осадков за месяц %.0f мм; %s",
 			SEASON_NAMES[season], celsius(lc.t_day + lc.amp / 2), celsius(lc.t_day - lc.amp / 2), celsius(lc.t_now), lc.p_now, snow))
 		b := &lc.bc

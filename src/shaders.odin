@@ -48,12 +48,96 @@ float haze_tau(vec3 rel) {
 	float e1 = exp(-max(h1, -50.0) * u_haze.y);
 	return u_haze.x * d * (e0 + 4.0 * em + e1) / 6.0;
 }
-uniform vec4 u_wx_fog; // дождь и снег: ослабление (1/м) и цвет мглы
+uniform vec4 u_wx_fog; // дождь, снег и дымка во влажном воздухе: ослабление (1/м) и цвет мглы
+`
+
+// Туман (0.018) — слой с низом и верхом по карте погоды (weather_view.odin):
+// в низинах, у моря, над снегом — от земли до верха слоя; низкие облака —
+// между кромкой и верхом. Оптическая толщина — по длине луча внутри слоя;
+// слой берётся у камеры и в конце луча (туман в долине
+// видно и с горы). Туман белый, освещён солнцем и небом; к солнцу светлее.
+// Здесь же apply_haze — дымка, мгла осадков и туман для всех шейдеров.
+// Нужны SKY_GLSL, HAZE_GLSL и CLOUD_GLSL.
+FOG_GLSL :: `
+uniform sampler2D u_fogmap; // карта тумана: низ и верх слоя (м над морем), ослабление (1/м)
+uniform vec4 u_fog_cam;  // туман у камеры: низ, верх, ослабление; w — верх самого высокого слоя на карте (< −999 — тумана нет)
+vec3 fog_slab(vec3 rel) {
+	vec3 dq = u_cloud_q0 + u_cloud_jq * rel - u_wx_q0;
+	vec2 uv = vec2(0.5) + vec2(dot(dq, u_wx_e), dot(dq, u_wx_n));
+	vec2 e = abs(uv - 0.5);
+	vec3 f = texture(u_fogmap, uv).xyz;
+	f.z *= 1.0 - smoothstep(0.42, 0.5, max(e.x, e.y));
+	return f;
+}
+// длина отрезка внутри слоя [b, t]: высота вдоль луча меняется от h0 до h1
+float slab_len(float h0, float h1, float d, float b, float t) {
+	float lo = min(h0, h1), hi = max(h0, h1);
+	if (hi - lo < 0.01) return (h0 > b && h0 < t) ? d : 0.0;
+	return d * max(min(hi, t) - max(lo, b), 0.0) / (hi - lo);
+}
+float fog_tau(vec3 rel) {
+	if (u_fog_cam.w < -999.0) return 0.0; // тумана на карте нет
+	float h0 = u_haze.z;
+	float h1 = h0 + rel.y + dot(rel.xz, rel.xz) * u_haze.w;
+	if (min(h0, h1) > u_fog_cam.w) return 0.0; // весь луч выше самого высокого слоя
+	float d = length(rel);
+	float t = u_fog_cam.z * slab_len(h0, h1, d, u_fog_cam.x, u_fog_cam.y);
+	vec3 fe = fog_slab(rel);
+	return max(t, fe.z * slab_len(h0, h1, d, fe.x, fe.y));
+}
+vec3 fog_color(vec3 dir) {
+	vec3 c = apply_light(vec3(0.8, 0.82, 0.84));
+	float mu = max(dot(dir, u_sun_dir), 0.0);
+	return c + u_light.rgb * 0.3 * pow(mu, 8.0) * smoothstep(-0.05, 0.1, u_sun_dir.y);
+}
 vec3 apply_haze(vec3 col, vec3 rel) {
 	float t = haze_tau(rel);
 	col = mix(col, sky_color(normalize(rel)), 1.0 - exp(-t));
 	if (u_wx_fog.x > 0.0) col = mix(col, u_wx_fog.yzw, 1.0 - exp(-u_wx_fog.x * length(rel)));
+	float f = fog_tau(rel);
+	if (f > 0.0) col = mix(col, fog_color(normalize(rel)), 1.0 - exp(-f));
 	return col;
+}
+// для облаков (их пиксели — всё небо): туман только по слою у камеры
+vec3 apply_haze_cam(vec3 col, vec3 rel) {
+	float t = haze_tau(rel);
+	col = mix(col, sky_color(normalize(rel)), 1.0 - exp(-t));
+	if (u_wx_fog.x > 0.0) col = mix(col, u_wx_fog.yzw, 1.0 - exp(-u_wx_fog.x * length(rel)));
+	if (u_fog_cam.w > -999.0 && u_fog_cam.z > 0.0) {
+		float h1 = u_haze.z + rel.y + dot(rel.xz, rel.xz) * u_haze.w;
+		float f = u_fog_cam.z * slab_len(u_haze.z, h1, length(rel), u_fog_cam.x, u_fog_cam.y);
+		col = mix(col, fog_color(normalize(rel)), 1.0 - exp(-f));
+	}
+	return col;
+}
+`
+
+// Снег (0.018, snow.odin): сетка вокруг игрока по высотам — глубина (м),
+// белизна, снег на хвое (доля), плотность (т/м³). Нужны u_cloud_q0, u_cloud_jq.
+SNOW_GLSL :: `
+uniform sampler3D u_snow; // по высотам — третья ось (видеокарта смешивает соседние уровни)
+uniform vec3 u_snow_q0; // середина сетки в координатах шума облаков
+uniform vec3 u_snow_e;  // оси сетки: (q − u_snow_q0)·u_snow_e — доля сетки к востоку
+uniform vec3 u_snow_n;
+uniform vec4 u_snow_lv; // нижний уровень (м над морем), шаг (м), уровней; w — 1: снег посчитан
+const float SNOW_LIFT_MAX = 1.0; // м: снег глубже блока рисуется и держит как метровый (snow.odin)
+// снег в точке rel (относительно камеры) на высоте alt; inside — 1 внутри сетки, к краю — 0
+vec4 snow_at(vec3 rel, float alt, out float inside) {
+	inside = 0.0;
+	if (u_snow_lv.w < 0.5) return vec4(0.0);
+	vec3 dq = u_cloud_q0 + u_cloud_jq * rel - u_snow_q0;
+	vec2 uv = vec2(0.5) + vec2(dot(dq, u_snow_e), dot(dq, u_snow_n));
+	vec2 e = abs(uv - 0.5);
+	inside = 1.0 - smoothstep(0.45, 0.5, max(e.x, e.y));
+	float l = clamp((alt - u_snow_lv.x) / u_snow_lv.y, 0.0, u_snow_lv.z - 1.0);
+	return textureLod(u_snow, vec3(uv, (l + 0.5) / u_snow_lv.z), 0.0);
+}
+// доля покрытой земли (Niu и Yang, 2007; как snow_coverage в snow.odin): тонкий снег
+// и подтаявший (серый, плотный) лежит пятнами
+float snow_cov(vec4 s) {
+	if (s.x <= 0.0) return 0.0;
+	float m = 0.5 + 1.1 * clamp((0.75 - s.y) / 0.2, 0.0, 1.0);
+	return tanh(s.x / (0.025 * pow(max(s.w * 10.0, 0.5), m)));
 }
 `
 
@@ -234,10 +318,18 @@ out vec2 v_tint;
 flat out int v_kind; // 1 — верх травы, 2 — бок травы, 3 — трава-растение, 4 — листопадная листва, 5 — вечнозелёная, 6 — прочий верх, 7 — цветы
 flat out int v_face;
 flat out float v_hash;
+out vec4 v_snow;     // снег здесь (snow.odin): глубина (м), белизна, на хвое, плотность (т/м³)
+out float v_snow_in; // 1 — внутри сетки снега (за краем — по климату)
+out float v_expo;    // открытость снегу (0…1)
+out float v_hy;      // боковая грань: высота над низом блока (выше 1 — лёгший сверху снег)
+uniform vec3 u_cloud_q0;
+uniform mat3 u_cloud_jq;
+` + SNOW_GLSL + `
 // Направленное затенение граней как в Minecraft: верх 1.0, бока 0.8/0.6, низ 0.5.
 const float FACE_SHADE[7] = float[7](0.6, 0.6, 1.0, 0.5, 0.8, 0.8, 1.0);
 void main() {
-	vec3 q = vec3(a_pos.xyz) * (1.0 / 16.0) - 1.0; // позиции сдвинуты на +1 блок
+	vec3 q = vec3(a_pos.x, a_pos.y & 4095u, a_pos.z) * (1.0 / 16.0) - 1.0; // позиции сдвинуты на +1 блок
+	v_expo = float(a_pos.y >> 12u) / 7.0; // старшие биты — открытость снегу
 	vec2 xz = mat2(u_rot.xy, u_rot.zw) * q.xz;
 	vec3 p = vec3(xz.x, q.y, xz.y) + u_origin;
 	uint face = (a_pos.w >> 8u) & 7u;
@@ -269,6 +361,14 @@ void main() {
 	v_hash = fract(sin(dot(cell + u_origin * 0.0, vec3(12.9898, 78.233, 37.719)) + u_chunk_alt * 0.37) * 43758.5453);
 	v_bhash = float((flags >> 1u) & 15u) / 15.0;
 	v_wpos = u_chunk_id * 16.0 + q;
+	// снег: глубина у этой высоты; открытая снегу поверхность (и верх боковых
+	// граней у края) поднимается на неё — ступеньки засыпаны, у стен снега меньше
+	float inside;
+	v_snow = snow_at(p, v_alt, inside);
+	v_snow_in = inside;
+	float lift = min(v_snow.x, SNOW_LIFT_MAX) * v_expo * inside; // глубже блока не поднимаем — ступени остались бы стенами
+	v_hy = face == 2u || face == 3u ? 0.0 : (a_tex.y == 0u ? 1.0 + lift : 0.0);
+	p.y += lift;
 	// ветер: трава и цветы клонятся (верх стебля), листва колышется; сдвиг зависит
 	// от места в мире — соседние блоки листвы сдвигаются одинаково, щелей нет
 	float ws = length(u_wind.xy);
@@ -305,6 +405,10 @@ flat in int v_face;
 flat in float v_hash;
 in vec3 v_wpos;
 flat in float v_bhash;
+in vec4 v_snow;
+in float v_snow_in;
+in float v_expo;
+in float v_hy;
 uniform sampler2DArray u_atlas;
 uniform float u_alpha_cutoff;
 uniform vec2 u_fog; // туман под водой
@@ -314,7 +418,7 @@ uniform vec4 u_layer_a;
 uniform vec4 u_layer_b;
 uniform vec4 u_layer_d; // веточки дуба и берёзы (голая крона)
 out vec4 o_color;
-` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + SNOW_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
 	vec4 c = texture(u_atlas, v_uvl);
 	bool twigs = false;
@@ -339,6 +443,10 @@ void main() {
 	}
 	if (!twigs && c.a < u_alpha_cutoff) discard;
 	vec3 base = c.rgb;
+	// свежий снег белый, старый и мокрый серее
+	// яркость на экране ~ белизна^(1/2,2): старый снег (70%) — почти белый, мокрый (50%) — серее
+	float salb = mix(0.85, v_snow.y, v_snow_in);
+	vec3 snow_col = SNOW_COLOR * pow(salb / 0.85, 0.45) * mix(vec3(0.96, 0.95, 0.92), vec3(1.0), clamp((salb - 0.5) / 0.3, 0.0, 1.0));
 	if (u_season.w > 0.5 && v_kind > 0) {
 		float snow = snow_cover(t, u_season.y, u_season.z);
 		if (v_kind <= 3) base = grass_season(grass_tint(base, v_tint), t, u_season.z);
@@ -348,13 +456,32 @@ void main() {
 			vec3 autumn = autumn_color(v_uvl.z == u_layer_b.x, fract(tree * 3.7));
 			base = mix(leaf_autumn(grass_tint(base, v_tint * 0.5), t + (tree - 0.5) * 4.0, u_season.y, autumn), vec3(0.42, 0.3, 0.16), bare * 0.5);
 		}
-		if (v_kind == 3 && snow > 0.6) discard; // траву занесло
-		if (v_kind == 7 && (snow > 0.2 || t < 5.0 + 3.0 * v_hash)) discard; // цветы — только в тёплое время
+		// снег: внутри сетки — по погоде (snow.odin), за её краем — по климату
+		float win = v_snow_in;
+		float cov = mix(snow, snow_cov(v_snow) * min(v_expo * 1.6, 1.0), win); // доля покрытой земли
+		float can = mix(snow, v_snow.z, win); // снег на кронах
+		bool buried = win > 0.5 ? v_snow.x > 0.08 : snow > 0.6;
+		if (v_kind == 3 && buried) discard; // траву прижало снегом
+		if (v_kind == 7 && ((win > 0.5 ? v_snow.x > 0.01 : snow > 0.2) || t < 5.0 + 3.0 * v_hash)) discard; // цветы — только в тёплое время
+		bool leaf = v_kind == 4 || v_kind == 5;
 		bool top = v_face == 2 && v_kind != 3;
-		if (v_kind == 2 && v_uvl.y < 0.19) top = true; // снег свешивается с края, как у травы в Minecraft
-		if (top) base = mix(base, SNOW_COLOR, twigs ? snow * 0.6 : snow);
-		else if (v_kind == 5 || v_kind == 4) base = mix(base, SNOW_COLOR, snow * (twigs ? 0.15 : 0.35));
+		if (v_kind == 2 && v_uvl.y < 0.19 && cov > 0.5) top = true; // снег свешивается с края, как у травы в Minecraft
+		if (top && !leaf) {
+			// тонкий и тающий снег лежит пятнами (по месту в мире — пятна не мерцают);
+			// шум считаем, только если покров неполный
+			if (cov > 0.002) {
+				float grain = hash13(floor(v_wpos * 16.0) + 0.5);
+				// шум растянут, чтобы был почти равномерным: белых точек — доля cov
+				float spot = cov > 0.995 ? 0.0 : clamp((0.7 * vnoise3(v_wpos * 0.4) + 0.3 * grain - 0.5) * 2.4 + 0.5, 0.0, 1.0);
+				if (spot < cov) base = snow_col * (0.96 + 0.04 * grain); // зернистость
+			}
+		} else if (leaf) {
+			float k = top ? (twigs ? 0.6 : (v_kind == 5 ? 0.9 : 0.6)) : (twigs ? 0.15 : 0.35);
+			base = mix(base, snow_col, can * k);
+		}
 	}
+	// бок блока выше его верха — это лёгший сверху снег
+	if (v_hy > 1.0 && u_season.w > 0.5) base = snow_col;
 	vec3 col = apply_light(base * v_light * cloud_shadow(v_rel));
 	// под водой свет гаснет с глубиной: ниже ~200 м почти темно
 	float depth = -(u_haze.z + v_rel.y);
@@ -392,7 +519,7 @@ uniform sampler2D u_band;     // свечение неба: полоса гал�
 uniform mat3 u_u2f;           // оси вселенной -> оси кадра
 uniform float u_band_k;       // насколько оно видно сейчас (0 — днём, в сумерках, при луне)
 out vec4 o_color;
-` + SKY_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + ANOMALY_GLSL + `
 float hash12(vec2 p) {
 	return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
@@ -446,6 +573,13 @@ void main() {
 		if (edge > 0.5) covered = true;
 	}
 	if (!covered) col += sun_disc;
+	// в тумане и под низкими облаками небо скрыто (слой у камеры, луч на 60 км)
+	if (!under && u_fog_cam.w > -999.0 && u_fog_cam.z > 0.0) {
+		float L = 60000.0;
+		float h1 = u_haze.z + dir.y * L + L * L * dot(dir.xz, dir.xz) * u_haze.w;
+		float ft = u_fog_cam.z * slab_len(u_haze.z, h1, L, u_fog_cam.x, u_fog_cam.y);
+		col = mix(col, fog_color(dir), 1.0 - exp(-ft));
+	}
 	col = apply_anomaly(col, dir, 8e4);
 	o_color = vec4(col, 1.0);
 }
@@ -493,7 +627,7 @@ uniform float u_light_k; // свет в клетке персонажа (тен�
 uniform vec2 u_fog;
 uniform vec4 u_tint; // rgb + сила (свечение, вспышки)
 out vec4 o_color;
-` + SKY_GLSL + HAZE_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + ANOMALY_GLSL + `
 // два источника света, как у мобов в Minecraft
 const vec3 L0 = vec3(0.16169, 0.80845, -0.56592);
 const vec3 L1 = vec3(-0.16169, 0.80845, 0.56592);
@@ -536,6 +670,7 @@ out vec3 v_n;
 out vec4 v_col;
 out vec3 v_season; // температура здесь сейчас, её ход за месяц, осадки за месяц
 out vec2 v_crowns; // доли листопадных и хвойных крон
+out float v_alt;    // высота над морем, м
 ` + LOGDEPTH_GLSL + `
 void main() {
 	vec3 P = u_org + a_off;
@@ -543,6 +678,7 @@ void main() {
 	vec4 z = texture(u_clim, vec2((degrees(asin(clamp(P.y / r, -1.0, 1.0))) + 90.0) / 180.0, 0.5));
 	v_season = vec3(mix(z.x, z.y, a_clim.x) - u_lapse * max(r - u_radius, 0.0), z.w, z.z * a_clim.y * 2.55);
 	v_crowns = a_clim.zw;
+	v_alt = r - u_radius;
 	vec3 rel = u_rel_o + u_jinv * a_off;
 	if (u_floor > 0.5 && a_color.a > 0.5) rel.y -= max(a_normal.w * 127.0, 2.0);
 	// под блоками (у их края) рельеф опущен: блоки рисуются поверх, а щели на
@@ -562,13 +698,14 @@ in vec3 v_n;
 in vec4 v_col;
 in vec3 v_season;
 in vec2 v_crowns;
+in float v_alt;
 uniform float u_season_on; // 1 — климат есть
 uniform sampler2D u_mask;   // какие чанки уже нарисованы блоками
 uniform vec3 u_mask_org;    // камера в маске (блоки), размер маски (чанки)
 uniform vec2 u_side_shade;  // затенение боков вдоль x и z кадра — как у блоков
 uniform float u_floor;      // 1 — дно под водой
 out vec4 o_color;
-` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + SNOW_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
 	vec2 m = (u_mask_org.xy + v_rel.xz) / 16.0;
 	float under = m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z ? texelFetch(u_mask, ivec2(m), 0).r : 0.0;
@@ -593,7 +730,17 @@ void main() {
 		float bare = leaves_bare(t, v_season.y);
 		vec3 fall = mix(leaf_autumn(base, t, v_season.y, mix(autumn_color(true, 0.5), autumn_color(false, 0.5), 0.5)), vec3(0.3, 0.26, 0.21), bare * 0.7);
 		base = mix(base, fall, decid);
-		base = mix(base, SNOW_COLOR, snow_cover(t, v_season.y, v_season.z) * (1.0 - 0.65 * conif - 0.4 * decid * (1.0 - bare)));
+		// снег: внутри сетки — по погоде (snow.odin), за её краем — по климату;
+		// вдали видно землю между кронами и снег на самих кронах
+		float sin_;
+		vec4 sg = snow_at(v_rel, v_alt, sin_);
+		float sc = snow_cover(t, v_season.y, v_season.z);
+		float cov = mix(sc, snow_cov(sg), sin_);
+		float can = sg.z * sin_; // за краем сетки снег на кронах не известен
+		float salb = mix(0.85, sg.y, sin_);
+		vec3 scol = SNOW_COLOR * pow(salb / 0.85, 0.45) * mix(vec3(0.96, 0.95, 0.92), vec3(1.0), clamp((salb - 0.5) / 0.3, 0.0, 1.0));
+		float open = max(1.0 - 0.65 * conif - 0.4 * decid * (1.0 - bare), 0.0);
+		base = mix(base, scol, clamp(cov * open + can * (0.55 * conif + 0.2 * decid), 0.0, 1.0));
 	}
 	vec3 col = apply_light(base * shade * cloud_shadow(v_rel));
 	if (water > 0.5 && (u_floor > 0.5 || under > 0.25 || dot(v_rel, n) > 0.0)) {
@@ -648,8 +795,9 @@ in float v_t;
 uniform vec3 u_pcs;  // камера в координатах шума
 uniform float u_px;  // угловой размер пикселя, рад
 uniform vec4 u_geom; // w — 1: смотрим на облака сверху
+uniform vec4 u_flash[4]; // вспышки молний: где (относительно камеры, м) и сила
 out vec4 o_color;
-` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + ANOMALY_GLSL + `
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + ANOMALY_GLSL + `
 void main() {
 	float dist = length(v_rel);
 	vec3 view = v_rel / dist;
@@ -675,7 +823,13 @@ void main() {
 	col = apply_light(col);
 	// заря подсвечивает тонкие края и низ со стороны солнца
 	col += u_glow.rgb * u_glow.a * pow(max(mu, 0.0) * 0.5 + 0.5, 3.0) * (1.0 - 0.6 * d) * 0.7;
-	col = apply_haze(col, v_rel);
+	// молнии подсвечивают облака изнутри (свет рассеивается в облаке на километры)
+	for (int i = 0; i < 4; i++) {
+		if (u_flash[i].w <= 0.0) continue;
+		float fd = length(v_rel - u_flash[i].xyz);
+		col += vec3(0.78, 0.82, 1.0) * u_flash[i].w * exp(-fd / 2500.0) * (0.3 + 0.7 * min(d * 2.0, 1.0));
+	}
+	col = apply_haze_cam(col, v_rel);
 	// за туманом аномалии облаков не видно
 	a *= exp(-anomaly_depth(view, dist));
 	o_color = vec4(col, a);
@@ -726,5 +880,36 @@ out vec4 o_color;
 void main() {
 	float k = 1.0 - smoothstep(0.32, 0.55, length(gl_PointCoord - 0.5));
 	o_color = vec4(v_col * k * exp(-anomaly_depth(v_dir, 8e4)), 1.0);
+}
+`
+
+// ---------------------------------------------------------------- молнии
+// Канал молнии (lightning.odin): яркие полосы, складываются со сценой; за
+// дымкой, мглой дождя и туманом тускнеют. Вдали — логарифмическая глубина.
+BOLT_VS :: `#version 330 core
+layout(location = 0) in vec3 a_rel; // относительно камеры, м (кадр)
+layout(location = 1) in vec3 a_col;
+uniform mat4 u_view_proj;
+uniform float u_log; // 1 — дальний проход
+out vec3 v_col;
+out vec3 v_rel;
+` + LOGDEPTH_GLSL + `
+void main() {
+	v_col = a_col;
+	v_rel = a_rel;
+	vec4 p = u_view_proj * vec4(a_rel, 1.0);
+	gl_Position = u_log > 0.5 ? log_depth(p) : p;
+}
+`
+
+BOLT_FS :: `#version 330 core
+in vec3 v_col;
+in vec3 v_rel;
+out vec4 o_color;
+` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + `
+void main() {
+	float d = length(v_rel);
+	float tr = exp(-haze_tau(v_rel) - u_wx_fog.x * d - fog_tau(v_rel));
+	o_color = vec4(v_col * tr, 1.0);
 }
 `

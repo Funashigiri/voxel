@@ -261,3 +261,10 @@ is_woody :: proc "contextless" (b: Block) -> bool {
 	return false
 }
 
+
+// На блоке лежит снег, а под ним снега нет: земля, камень, брёвна. Листва и
+// тонкие ветки снег пропускают (на кроны он ложится отдельно — snow.odin).
+snow_blocker :: proc "contextless" (b: Block) -> bool {
+	info := &BLOCK_INFO[b]
+	return info.blocks_light && info.render != .Leaves
+}

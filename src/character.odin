@@ -91,6 +91,7 @@ cell_range :: proc(lo, hi: f64) -> (i32, i32) {
 box_collides :: proc(w: ^World, b: AABB) -> bool {
 	x0, x1 := cell_range(b.min.x, b.max.x)
 	y0, y1 := cell_range(b.min.y, b.max.y)
+	if w.snow != nil do y0 -= SNOW_BELOW // снег на блоках ниже поднимает их верх
 	z0, z1 := cell_range(b.min.z, b.max.z)
 	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
 		if !world_is_solid(w, x, y, z) do continue
@@ -116,6 +117,7 @@ clip_axis :: proc(w: ^World, b: AABB, d: f64, axis: int) -> f64 {
 	}
 	x0, x1 := cell_range(region.min.x, region.max.x)
 	y0, y1 := cell_range(region.min.y, region.max.y)
+	if w.snow != nil do y0 -= SNOW_BELOW
 	z0, z1 := cell_range(region.min.z, region.max.z)
 	d := d
 	for y in y0 ..= y1 do for z in z0 ..= z1 do for x in x0 ..= x1 {
@@ -209,12 +211,28 @@ character_move :: proc(p: ^Character, w: ^World) {
 	}
 
 	orig := d
+	start := box
 	d.y = clip_axis(w, box, d.y, 1)
 	box = box_offset(box, {0, d.y, 0})
 	d.x = clip_axis(w, box, d.x, 0)
 	box = box_offset(box, {d.x, 0, 0})
 	d.z = clip_axis(w, box, d.z, 2)
 	box = box_offset(box, {0, 0, d.z})
+	// невысокий уступ (край снега, разная глубина у соседних блоков) — перешагиваем
+	if p.on_ground && (orig.x != d.x || orig.z != d.z) && w.snow != nil {
+		STEP_UP :: 0.4
+		up := clip_axis(w, start, STEP_UP, 1)
+		b2 := box_offset(start, {0, up, 0})
+		sx := clip_axis(w, b2, orig.x, 0)
+		b2 = box_offset(b2, {sx, 0, 0})
+		sz := clip_axis(w, b2, orig.z, 2)
+		b2 = box_offset(b2, {0, 0, sz})
+		b2 = box_offset(b2, {0, clip_axis(w, b2, -up, 1), 0})
+		if sx * sx + sz * sz > d.x * d.x + d.z * d.z + 1e-9 {
+			box = b2
+			d = {sx, d.y, sz}
+		}
+	}
 
 	p.pos = {box.min.x + CHAR_HALF_WIDTH, box.min.y, box.min.z + CHAR_HALF_WIDTH}
 	p.h_collision = orig.x != d.x || orig.z != d.z
@@ -328,6 +346,8 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 			friction: f64 = 0.546
 			speed: f64 = p.sprinting ? 0.13 : 0.1
 			accel = speed * (0.16277136 / (friction * friction * friction))
+			// по глубокому снегу идти тяжело: ноги вязнут на (глубина − на сколько держит)
+			if _, depth, support, ok := snow_underfoot(p, w); ok do accel /= 1 + 2.5 * max(depth - support, 0)
 		} else {
 			accel = p.sprinting ? 0.026 : 0.02
 		}
@@ -341,6 +361,10 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 	}
 	for &v in p.vel do if abs(v) < 0.003 do v = 0
 
+	// снега прибыло под ногами — поднимаемся на его верх
+	if top, _, support, ok := snow_underfoot(p, w); ok && p.on_ground && p.pos.y > top - 0.05 && p.pos.y < top + support - 0.005 {
+		p.pos.y = min(top + support, p.pos.y + 0.05)
+	}
 	p.in_water = in_water_check(w, p.pos, character_height(p))
 
 	// --- анимация ---
@@ -411,4 +435,24 @@ look_dir :: proc(yaw, pitch: f32) -> [3]f32 {
 
 character_render_pos :: proc(p: ^Character, t: f32) -> [3]f64 {
 	return p.prev_pos + (p.pos - p.prev_pos) * f64(t)
+}
+
+// Снег под ногами: верх блока, на котором стоим, глубина снега на нём и на
+// сколько он держит (snow.odin).
+snow_underfoot :: proc(p: ^Character, w: ^World) -> (top, depth, support: f64, ok: bool) {
+	return snow_at_feet(w, p.pos)
+}
+
+snow_at_feet :: proc(w: ^World, pos: [3]f64) -> (top, depth, support: f64, ok: bool) {
+	if w.snow == nil do return
+	x, z := i32(math.floor(pos.x)), i32(math.floor(pos.z))
+	y := i32(math.floor(pos.y - 0.01))
+	for _ in 0 ..< SNOW_BELOW {
+		if world_is_solid(w, x, y, z) {
+			depth, support = snow_on_block(w, x, y, z)
+			return f64(y + 1), depth, support, true
+		}
+		y -= 1
+	}
+	return
 }

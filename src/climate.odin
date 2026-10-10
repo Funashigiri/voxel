@@ -46,6 +46,10 @@ Climate :: struct {
 	year_h:   f64, // стандартных часов в году
 	season_eq: f64, // сезон (доля года по средней аномалии) в момент весеннего равноденствия на севере
 	equator_t, pole_n_t, pole_s_t: f64, // за год, на уровне моря
+	// солнце по сезону (0.018 — таяние снега): склонение (рад) и поток у верха атмосферы (Вт/м²)
+	sun_decl:  [CLIM_SEASON]f32,
+	sun_flux:  [CLIM_SEASON]f32,
+	clear_sky: f64, // доля света, что доходит до земли в ясную погоду (прямой и рассеянный)
 }
 
 // Климат мира — задаётся один раз при старте, до фоновых потоков.
@@ -331,7 +335,43 @@ climate_make :: proc(input: Climate_Input) -> (cm: Climate) {
 	}
 	norm /= wsum * CLIM_SEASON
 	for i in 0 ..< CLIM_LAT do for k in 0 ..< CLIM_SEASON do cm.p_zonal[i][k] = f32(cm.global_p / 12 * rel[i][k] / norm)
+	// солнце по сезону: отсчёт k — сезон k/CLIM_SEASON (как в climate_at)
+	for k in 0 ..< CLIM_SEASON {
+		decl, r := sun_geometry(&in_, 2 * math.PI * f64(k) / CLIM_SEASON)
+		cm.sun_decl[k] = f32(decl)
+		cm.sun_flux[k] = f32(1361 * in_.star_lum / max(r * r, 1e-6))
+	}
+	cm.clear_sky = math.exp(-0.29 * a.pressure / 1.013) // у Земли ~0,75
 	cm.ok = true
+	return
+}
+
+// Среднесуточный свет у верха атмосферы (Вт/м²) на широте lat (°) в сезон s.
+climate_daily_sun :: proc(cm: ^Climate, lat, s: f64) -> f64 {
+	x := math.mod(s, 1)
+	if x < 0 do x += 1
+	x *= CLIM_SEASON
+	k0 := int(x) % CLIM_SEASON
+	k1 := (k0 + 1) % CLIM_SEASON
+	g := x - math.floor(x)
+	decl := math.lerp(f64(cm.sun_decl[k0]), f64(cm.sun_decl[k1]), g)
+	flux := math.lerp(f64(cm.sun_flux[k0]), f64(cm.sun_flux[k1]), g)
+	return daily_insolation(flux, math.to_radians(clamp(lat, -89.9, 89.9)), decl)
+}
+
+// Солнце в сезон s на широте lat (°) в местный час hour (0..24): косинус
+// зенитного угла (< 0 — ночь) и поток света у верха атмосферы, Вт/м².
+climate_sun :: proc(cm: ^Climate, lat, s, hour: f64) -> (cosz, flux: f64) {
+	x := math.mod(s, 1)
+	if x < 0 do x += 1
+	x *= CLIM_SEASON
+	k0 := int(x) % CLIM_SEASON
+	k1 := (k0 + 1) % CLIM_SEASON
+	g := x - math.floor(x)
+	decl := math.lerp(f64(cm.sun_decl[k0]), f64(cm.sun_decl[k1]), g)
+	flux = math.lerp(f64(cm.sun_flux[k0]), f64(cm.sun_flux[k1]), g)
+	phi := math.to_radians(lat)
+	cosz = math.sin(phi) * math.sin(decl) + math.cos(phi) * math.cos(decl) * math.cos((hour - 12) / 24 * math.TAU)
 	return
 }
 

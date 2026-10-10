@@ -80,6 +80,7 @@ Column :: struct {
 	points:   [CHUNK_AREA][3]f64, // точки шара (шум трав и цветов)
 	sky:      [CHUNK_AREA]i32, // первый y, куда достаёт небесный свет
 	sky_bare: [CHUNK_AREA]i32, // то же, когда лиственные кроны голые (зима)
+	sky_snow: [CHUNK_AREA]i32, // первый y, куда долетает снег (листва его пропускает)
 	trees:    [MAX_COL_TREES]Tree, // деревья, чья листва задевает колонку
 	tree_n:   int,
 	lo, hi:   i32, // полоса поверхности, блоки
@@ -108,6 +109,7 @@ World :: struct {
 	edits:       map[Chunk_Key][dynamic]Block_Edit,
 	gravity:     f64, // сила тяжести планеты, g (1 — земная)
 	jump_apex:   f64, // высота прыжка при этой силе тяжести, блоков
+	snow:        ^Snow_State, // снег (snow.odin): на нём стоят и в нём вязнут
 	bare:        bool, // лиственные кроны вокруг игрока сейчас голые — свет неба проходит сквозь них
 }
 
@@ -318,15 +320,20 @@ world_set_block :: proc(w: ^World, x, y, z: i32, b: Block) {
 	col.lo = min(col.lo, y)
 	col.hi = max(col.hi, y)
 	i := column_index(gx, gz)
-	for bare in ([2]bool{false, true}) {
-		sky := bare ? &col.sky_bare[i] : &col.sky[i]
-		if BLOCK_INFO[b].blocks_light && !(bare && deciduous_leaves(b)) {
+	// свет неба (с листвой и без лиственной) и куда долетает снег
+	for kind in 0 ..< 3 {
+		sky := kind == 0 ? &col.sky[i] : kind == 1 ? &col.sky_bare[i] : &col.sky_snow[i]
+		blocks :: proc(b: Block, kind: int) -> bool {
+			if kind == 2 do return snow_blocker(b)
+			return BLOCK_INFO[b].blocks_light && !(kind == 1 && deciduous_leaves(b))
+		}
+		if blocks(b, kind) {
 			sky^ = max(sky^, y + 1)
 		} else if y == sky^ - 1 {
 			yy := y - 1
 			for ; yy > y - 512; yy -= 1 {
 				bb, _ := global_get_block(w, face, gx, yy, gz)
-				if BLOCK_INFO[bb].blocks_light && !(bare && deciduous_leaves(bb)) do break
+				if blocks(bb, kind) do break
 			}
 			sky^ = yy + 1
 		}
@@ -445,5 +452,13 @@ block_boxes :: proc(w: ^World, x, y, z: i32) -> (boxes: [5][2][3]f64, n: int) {
 	}
 	if loaded && !BLOCK_INFO[b].solid do return
 	boxes[0] = {o, o + 1}
+	// на снегу стоят выше блока — на сколько снег держит (отдельная коробка:
+	// если снега прибыло под ногами, сквозь блок не провалиться)
+	if loaded && snow_blocker(b) {
+		if _, s := snow_on_block(w, x, y, z); s > 0.01 {
+			boxes[1] = {o + {0, 1, 0}, o + {1, 1 + s, 1}}
+			return boxes, 2
+		}
+	}
 	return boxes, 1
 }

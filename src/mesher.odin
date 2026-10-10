@@ -37,6 +37,8 @@ Padded :: struct {
 	blocks:  [P * P * P]Block,
 	light_h: [P * P]i32, // свет неба: первый y (от низа секции), куда он достаёт
 	tint:    [P * P]u8, // оттенок травы и листвы по климату (сухость, холод)
+	snow_h:  [P * P]i32, // куда долетает снег: первый y от низа секции
+	ever_h:  [P * P]i32, // выше — нет хвойной кроны (под ней снега меньше)
 }
 
 @(private = "file")
@@ -95,7 +97,7 @@ cell :: proc "contextless" (p: ^Padded, x, y, z: i32) -> (v: f32, caster: bool) 
 }
 
 @(private = "file")
-emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, light: [4]f32, face_id: u16, layer: u8, flags: u16, tint: u8 = 0) {
+emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, light: [4]f32, face_id: u16, layer: u8, flags: u16, tint: u8 = 0, snow: [4]u16 = {}) {
 	// разворачиваем диагональ квадрата, чтобы AO интерполировался ровно
 	order := [4]int{0, 1, 2, 3}
 	if light[1] + light[3] > light[0] + light[2] do order = {1, 2, 3, 0}
@@ -103,7 +105,7 @@ emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, lig
 		l := u16(clamp(light[k], 0, 1) * 255 + 0.5)
 		append(out, Chunk_Vertex{
 			x = u16(pos[k].x),
-			y = u16(pos[k].y),
+			y = u16(pos[k].y) | snow[k] << 12, // старшие биты — открытость снегу (0…7)
 			z = u16(pos[k].z),
 			light_face = l | face_id << 8 | flags << 11,
 			u = uv[k].x,
@@ -114,8 +116,25 @@ emit_quad :: proc(out: ^[dynamic]Chunk_Vertex, pos: [4][3]i32, uv: [4][2]u8, lig
 	}
 }
 
+// Насколько угол (cx, cz) на высоте y открыт снегу (0…1): по четырём колонкам
+// вокруг, как сглаженный свет. Колонка открыта, если над этой высотой нет
+// земли, камня, брёвен и клетка не занята; под хвойной кроной снега меньше.
 @(private = "file")
-emit_cube_face :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, face: Face, layer: u8, flags: u16, top16: i32) {
+snow_exposure :: proc "contextless" (p: ^Padded, cx, y, cz: i32) -> f32 {
+	sum: f32 = 0
+	for dz in i32(-1) ..= 0 do for dx in i32(-1) ..= 0 {
+		x, z := cx + dx, cz + dz
+		ci := (z + 1) * P + (x + 1)
+		if y < p.snow_h[ci] do continue
+		b := pb(p, x, y, z)
+		if BLOCK_INFO[b].opaque || b == .Water do continue
+		sum += y < p.ever_h[ci] ? 0.6 : 1
+	}
+	return sum / 4
+}
+
+@(private = "file")
+emit_cube_face :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, face: Face, layer: u8, flags: u16, top16: i32, snowy := false) {
 	n := FACE_DIR[face]
 	f := [3]i32{x, y, z} + n
 	lf, _ := cell(p, f.x, f.y, f.z)
@@ -142,7 +161,19 @@ emit_cube_face :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, fa
 		uv[k] = QUAD_UV[k]
 		if corner.y == 1 && face != .Up && face != .Down do uv[k].y = u8(16 - top16)
 	}
-	emit_quad(out, pos, uv, light, u16(face), layer, flags, p.tint[(z + 1) * P + (x + 1)])
+	// снег: поверхность под открытым небом поднимается на его глубину (в шейдере);
+	// верхний край боковой грани — тоже, если сверху у блока пусто
+	snow: [4]u16
+	if snowy && face != .Down {
+		above := pb(p, x, y + 1, z)
+		if face == .Up || (!BLOCK_INFO[above].opaque && above != .Water) {
+			for k in 0 ..< 4 {
+				corner := FACE_CORNERS[face][k]
+				if corner.y == 1 do snow[k] = u16(snow_exposure(p, x + corner.x, y + 1, z + corner.z) * 7 + 0.5)
+			}
+		}
+	}
+	emit_quad(out, pos, uv, light, u16(face), layer, flags, p.tint[(z + 1) * P + (x + 1)], snow)
 }
 
 @(private = "file")
@@ -303,6 +334,8 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 			fill: Block = ok ? .Air : .Monolith
 			for y in i32(-1) ..= CHUNK_SIZE do p.blocks[pidx(px, y, pz)] = fill
 			p.light_h[(pz + 1) * P + (px + 1)] = min(i32)
+			p.snow_h[(pz + 1) * P + (px + 1)] = max(i32)
+			p.ever_h[(pz + 1) * P + (px + 1)] = min(i32)
 			p.tint[(pz + 1) * P + (px + 1)] = 0
 			continue
 		}
@@ -324,6 +357,8 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 		}
 		p.light_h[(pz + 1) * P + (px + 1)] = (w.bare ? col.sky_bare[ci] : col.sky[ci]) - y0
 		p.tint[(pz + 1) * P + (px + 1)] = col.tint[ci]
+		p.snow_h[(pz + 1) * P + (px + 1)] = col.sky_snow[ci] - y0
+		p.ever_h[(pz + 1) * P + (px + 1)] = col.sky_bare[ci] - y0
 	}
 }
 
@@ -360,7 +395,7 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 				if BLOCK_INFO[nb].opaque do continue
 				// внутри вечнозелёной кроны грани между листьями не видны (голых веток зимой нет)
 				if nb == b && evergreen_leaves(b) do continue
-				emit_cube_face(&opaque_verts, p, x, y, z, face, u8(info.tex[face]), flags, 16)
+				emit_cube_face(&opaque_verts, p, x, y, z, face, u8(info.tex[face]), flags, 16, info.render == .Cube && snow_blocker(b))
 			}
 		case .Cross:
 			emit_cross(&opaque_verts, p, x, y, z, u8(info.tex[.Up]), x0 + x, z0 + z, w.seed)
