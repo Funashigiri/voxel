@@ -40,6 +40,7 @@ Padded :: struct {
 	snow_h:  [P * P]i32, // куда долетает снег: первый y от низа секции
 	ever_h:  [P * P]i32, // выше — нет хвойной кроны (под ней снега меньше)
 	wflow:   [P * P]u8, // течение воды (world.odin: Column.wflow)
+	wtop:    [P * P]i32, // верхний блок воды в колонке (от низа секции; min(i32) — воды нет)
 }
 
 @(private = "file")
@@ -180,7 +181,7 @@ emit_cube_face :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, fa
 }
 
 @(private = "file")
-emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer: u8, wx, wz: i32, seed: u32) {
+emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer: u8, wx, wz: i32, seed: u32, drop: i32 = 0) {
 	l, _ := cell(p, x, y, z)
 	light := [4]f32{l, l, l, l}
 	// случайный сдвиг по XZ, как у травы в Minecraft
@@ -188,18 +189,40 @@ emit_cross :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer:
 	ox := i32(hsh % 7) - 3
 	oz := i32((hsh >> 4) % 7) - 3
 	bx := x * 16 + 16 + ox
-	by := y * 16 + 16
+	by := y * 16 + 16 - drop // drop — стебель уходит ниже клетки (тростник над водой — до глади)
 	bz := z * 16 + 16 + oz
 	diag := [2][2][2]i32{{{1, 1}, {15, 15}}, {{1, 15}, {15, 1}}}
 	for d in diag {
 		a := d[0]
 		b := d[1]
-		front := [4][3]i32{{bx + a.x, by, bz + a.y}, {bx + b.x, by, bz + b.y}, {bx + b.x, by + 16, bz + b.y}, {bx + a.x, by + 16, bz + a.y}}
+		front := [4][3]i32{{bx + a.x, by, bz + a.y}, {bx + b.x, by, bz + b.y}, {bx + b.x, by + 16 + drop, bz + b.y}, {bx + a.x, by + 16 + drop, bz + a.y}}
 		back := [4][3]i32{front[1], front[0], front[3], front[2]}
 		tint := p.tint[(z + 1) * P + (x + 1)]
 		emit_quad(out, front, QUAD_UV, light, FACE_ID_CROSS, layer, 0, tint)
 		emit_quad(out, back, QUAD_UV, light, FACE_ID_CROSS, layer, 0, tint)
 	}
+}
+
+// Лист кувшинки: плоский, на 1/16 над гладью воды в блоке ниже (её верх —
+// на 14/16), с двух сторон (снизу видно из-под воды); повёрнут по-своему.
+@(private = "file")
+emit_pad :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, layer: u8, wx, wz: i32, seed: u32) {
+	l, _ := cell(p, x, y, z)
+	light := [4]f32{l, l, l, l}
+	rot := int(eng.hash2(wx, wz, seed ~ 0x1717) & 3)
+	py := y * 16 + 16 - 1
+	pos, back: [4][3]i32
+	uv: [4][2]u8
+	for k in 0 ..< 4 {
+		c := FACE_CORNERS[.Up][k]
+		pos[k] = {(x + c.x) * 16 + 16, py, (z + c.z) * 16 + 16}
+		uv[k] = QUAD_UV[(k + rot) % 4]
+	}
+	back = {pos[1], pos[0], pos[3], pos[2]}
+	buv := [4][2]u8{uv[1], uv[0], uv[3], uv[2]}
+	tint := p.tint[(z + 1) * P + (x + 1)]
+	emit_quad(out, pos, uv, light, u16(Face.Up), layer, 0, tint)
+	emit_quad(out, back, buv, light * 0.7, u16(Face.Down), layer, 0, tint)
 }
 
 // ---- тонкие стволы и ветви: брус сечением POST_W вдоль настоящей линии ветви
@@ -341,6 +364,7 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 			for y in i32(-1) ..= CHUNK_SIZE do p.blocks[pidx(px, y, pz)] = fill
 			if ok do missing = true
 			p.wflow[(pz + 1) * P + (px + 1)] = 0
+			p.wtop[(pz + 1) * P + (px + 1)] = min(i32)
 			p.light_h[(pz + 1) * P + (px + 1)] = min(i32)
 			p.snow_h[(pz + 1) * P + (px + 1)] = max(i32)
 			p.ever_h[(pz + 1) * P + (px + 1)] = min(i32)
@@ -366,6 +390,7 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 		p.light_h[(pz + 1) * P + (px + 1)] = (w.bare ? col.sky_bare[ci] : col.sky[ci]) - y0
 		p.tint[(pz + 1) * P + (px + 1)] = col.tint[ci]
 		p.wflow[(pz + 1) * P + (px + 1)] = col.wflow[ci]
+		p.wtop[(pz + 1) * P + (px + 1)] = col.water_top[ci] == min(i32) ? min(i32) : col.water_top[ci] - y0
 		p.snow_h[(pz + 1) * P + (px + 1)] = col.sky_snow[ci] - y0
 		p.ever_h[(pz + 1) * P + (px + 1)] = col.sky_bare[ci] - y0
 	}
@@ -377,6 +402,32 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 		for y in i32(-1) ..= CHUNK_SIZE {
 			if pb(p, px, y, pz) == .Air && pb(p, ix, y, iz) == .Water do p.blocks[pidx(px, y, pz)] = .Water
 		}
+	}
+}
+
+// Не сплошной блок под гладью (корень мангра, ветвь, упавшая в воду): клетка
+// по-прежнему в воде — рисуется и вода, иначе в глади была бы дыра.
+@(private = "file")
+submerged :: #force_inline proc(p: ^Padded, x, y, z: i32) -> bool {
+	b := pb(p, x, y, z)
+	return b != .Water && b != .Air && !BLOCK_INFO[b].opaque && y <= p.wtop[(z + 1) * P + (x + 1)]
+}
+
+@(private = "file")
+watery :: #force_inline proc(p: ^Padded, x, y, z: i32) -> bool {
+	return pb(p, x, y, z) == .Water || submerged(p, x, y, z)
+}
+
+// Грани воды в клетке: там, где рядом не вода и не сплошной блок; верх — на 14/16.
+@(private = "file")
+emit_water :: proc(p: ^Padded, x, y, z: i32) {
+	info := &BLOCK_INFO[Block.Water]
+	top16: i32 = watery(p, x, y + 1, z) ? 16 : 14
+	for face in Face {
+		d := FACE_DIR[face]
+		nb := pb(p, x + d.x, y + d.y, z + d.z)
+		if BLOCK_INFO[nb].opaque || watery(p, x + d.x, y + d.y, z + d.z) do continue
+		emit_cube_face(&water_verts, p, x, y, z, face, u8(info.tex[face]), FLAG_ANIMATED, top16)
 	}
 }
 
@@ -416,18 +467,17 @@ chunk_build_mesh :: proc(w: ^World, c: ^Chunk) {
 				emit_cube_face(&opaque_verts, p, x, y, z, face, u8(info.tex[face]), flags, 16, info.render == .Cube && snow_blocker(b))
 			}
 		case .Cross:
-			emit_cross(&opaque_verts, p, x, y, z, u8(info.tex[.Up]), x0 + x, z0 + z, w.seed)
+			// тростник и рогоз над водой: стебель — до глади (она на 14/16 блока ниже)
+		drop: i32 = (b == .Reed || b == .Cattail) && pb(p, x, y - 1, z) == .Water ? 2 : 0
+		emit_cross(&opaque_verts, p, x, y, z, u8(info.tex[.Up]), x0 + x, z0 + z, w.seed, drop)
+		case .Pad:
+			emit_pad(&opaque_verts, p, x, y, z, u8(info.tex[.Up]), x0 + x, z0 + z, w.seed)
 		case .Post:
 			has_thin = true // рисуется по линиям ветвей, ниже
 		case .Liquid:
-			top16: i32 = pb(p, x, y + 1, z) == .Water ? 16 : 14
-			for face in Face {
-				d := FACE_DIR[face]
-				nb := pb(p, x + d.x, y + d.y, z + d.z)
-				if nb == .Water || BLOCK_INFO[nb].opaque do continue
-				emit_cube_face(&water_verts, p, x, y, z, face, u8(info.tex[face]), FLAG_ANIMATED, top16)
-			}
+			emit_water(p, x, y, z)
 		}
+		if submerged(p, x, y, z) do emit_water(p, x, y, z) // корень или ветвь в воде — вокруг вода
 	}
 	if has_thin do emit_thin_wood(w, c, p, &opaque_verts)
 

@@ -74,7 +74,29 @@ far_selftest :: proc(seed: u32, g: ^Planet_Geo) -> (ridge_mean, diff_mean, diff_
 // степи и саванны — с проплешинами земли. Под водой (under — какой, depth —
 // блоков воды): дно моря — песок у берега, глубже ил и гравий; русло — галька
 // и песок; дно озера — песок у берега, глубже ил; солончак — корка соли.
-surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32, bc: ^Block_Climate, under: Water_Kind = .None, depth: i32 = 0) -> (surface, filler: Block) {
+// Болото (wet; soak — грунтовая вода над землёй, м): на верховом — сфагнум на
+// торфе, в низинном и тропическом — ил там, где вода у самой поверхности, у
+// тёплого моря в манграх — ил; дно мочажин — торф, лужи в топях — ил.
+surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32, bc: ^Block_Climate, under: Water_Kind = .None, depth: i32 = 0, wet: Wetland = .None, soak: f64 = -1) -> (surface, filler: Block) {
+	if wet != .None && bc.k.biome != .Ice_Cap && (under == .None || under == .Lake || (under == .Sea && depth <= 2)) {
+		#partial switch wet {
+		case .Bog:
+			if under != .None do return .Peat, .Peat
+			if slope < 3 do return .Sphagnum, .Peat
+		case .Marsh:
+			if under != .None || (slope < 2 && soak > -0.15) do return .Mud, .Mud
+			if slope < 3 do return .Grass, .Dirt
+		case .Swamp:
+			if under != .None || (slope < 2 && soak > -0.25) do return .Mud, .Mud
+			if slope < 3 do return .Grass, .Mud
+		case .Mangrove:
+			return .Mud, .Mud
+		case .Salt_Marsh:
+			// приливная отмель — ил, выше — луг солёного марша
+			if under != .None || soak > 0 do return .Mud, .Mud
+			return .Grass, .Dirt
+		}
+	}
 	#partial switch under {
 	case .Sea:
 		n := fbm(seed + 131, p, 24, 2)
@@ -150,6 +172,9 @@ generate_column :: proc(w: ^World, col: ^Column) {
 	wkind: [N * N]Water_Kind
 	wflow: [N * N]u8
 	salt: [N * N]bool
+	wet: [N * N]Wetland
+	peat: [N * N]f32 // толща торфа, м
+	soak: [N * N]f32 // грунтовая вода над землёй, м (у моря — над отметкой прилива)
 	for j in 0 ..< N do for i in 0 ..< N {
 		k := j * N + i
 		points[k] = geo_point(&w.geo, face, x0 + i32(i) - PAD, z0 + i32(j) - PAD)
@@ -164,6 +189,9 @@ generate_column :: proc(w: ^World, col: ^Column) {
 			}
 		}
 		salt[k] = s.kind == .Salt
+		wet[k], peat[k] = s.wet, f32(s.peat)
+		soak[k] = s.wt > -1.0e8 ? f32(s.wt - s.ground) : -100
+		if s.wet == .Mangrove || s.wet == .Salt_Marsh do soak[k] = f32(0.3 - s.ground)
 	}
 	slope_at :: proc(heights: ^[N * N]i32, i, j: int) -> i32 {
 		h := heights[j * N + i]
@@ -198,10 +226,14 @@ generate_column :: proc(w: ^World, col: ^Column) {
 			col.height[i] = h
 			// под морем — морская зона; суша ниже уровня моря и дно озёр — по климату суши
 			bc := block_climate(w, face, x0 + lx, z0 + lz, wkind[k] == .Sea ? -1 : max(f64(h) + 1 - Y_SEA, 0), col.points[i])
+			wet[k] = wetland_here(wet[k], &bc)
 			col.biome[i] = bc.k.biome
 			col.tint[i] = bc.tint
 			under := wtop[k] > h ? wkind[k] : (salt[k] ? .Salt : .None)
-			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj), &bc, under, wtop[k] > h ? wtop[k] - h : 0)
+			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj), &bc, under, wtop[k] > h ? wtop[k] - h : 0, wet[k], f64(soak[k]))
+			col.wet[i] = wet[k]
+			if col.surface[i] == .Sphagnum || (col.surface[i] == .Peat && under == .Lake) do col.peat[i] = u8(clamp(math.round(peat[k]), 1, 250))
+			col.wplant[i] = wetland_plant(w.seed, x0 + lx, z0 + lz, col.points[i], &bc, wet[k], under, wtop[k] > h ? wtop[k] - h : 0, wflow[k], col.surface[i], f64(soak[k]))
 		}
 		col.sky[i] = col.height[i] + 1
 		if col.water_top[i] > col.height[i] {
@@ -214,6 +246,7 @@ generate_column :: proc(w: ^World, col: ^Column) {
 		col.sky_snow[i] = col.sky[i]
 		col.lo = min(col.lo, col.height[i] - 4)
 		col.hi = max(col.hi, col.height[i] + 1) // +1 — трава и цветы
+		if col.wplant[i] != .Air do col.hi = max(col.hi, max(col.height[i], col.water_top[i]) + 2) // тростник над гладью
 	}
 
 	// климат в центре колонки — для смены времён года на экране
@@ -298,6 +331,12 @@ column_block :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
 	if col.monolith[i] do return .Monolith
 	if col.surface[i] == .Stone do return strata(col, i, y, seed) // голая скала: сразу пласты
 	if y == h do return col.surface[i]
+	if pd := i32(col.peat[i]); pd > 0 {
+		// торф лёг на прежнюю почву
+		if y >= h - pd do return .Peat
+		if y >= h - pd - 2 do return .Dirt
+		return strata(col, i, y, seed)
+	}
 	if y >= h - (col.surface[i] == .Snow ? 12 : 3) do return col.filler[i] // ледник — толща льда
 	return strata(col, i, y, seed)
 }
@@ -320,9 +359,21 @@ generate_section :: proc(w: ^World, col: ^Column, c: ^Chunk) {
 		for ly in i32(0) ..< CHUNK_SIZE {
 			c.blocks[block_index(lx, ly, lz)] = column_block(col, i, y0 + ly, useed)
 		}
-		// подлесок тропического леса: кусты и молодые деревца
 		h := col.height[i]
 		wx, wz := x0 + lx, z0 + lz
+		// у воды и на болоте: тростник и рогоз (в два блока над гладью или землёй),
+		// кувшинка на глади, осока
+		if wp := col.wplant[i]; wp != .Air {
+			top := max(h, col.water_top[i])
+			put :: proc(c: ^Chunk, lx, y, lz, y0: i32, b: Block) {
+				if y >= y0 && y < y0 + CHUNK_SIZE do c.blocks[block_index(lx, y - y0, lz)] = b
+			}
+			put(c, lx, top + 1, lz, y0, wp)
+			if wp == .Reed do put(c, lx, top + 2, lz, y0, .Reed_Top)
+			if wp == .Cattail do put(c, lx, top + 2, lz, y0, .Cattail_Top)
+			continue
+		}
+		// подлесок тропического леса: кусты и молодые деревца
 		if col.surface[i] == .Grass {
 			if tall, bush := undergrowth(useed, wx, wz, col.biome[i]); tall > 0 {
 				for dy in 1 ..= tall {
@@ -375,7 +426,8 @@ generate_section :: proc(w: ^World, col: ^Column, c: ^Chunk) {
 			g := (^Section_Gen)(data)
 			i := block_index(x - g.o.x, y - g.o.y, z - g.o.z)
 			cur := g.c.blocks[i]
-			if cur == .Air || is_plant(cur) || (is_log(b) && BLOCK_INFO[cur].render == .Leaves) do g.c.blocks[i] = b
+			// древесина встаёт и в воду (корни мангров), листва — только в воздух
+			if cur == .Air || is_plant(cur) || (is_log(b) && BLOCK_INFO[cur].render == .Leaves) || (cur == .Water && is_woody(b)) do g.c.blocks[i] = b
 		})
 		// под стволом трава превращается в землю
 		if t.kind == .Cactus do continue
@@ -731,6 +783,42 @@ climate_blend :: proc(cs: [4]^Corner_Climate, fx, fz, alt, dither, wet: f64) -> 
 	return
 }
 
+// Растение у воды и на болоте в клетке (Air — нет; тогда — обычные травы).
+// Пресная вода без сильного течения: тростник — на глубине до ~2 м, рогоз —
+// до метра, кувшинки — на стоячей воде до ~3 м; растут куртинами (корневищами).
+// На суше болот: в топи, где вода у поверхности, — тростник и рогоз (в
+// тропиках — папирус, такой же высокий), иначе осока; на сфагнуме — редкая
+// осока и пушица; на солёном марше — высокие травы. Пределы по теплу лета:
+// осока — от 4 °C самого тёплого месяца, тростник — от 12, рогоз и кувшинки — от 14.
+wetland_plant :: proc(seed: u32, wx, wz: i32, p: [3]f64, bc: ^Block_Climate, wet: Wetland, under: Water_Kind, depth: i32, flow: u8, surface: Block, soak: f64) -> Block {
+	if bc.k.biome == .Ice_Cap || bc.t_max < 4 do return .Air
+	s := i64(seed)
+	r := eng.hash2f(wx, wz, seed + 111)
+	reeds := f64(fbm(s + 201, p, 22, 2)) // куртины тростника
+	lilies := f64(fbm(s + 202, p, 14, 2))
+	cattail := bc.t_max >= 14 && fbm(s + 203, p, 40, 1) > 0.25
+	if under == .Lake || under == .River {
+		speed := (flow >> 4) & 7 // по 0,25 м/с
+		if under == .River && speed > 1 do return .Air
+		if depth <= 2 && bc.t_max >= 12 && reeds > (wet == .Bog ? 0.4 : 0.0) && r < 0.75 {
+			return depth == 1 && cattail ? .Cattail : .Reed
+		}
+		if depth <= 3 && speed == 0 && bc.t_max >= 14 && lilies > (wet == .Bog ? 0.45 : 0.15) && r < 0.55 do return .Lily_Pad
+		return .Air
+	}
+	if under != .None do return .Air
+	#partial switch wet {
+	case .Marsh, .Swamp:
+		if surface == .Mud && bc.t_max >= 12 && reeds > -0.3 && r < 0.7 do return cattail && wet == .Marsh ? .Cattail : .Reed
+		if r < (wet == .Marsh ? 0.5 : 0.35) do return .Sedge
+	case .Bog:
+		if r < 0.12 do return .Sedge
+	case .Salt_Marsh:
+		if surface == .Grass && r < 0.6 do return .Tall_Grass
+	}
+	return .Air
+}
+
 // Подлесок в клетке (wx, wz) на траве: высота куста (0 — нет) и его листва.
 // В тропическом лесу кусты и молодые деревца стоят густо, до двух метров.
 undergrowth :: proc(seed: u32, wx, wz: i32, biome: Biome) -> (tall: i32, leaves: Block) {
@@ -766,4 +854,65 @@ kind_near :: proc(w: ^World, x, z: i32, kind: Water_Kind) -> (bx, bz: i32, ok: b
 		if ok && r > r_found + 120 do return // русло уже пройдено поперёк
 	}
 	return
+}
+
+// Отладка (-spawn:bog|marsh|swamp|mangrove|saltmarsh): ближайшее к (cx, cz)
+// болото этого вида (до ~100 км). Сначала грубо — по дальнему рельефу (клетки
+// 400 м, где болото занимает заметную долю), потом в такой клетке — место,
+// где и вокруг на 16 м то же болото; стоим на сухом (не в мочажине).
+find_wetland_spawn :: proc(w: ^World, cx, cz: i32, want: Wetland) -> (pos: [3]f64, ok: bool) {
+	seed := i64(w.seed)
+	n := w.geo.n
+	at :: proc(w: ^World, x, z: i32, cell: f64) -> Hydro_Sample {
+		return terrain_surface(i64(w.seed), geo_point(&w.geo, w.geo.face, x, z), cell)
+	}
+	COARSE :: 400
+	FINE :: 16
+	for ring in i32(0) ..< 250 {
+		for k in i32(0) ..< max(8 * ring, 1) {
+			// обход кольца по периметру квадрата
+			dx, dz: i32
+			side, t := k / max(2 * ring, 1), k % max(2 * ring, 1)
+			switch side {
+			case 0:
+				dx, dz = -ring + t, -ring
+			case 1:
+				dx, dz = ring, -ring + t
+			case 2:
+				dx, dz = ring - t, ring
+			case:
+				dx, dz = -ring, ring - t
+			}
+			x, z := cx + dx * COARSE, cz + dz * COARSE
+			if x < 1000 || z < 1000 || x > n - 1000 || z > n - 1000 do continue
+			s := at(w, x, z, COARSE)
+			if s.wet != want || s.wet_frac < 0.1 do continue
+			_ = seed
+			for fz := z - COARSE; fz <= z + COARSE; fz += FINE do for fx := x - COARSE; fx <= x + COARSE; fx += FINE {
+				f := at(w, fx, fz, 0.5)
+				if f.wet != want || f.kind != .None do continue
+				all := true
+				for d in ([4][2]i32{{FINE, 0}, {-FINE, 0}, {0, FINE}, {0, -FINE}}) {
+					if at(w, fx + d.x, fz + d.y, 0.5).wet != want {
+						all = false
+						break
+					}
+				}
+				if !all do continue
+				bc := block_climate(w, w.geo.face, fx, fz, max(f.ground, 0), geo_point(&w.geo, w.geo.face, fx, fz))
+				if wetland_here(f.wet, &bc) != want do continue
+				return {f64(fx) + 0.5, f64(height_block(f.ground)) + 1, f64(fz) + 0.5}, true
+			}
+		}
+	}
+	return
+}
+
+// Болото по месту: верховое живёт на одной дождевой воде, поэтому в засушливом
+// климате блока (Кёппен B — степь, пустыня) его нет — там болото низинное, на
+// грунтовой воде (сеть стока считает климат по крупным клеткам, у границы
+// засушливых краёв он бывает влажнее местного).
+wetland_here :: proc(wet: Wetland, bc: ^Block_Climate) -> Wetland {
+	if wet == .Bog && bc.k.code[0] == 'B' do return .Marsh
+	return wet
 }

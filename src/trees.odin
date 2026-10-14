@@ -46,6 +46,10 @@ TREE_SPECIES := [Tree_Kind]Tree_Species {
 	.Acacia = {13, 0.05, 1.2, 200, 50, 1.40, 1.00, 0.35, 0.30, 0.005},
 	.Jungle = {42, 0.03, 1.3, 400, 70, 0.55, 0.42, 0.45, 0.32, 0.0045},
 	.Cactus = {3, 0.05, 1.0, 100, 30, 0, 0, 0, 0, 0},
+	// ива белая (быстро растёт и толстеет), ольха чёрная, мангр (ризофора)
+	.Willow   = {25, 0.06, 1.2, 100, 30, 1.00, 0.60, 0.75, 0.55, 0.009},
+	.Alder    = {24, 0.045, 1.2, 120, 40, 0.55, 0.38, 0.70, 0.50, 0.005},
+	.Mangrove = {18, 0.05, 1.2, 120, 45, 0.90, 0.60, 0.60, 0.45, 0.004},
 }
 
 TREE_NAMES := [Tree_Kind]string {
@@ -55,6 +59,9 @@ TREE_NAMES := [Tree_Kind]string {
 	.Acacia = "акация",
 	.Jungle = "тропические деревья",
 	.Cactus = "кактусы",
+	.Willow   = "ива",
+	.Alder    = "ольха",
+	.Mangrove = "мангры",
 }
 
 @(private = "file")
@@ -126,6 +133,12 @@ tree_blocks_of :: proc(k: Tree_Kind) -> (log, wood, pole, leaves: Block) {
 		return .Jungle_Log, .Jungle_Wood, .Jungle_Pole, .Jungle_Leaves
 	case .Cactus:
 		return .Cactus, .Cactus, .Cactus, .Air
+	case .Willow:
+		return .Willow_Log, .Willow_Wood, .Willow_Pole, .Willow_Leaves
+	case .Alder:
+		return .Alder_Log, .Alder_Wood, .Alder_Pole, .Alder_Leaves
+	case .Mangrove:
+		return .Mangrove_Log, .Mangrove_Wood, .Mangrove_Pole, .Mangrove_Leaves
 	}
 	return .Oak_Log, .Oak_Wood, .Oak_Pole, .Oak_Leaves
 }
@@ -158,6 +171,9 @@ TREE_SHADE := [Tree_Kind]f64 {
 	.Acacia = 0.05,
 	.Jungle = 0.9,
 	.Cactus = 1,
+	.Willow   = 0.05,
+	.Alder    = 0.25,
+	.Mangrove = 0.3,
 }
 
 // Дерево клетки (cx, cz) грани face — одно и то же, из какой колонки ни спроси.
@@ -224,22 +240,62 @@ make_tree :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (t: Tree, ok: bool
 	if tx < 3 || tz < 3 || tx > n - 5 || tz > n - 5 do return
 	if corner_dist(n, tx, tz) < MONOLITH_RADIUS + 4 do return
 	p := geo_point(&w.geo, face, tx, tz)
-	h, dry := terrain_dry(seed, p)
-	if !dry do return // в воде деревья не растут
+	s := terrain_surface(seed, p, 0.5)
+	h := height_block(s.ground)
+	in_water := (s.kind == .Sea || s.kind == .Lake || s.kind == .River) && height_block(s.water) > h
+	// мангры стоят и в мелкой воде у тёплого берега (на корнях-ходулях); прочие в воде не растут
+	if in_water && !(s.wet == .Mangrove && s.kind == .Sea && s.water - s.ground < 1.2) do return
 	bc := block_climate(w, face, tx, tz, max(f64(h) + 1 - Y_SEA, 0), p)
+	s.wet = wetland_here(s.wet, &bc)
+	if bc.k.biome == .Ice_Cap do return
 	cover := f64(forest_cover(seed, p, bc.k.biome, bc.t_max))
+	roll := f64(eng.hash2f(cx, cz, useed + 502))
+	kind := tree_kind_for(&bc, roll, f64(fbm(seed + 99, p, 160, 2)))
+	dry := f64(bc.tint & 15) / 15
+	stunt := 1.0
+	// болота и берега (0.020): где грунтовая вода близко, растут свои деревья,
+	// и сухость климата им не помеха
+	dtw := s.wt > -1.0e8 ? s.ground - s.wt : 1.0e9 // глубина грунтовой воды, м
+	#partial switch s.wet {
+	case .Mangrove:
+		kind, cover, dry = .Mangrove, 0.8, 0
+	case .Salt_Marsh:
+		return // солёный луг — без деревьев
+	case .Bog:
+		// на сфагнуме — редкие низкорослые ель и берёза: корням не хватает воздуха и пищи
+		cover *= 0.25
+		stunt = 0.35
+		kind = bc.k.biome == .Taiga && roll < 0.6 ? .Spruce : .Birch
+	case .Marsh:
+		// заболоченный ольшаник с ивами — куртинами, между ними открытая топь
+		if fbm(seed + 97, p, 300, 2) < -0.1 do return
+		kind, cover, dry = roll < 0.65 ? .Alder : .Willow, max(cover, 0.6), 0
+	case .Swamp:
+		kind, cover, dry = .Jungle, max(cover, 0.35), 0 // болотный тропический лес
+	case .None:
+		if dtw < 2.5 {
+			// корни достают до воды: по берегам ивы, в сухом краю — лес вдоль рек
+			if bc.t_min >= 18 {
+				kind = bc.k.biome == .Desert_Hot ? .Acacia : .Jungle
+			} else if roll < (cover > 0.5 ? 0.45 : 0.85) {
+				kind = .Willow
+			}
+			cover, dry = max(cover, 0.55 * tsmooth(9, 12, bc.t_max)), 0
+		}
+	}
 	if f64(eng.hash2f(cx, cz, useed + 501)) > cover do return
 	slope: i32
 	for d in ([4][2]i32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
 		slope = max(slope, abs(h - terrain_height(seed, geo_point(&w.geo, face, tx + d.x, tz + d.y))))
 	}
-	surface, _ := surface_for(seed, p, h, slope, &bc)
-	kind := tree_kind_for(&bc, f64(eng.hash2f(cx, cz, useed + 502)), f64(fbm(seed + 99, p, 160, 2)))
+	soak := s.wt > -1.0e8 ? s.wt - s.ground : -100.0
+	if s.wet == .Mangrove do soak = 0.3 - s.ground
+	surface, _ := surface_for(seed, p, h, slope, &bc, in_water ? s.kind : .None, in_water ? height_block(s.water) - h : 0, s.wet, soak)
 	if kind == .Cactus {
 		if surface != .Sand || slope > 1 do return
 		return {x = tx, z = tz, base = h + 1, height = f32(1 + (hsh >> 16) % 3), kind = .Cactus, girth = 1, seed = hsh}, true
 	}
-	if surface != .Grass || slope > 2 do return
+	if (surface != .Grass && surface != .Sphagnum && surface != .Mud) || slope > 2 do return
 
 	sp := &TREE_SPECIES[kind]
 	r := eng.rng_make(u64(hsh) ~ u64(useed) << 32 ~ 0x7EE5)
@@ -247,7 +303,7 @@ make_tree :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (t: Tree, ok: bool
 	// в просвет встаёт подрост, которому уже лет десять, — возрасты по экспоненте
 	span := sp.life - 10
 	age := 10 - sp.tau * math.ln(1 - eng.rng_f64(&r) * (1 - math.exp(-span / sp.tau)))
-	h_max := tree_site_height(kind, bc.t_max, f64(bc.tint & 15) / 15)
+	h_max := tree_site_height(kind, bc.t_max, dry) * stunt
 	giant := kind == .Jungle && eng.rng_f64(&r) < 0.06 // великаны над пологом
 	if giant do h_max *= 1.35
 	H := h_max * math.pow(1 - math.exp(-sp.k * age), sp.c) * eng.rng_range(&r, 0.9, 1.1)
@@ -497,6 +553,12 @@ tree_shape :: proc(t: Tree) -> (s: Shape, trunk_top: f64, c: [3]f64) {
 		trunk_top = shape_acacia(&s, t, c, &rng, limb, pole)
 	case .Jungle:
 		trunk_top = shape_jungle(&s, t, c, &rng, limb, pole)
+	case .Willow:
+		trunk_top = shape_willow(&s, t, c, &rng, limb, pole)
+	case .Alder:
+		trunk_top = shape_birch(&s, t, c, &rng, limb, pole) // как у берёзы: ствол до макушки, крона яйцом
+	case .Mangrove:
+		trunk_top = shape_mangrove(&s, t, c, &rng, limb, pole)
 	case .Cactus:
 	}
 	// тонкий ствол — отрезок от земли (с запасом вниз — на склоне не висит) до развилки
@@ -680,15 +742,98 @@ shape_jungle :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: B
 	return bole
 }
 
-// Отладка (-spawn:tree): у ближайшего большого лиственного дерева, лицом к нему.
-find_tree_spawn :: proc(w: ^World, cx, cz: i32) -> (pos: [3]f64, yaw: f32, ok: bool) {
+// Ива белая: короткий толстый ствол, крупные сучья круто вверх, крона
+// широкая; концы ветвей свисают — облака листвы опущены и вытянуты вниз.
+@(private = "file")
+shape_willow :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: Block) -> (trunk: f64) {
+	H, R := f64(t.height), f64(t.crown)
+	if H < 5 {
+		add_blob(s, c + V{0, H - max(R * 0.8, 1), 0}, max(R, 1.2), max(R * 0.9, 1.3), 0.9)
+		return H - 1
+	}
+	bole := clamp(H * rr(rng, 0.2, 0.32), 1.5, 5)
+	rl := clamp(R * 0.42, 1.3, 3.4)
+	n := 3 + eng.rng_int(rng, 0, 2)
+	az0 := rr(rng, 0, math.TAU)
+	for i in 0 ..< n {
+		az := az0 + math.TAU * f64(i) / f64(n) + rr(rng, -0.4, 0.4)
+		out := V{math.cos(az), 0, math.sin(az)}
+		start := c + V{0, bole, 0}
+		reach := max(R - rl * 0.6, 0.8) * rr(rng, 0.8, 1.0)
+		end := start + out * reach + V{0, (H - bole - rl * 0.6) * rr(rng, 0.75, 0.95), 0}
+		mid := start + (end - start) * 0.45 + out * 0.4
+		add_seg(s, start, mid, wood)
+		add_seg(s, mid, end, wood)
+		add_blob(s, end + V{0, -rl * 0.35, 0}, rl, rl * 1.45, 0.85) // свисающие ветви
+		// боковая ветвь от середины — наружу и вниз
+		az2 := az + (eng.rng_f64(rng) < 0.5 ? -1.0 : 1.0) * rr(rng, 0.5, 0.9)
+		e2 := mid + V{math.cos(az2), 0.35, math.sin(az2)} * (reach * 0.55)
+		if H >= 10 do add_seg(s, mid, e2, twig)
+		add_blob(s, e2 + V{0, -rl * 0.45, 0}, rl * 0.8, rl * 1.3, 0.8)
+	}
+	add_blob(s, c + V{0, H - rl * 0.9, 0}, rl * 1.1, rl * 0.9, 0.9)
+	return bole
+}
+
+// Мангровое дерево (ризофора): ствол стоит на дугах корней-ходуль, что уходят
+// в ил и в воду; крона густая, округлая, низкая.
+@(private = "file")
+shape_mangrove :: proc(s: ^Shape, t: Tree, c: [3]f64, rng: ^eng.Rng, wood, twig: Block) -> (trunk: f64) {
+	H, R := f64(t.height), f64(t.crown)
+	g := f64(t.girth)
+	rh := clamp(H * 0.25, 1.2, 3.0) // откуда от ствола отходят корни
+	roots := H < 4 ? 3 : 5 + eng.rng_int(rng, 0, 3)
+	az := rr(rng, 0, math.TAU)
+	for _ in 0 ..< roots {
+		az += math.TAU / f64(roots) + rr(rng, -0.4, 0.4)
+		out := V{math.cos(az), 0, math.sin(az)}
+		top := c + out * (g / 2) + V{0, rh * rr(rng, 0.6, 1.0), 0}
+		reach := g / 2 + rr(rng, 1.2, 2.2)
+		knee := c + out * (reach * 0.6) + V{0, rh * rr(rng, 0.75, 1.0), 0}
+		add_seg(s, top, knee, twig)
+		add_seg(s, knee, c + out * reach + V{0, -1.5, 0}, twig)
+	}
+	if H < 4 {
+		add_blob(s, c + V{0, H - max(R * 0.6, 0.9), 0}, max(R, 1.1), max(R * 0.7, 1), 0.92)
+		return H - 1
+	}
+	rl := clamp(R * 0.5, 1.3, 3.5)
+	cb := max(f64(t.crown_base), rh + 1)
+	n := 2 + eng.rng_int(rng, 0, 2)
+	az0 := rr(rng, 0, math.TAU)
+	for i in 0 ..< n {
+		a := az0 + math.TAU * f64(i) / f64(n) + rr(rng, -0.4, 0.4)
+		start := c + V{0, cb, 0}
+		reach := max(R - rl * 0.7, 0.6) * rr(rng, 0.7, 1.0)
+		end := start + dir_at(a, rr(rng, 0.8, 1.1)) * reach
+		end.y = min(end.y, c.y + H - rl * 0.6)
+		if H >= 8 do add_seg(s, start, end, twig)
+		add_blob(s, end + V{0, rl * 0.2, 0}, rl, rl * 0.7, 0.95)
+	}
+	add_blob(s, c + V{0, H - rl * 0.75, 0}, R * 0.75, rl * 0.75, 0.95)
+	return cb
+}
+
+// Отладка (-spawn:tree): у ближайшего большого лиственного дерева, лицом к нему;
+// -spawn:willow|alder|mangrovetree — у дерева этого вида (не ниже 6 м).
+find_tree_spawn :: proc(w: ^World, cx, cz: i32, want := "tree") -> (pos: [3]f64, yaw: f32, ok: bool) {
 	face := w.geo.face
 	best: Tree
 	best_d := max(f64)
 	for gz in eng.floor_div(cz - 300, TREE_CELL) ..= eng.floor_div(cz + 300, TREE_CELL) {
 		for gx in eng.floor_div(cx - 300, TREE_CELL) ..= eng.floor_div(cx + 300, TREE_CELL) {
 			t, has := tree_in_cell(w, face, gx, gz)
-			if !has || (t.kind != .Oak && t.kind != .Birch) || t.height < 14 do continue
+			if !has do continue
+			switch want {
+			case "willow":
+				if t.kind != .Willow || t.height < 6 do continue
+			case "alder":
+				if t.kind != .Alder || t.height < 6 do continue
+			case "mangrovetree":
+				if t.kind != .Mangrove || t.height < 6 do continue
+			case:
+				if (t.kind != .Oak && t.kind != .Birch) || t.height < 14 do continue
+			}
 			d := math.hypot(f64(t.x - cx), f64(t.z - cz))
 			if d < best_d do best, best_d = t, d
 		}
@@ -700,7 +845,7 @@ find_tree_spawn :: proc(w: ^World, cx, cz: i32) -> (pos: [3]f64, yaw: f32, ok: b
 		x := best.x + i32(math.round(math.cos(a) * dist))
 		z := best.z + i32(math.round(math.sin(a) * dist))
 		h, dry := terrain_dry(i64(w.seed), geo_point(&w.geo, face, x, z))
-		if !dry || h <= SEA_LEVEL + 1 || tree_in_the_way(w, face, x, h + 1, z) do continue
+		if !dry || (h <= SEA_LEVEL + 1 && want != "mangrovetree") || tree_in_the_way(w, face, x, h + 1, z) do continue
 		pos = {f64(x) + 0.5, f64(h) + 1, f64(z) + 0.5}
 		yaw = f32(math.atan2(-(f64(best.x) - f64(x)), f64(best.z) - f64(z)))
 		return pos, yaw, true

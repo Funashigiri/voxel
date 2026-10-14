@@ -13,7 +13,7 @@ import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.019"
+VERSION :: "0.020"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -45,6 +45,8 @@ Options :: struct {
 	mountain_spawn: bool, // появиться над горами
 	cliff_spawn:   bool, // у самого крутого обрыва (слои пород)
 	tree_spawn:    bool, // у большого лиственного дерева, лицом к нему
+	wet_want:      Wetland, // -spawn:bog|marsh|swamp|mangrove|saltmarsh — на болоте этого вида
+	tree_want:     string, // -spawn:willow|alder|mangrovetree — у дерева этого вида
 	wx_want:       string, // -wx: начать в ближайший день с такой погодой (rain, snow, firstsnow, storm, clear, overcast, fog, thunder, nightstorm)
 	has_latlon:    bool, // высадка в заданной точке планеты
 	lat, lon:      f64,
@@ -182,7 +184,20 @@ parse_options :: proc() -> (o: Options) {
 			o.water_mode = val
 			o.mountain_spawn = val == "mountain"
 			o.cliff_spawn = val == "cliff"
-			o.tree_spawn = val == "tree"
+			o.tree_spawn = val == "tree" || val == "willow" || val == "alder" || val == "mangrovetree"
+			o.tree_want = val
+			switch val {
+			case "bog":
+				o.wet_want = .Bog
+			case "marsh":
+				o.wet_want = .Marsh
+			case "swamp":
+				o.wet_want = .Swamp
+			case "mangrove":
+				o.wet_want = .Mangrove
+			case "saltmarsh":
+				o.wet_want = .Salt_Marsh
+			}
 		case "-latlon":
 			las, _, los := strings.partition(val, ",")
 			o.lat = strconv.parse_f64(las) or_else 40
@@ -503,8 +518,13 @@ main :: proc() {
 		spawn, test_yaw = find_cliff_spawn(&world, sx, sz)
 		has_test_yaw = true
 	}
+	if opts.wet_want != .None {
+		p, ok := find_wetland_spawn(&world, sx, sz, opts.wet_want)
+		if ok do spawn = p
+		fmt.printfln("болото %v: %s (%.0f м от места высадки)", opts.wet_want, ok ? "найдено" : "не найдено в 100 км", math.hypot(p.x - f64(sx), p.z - f64(sz)))
+	}
 	if opts.tree_spawn {
-		if p, yaw, ok := find_tree_spawn(&world, sx, sz); ok {
+		if p, yaw, ok := find_tree_spawn(&world, sx, sz, opts.tree_want); ok {
 			spawn, test_yaw = p, yaw
 			has_test_yaw = true
 		}
@@ -900,6 +920,11 @@ main :: proc() {
 			}
 			// автоснимок ждёт, пока досчитаются звёздное небо и дальний рельеф
 			bolt_ok := opts.look_at != "bolt" || (bolt_shot_at >= 0 && now - start >= bolt_shot_at)
+			@(static) dbg_next := 30.0
+			if auto_mode && now - start > dbg_next {
+				dbg_next += 10
+				fmt.printfln("автоснимок ждёт %.0f с: звёздное небо %v, дальний рельеф %v (заявок %d, ждут видеокарты %d), погода %v, снег %v", now - start, star_sky.ready || star_sky.worker == nil, far.ready_all, len(far.reqs), len(far.uploads), wx.front.ok, snow.front.ok)
+			}
 			if auto_mode && bolt_ok && (star_sky.ready || star_sky.worker == nil) && far.ready_all && wx.front.ok && snow.front.ok && now - start > opts.shot_delay + f64(shots_taken) * opts.interval {
 				bolt_shot_at = -1
 				path := opts.shot_path

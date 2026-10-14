@@ -56,6 +56,28 @@ Block :: enum u8 {
 	Jungle_Pole,
 	// реки и озёра (0.019)
 	Salt, // корка солончака
+	// болота и берега (0.020)
+	Peat, // торф
+	Sphagnum, // сфагнум поверх торфа
+	Mud, // ил
+	Sedge, // осока
+	Reed, // тростник: низ
+	Reed_Top, // тростник: метёлка
+	Cattail, // рогоз: низ
+	Cattail_Top, // рогоз: початок
+	Lily_Pad, // кувшинка на глади
+	Willow_Log,
+	Willow_Leaves,
+	Willow_Wood,
+	Willow_Pole,
+	Alder_Log,
+	Alder_Leaves,
+	Alder_Wood,
+	Alder_Pole,
+	Mangrove_Log,
+	Mangrove_Leaves,
+	Mangrove_Wood,
+	Mangrove_Pole,
 }
 
 // Русские названия (F3: что под ногами).
@@ -107,6 +129,27 @@ BLOCK_NAMES := [Block]string {
 	.Acacia_Pole  = "тонкий ствол акации",
 	.Jungle_Pole  = "тонкий ствол тропического дерева",
 	.Salt         = "соль (солончак)",
+	.Peat          = "торф",
+	.Sphagnum      = "сфагнум (мох)",
+	.Mud           = "ил",
+	.Sedge         = "осока",
+	.Reed          = "тростник",
+	.Reed_Top      = "тростник",
+	.Cattail       = "рогоз",
+	.Cattail_Top   = "рогоз",
+	.Lily_Pad      = "кувшинка",
+	.Willow_Log    = "ива",
+	.Willow_Leaves = "листва ивы",
+	.Willow_Wood   = "ветвь ивы",
+	.Willow_Pole   = "тонкий ствол ивы",
+	.Alder_Log     = "ольха",
+	.Alder_Leaves  = "листва ольхи",
+	.Alder_Wood    = "ветвь ольхи",
+	.Alder_Pole    = "тонкий ствол ольхи",
+	.Mangrove_Log  = "мангровое дерево",
+	.Mangrove_Leaves = "листва мангра",
+	.Mangrove_Wood = "корень-ходуля мангра",
+	.Mangrove_Pole = "тонкий ствол мангра",
 }
 
 Render_Kind :: enum u8 {
@@ -115,6 +158,7 @@ Render_Kind :: enum u8 {
 	Leaves, // куб с дырками (alpha-test), грани между листьями рисуются ("fancy")
 	Cross, // растения: две диагональные плоскости
 	Liquid, // полупрозрачная вода
+	Pad, // плоский лист на глади воды (кувшинка)
 	Post, // тонкий ствол или ветвь: столбик POST_W, соединяется с соседними стволами и ветвями
 }
 
@@ -182,6 +226,24 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Snow] = cube(all_faces(.Snow))
 	BLOCK_INFO[.Ice] = cube(all_faces(.Ice))
 	BLOCK_INFO[.Salt] = cube(all_faces(.Salt))
+	BLOCK_INFO[.Peat] = cube(all_faces(.Peat))
+	BLOCK_INFO[.Sphagnum] = cube(column_faces(.Sphagnum_Side, .Sphagnum_Top, .Peat))
+	BLOCK_INFO[.Mud] = cube(all_faces(.Mud))
+	for b in ([5]Block{.Sedge, .Reed, .Reed_Top, .Cattail, .Cattail_Top}) {
+		t := b == .Sedge ? Tex.Sedge : b == .Reed ? Tex.Reed : b == .Reed_Top ? Tex.Reed_Top : b == .Cattail ? Tex.Cattail : Tex.Cattail_Top
+		BLOCK_INFO[b] = {render = .Cross, tex = all_faces(t)}
+	}
+	BLOCK_INFO[.Lily_Pad] = {render = .Pad, tex = all_faces(.Lily_Pad)}
+	BLOCK_INFO[.Willow_Log] = cube(column_faces(.Willow_Log, .Willow_Log_Top, .Willow_Log_Top))
+	BLOCK_INFO[.Alder_Log] = cube(column_faces(.Alder_Log, .Alder_Log_Top, .Alder_Log_Top))
+	BLOCK_INFO[.Mangrove_Log] = cube(column_faces(.Mangrove_Log, .Mangrove_Log_Top, .Mangrove_Log_Top))
+	BLOCK_INFO[.Willow_Wood] = cube(all_faces(.Willow_Log))
+	BLOCK_INFO[.Alder_Wood] = cube(all_faces(.Alder_Log))
+	BLOCK_INFO[.Mangrove_Wood] = cube(all_faces(.Mangrove_Log))
+	for b in ([3]Block{.Willow_Leaves, .Alder_Leaves, .Mangrove_Leaves}) {
+		t := b == .Willow_Leaves ? Tex.Willow_Leaves : b == .Alder_Leaves ? Tex.Alder_Leaves : Tex.Mangrove_Leaves
+		BLOCK_INFO[b] = {render = .Leaves, solid = true, blocks_light = true, tex = all_faces(t)}
+	}
 	BLOCK_INFO[.Spruce_Log] = cube(column_faces(.Spruce_Log, .Spruce_Log_Top, .Spruce_Log_Top))
 	BLOCK_INFO[.Acacia_Log] = cube(column_faces(.Acacia_Log, .Acacia_Log_Top, .Acacia_Log_Top))
 	BLOCK_INFO[.Jungle_Log] = cube(column_faces(.Jungle_Log, .Jungle_Log_Top, .Jungle_Log_Top))
@@ -206,6 +268,9 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Spruce_Pole] = pole(.Spruce_Log, .Spruce_Log_Top)
 	BLOCK_INFO[.Acacia_Pole] = pole(.Acacia_Log, .Acacia_Log_Top)
 	BLOCK_INFO[.Jungle_Pole] = pole(.Jungle_Log, .Jungle_Log_Top)
+	BLOCK_INFO[.Willow_Pole] = pole(.Willow_Log, .Willow_Log_Top)
+	BLOCK_INFO[.Alder_Pole] = pole(.Alder_Log, .Alder_Log_Top)
+	BLOCK_INFO[.Mangrove_Pole] = pole(.Mangrove_Log, .Mangrove_Log_Top)
 	BLOCK_INFO[.Water] = {
 		render       = .Liquid,
 		blocks_light = true,
@@ -231,7 +296,8 @@ blocks_init :: proc() {
 // Ствол дерева (или кактус) — не затирает листву соседей при генерации.
 is_log :: proc(b: Block) -> bool {
 	#partial switch b {
-	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood, .Oak_Pole, .Birch_Pole, .Spruce_Pole, .Acacia_Pole, .Jungle_Pole:
+	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Cactus, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood, .Oak_Pole, .Birch_Pole, .Spruce_Pole, .Acacia_Pole, .Jungle_Pole,
+	     .Willow_Log, .Alder_Log, .Mangrove_Log, .Willow_Wood, .Alder_Wood, .Mangrove_Wood, .Willow_Pole, .Alder_Pole, .Mangrove_Pole:
 		return true
 	}
 	return false
@@ -243,12 +309,12 @@ is_plant :: proc(b: Block) -> bool {
 
 // Хвоя и вечнозелёная листва — не опадают.
 evergreen_leaves :: proc "contextless" (b: Block) -> bool {
-	return b == .Spruce_Leaves || b == .Acacia_Leaves || b == .Jungle_Leaves
+	return b == .Spruce_Leaves || b == .Acacia_Leaves || b == .Jungle_Leaves || b == .Mangrove_Leaves
 }
 
-// Листва, что опадает на зиму (дуб, берёза): голая крона не держит свет неба.
+// Листва, что опадает на зиму (дуб, берёза, ива, ольха): голая крона не держит свет неба.
 deciduous_leaves :: proc "contextless" (b: Block) -> bool {
-	return b == .Oak_Leaves || b == .Birch_Leaves
+	return b == .Oak_Leaves || b == .Birch_Leaves || b == .Willow_Leaves || b == .Alder_Leaves
 }
 
 // Тонкий ствол: ширина столбика в 1/16 блока (25 см).
@@ -259,7 +325,8 @@ POST_HI :: 8 + POST_W / 2
 // Древесина, к которой тянется тонкий ствол (стволы, ветви, другие тонкие стволы).
 is_woody :: proc "contextless" (b: Block) -> bool {
 	#partial switch b {
-	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood, .Oak_Pole, .Birch_Pole, .Spruce_Pole, .Acacia_Pole, .Jungle_Pole:
+	case .Oak_Log, .Birch_Log, .Spruce_Log, .Acacia_Log, .Jungle_Log, .Oak_Wood, .Birch_Wood, .Spruce_Wood, .Acacia_Wood, .Jungle_Wood, .Oak_Pole, .Birch_Pole, .Spruce_Pole, .Acacia_Pole, .Jungle_Pole,
+	     .Willow_Log, .Alder_Log, .Mangrove_Log, .Willow_Wood, .Alder_Wood, .Mangrove_Wood, .Willow_Pole, .Alder_Pole, .Mangrove_Pole:
 		return true
 	}
 	return false

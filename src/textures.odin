@@ -59,6 +59,26 @@ Tex :: enum u8 {
 	Birch_Twigs,
 	// реки и озёра (0.019): корка солончака
 	Salt,
+	// болота и берега (0.020)
+	Peat,
+	Sphagnum_Top,
+	Sphagnum_Side,
+	Mud,
+	Sedge,
+	Reed,
+	Reed_Top,
+	Cattail,
+	Cattail_Top,
+	Lily_Pad,
+	Willow_Log,
+	Willow_Log_Top,
+	Willow_Leaves,
+	Alder_Log,
+	Alder_Log_Top,
+	Alder_Leaves,
+	Mangrove_Log,
+	Mangrove_Log_Top,
+	Mangrove_Leaves,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -506,6 +526,143 @@ gen_ice :: proc() -> (img: Pixels) {
 	return
 }
 
+// ---------------------------------------------------------------- болота и берега (0.020)
+
+// Торф: тёмно-бурый, волокнистый — полусгнивший мох и осока слоями.
+@(private = "file")
+gen_peat :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(46, 32, 22), rgb(58, 41, 27), rgb(70, 50, 32), rgb(84, 61, 38), rgb(98, 72, 45)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.45 * h(x / 3, y, 360) + 0.35 * h(x, y, 361) + 0.2 * vn(x, y, 4, 362) // волокна вдоль слоя
+		img[y * TEX_SIZE + x] = pick(pal, stretch(n, 0.1, 0.9))
+	}
+	return
+}
+
+// Сфагнум сверху: подушки разного цвета — зелёные, жёлто-зелёные, красноватые.
+@(private = "file")
+gen_sphagnum_top :: proc() -> (img: Pixels) {
+	green := []RGBA{rgb(92, 128, 52), rgb(108, 144, 60), rgb(124, 158, 70)}
+	yellow := []RGBA{rgb(150, 156, 64), rgb(166, 170, 76), rgb(180, 180, 90)}
+	red := []RGBA{rgb(128, 64, 52), rgb(146, 78, 62), rgb(160, 96, 74)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		patch := vn(x, y, 4, 370)
+		pal := patch < 0.38 ? green : patch < 0.68 ? yellow : red
+		c := pick(pal, h(x, y, 371))
+		if h(x, y, 372) < 0.08 do c = mix_rgb(c, rgb(230, 236, 200), 0.35) // головки мха
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Сфагнум сбоку: торф, сверху полоса мха.
+@(private = "file")
+gen_sphagnum_side :: proc() -> (img: Pixels) {
+	img = gen_peat()
+	top := gen_sphagnum_top()
+	for x in 0 ..< TEX_SIZE {
+		fringe := 3 + (h(x, 0, 373) < 0.5 ? 1 : 0)
+		for y in 0 ..< fringe do img[y * TEX_SIZE + x] = top[y * TEX_SIZE + x]
+	}
+	return
+}
+
+// Ил: серо-бурый, с мокрыми бликами.
+@(private = "file")
+gen_mud :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(64, 56, 46), rgb(76, 67, 55), rgb(88, 78, 64), rgb(100, 89, 73)}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		n := 0.6 * vn(x, y, 4, 380) + 0.4 * h(x, y, 381)
+		c := pick(pal, stretch(n, 0.1, 0.9))
+		if h(x, y, 382) > 0.95 do c = rgb(126, 120, 108) // блик воды
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
+// Осока: густой пучок узких листьев, дугой в стороны.
+@(private = "file")
+gen_sedge :: proc() -> (img: Pixels) {
+	dark := rgb(74, 98, 38)
+	light := rgb(150, 162, 76)
+	for b in 0 ..< 9 {
+		x := 2 + int(h(b, 0, 390) * 12)
+		height := 7 + int(h(b, 1, 391) * 8)
+		bend := (h(b, 2, 392) < 0.5 ? -1.0 : 1.0) * (0.5 + h(b, 3, 393) * 2.5)
+		for i in 0 ..< height {
+			f := f32(i) / f32(height)
+			y := TEX_SIZE - 1 - i
+			xx := x + int(bend * f * f * 3)
+			put(&img, xx, y, mix_rgb(dark, light, f * 0.8 + h(x, y, 394) * 0.2))
+		}
+	}
+	return
+}
+
+// Тростник: высокие стебли с листьями наискось; наверху — метёлка.
+@(private = "file")
+gen_reed :: proc(top: bool) -> (img: Pixels) {
+	stem := rgb(132, 146, 74)
+	leaf := rgb(96, 128, 52)
+	for k in 0 ..< 4 {
+		x := 2 + k * 4 + int(h(k, 0, 400) * 2)
+		y0 := top ? 4 + int(h(k, 1, 401) * 4) : 0 // верх стебля
+		for y in y0 ..< TEX_SIZE do put(&img, x, y, mix_rgb(stem, rgb(168, 160, 96), f32(TEX_SIZE - y) / 32))
+		// листья: от стебля наискось вниз
+		for l in 0 ..< 2 {
+			ly := y0 + 3 + l * 5 + int(h(k, l + 2, 402) * 2)
+			dir := h(k, l + 4, 403) < 0.5 ? -1 : 1
+			for i in 0 ..< 4 do put(&img, x + dir * (i + 1), ly + i / 2, mix_rgb(leaf, stem, f32(i) / 4))
+		}
+		if top {
+			// метёлка: пушистая, лиловато-бурая
+			for py in y0 - 4 ..< y0 + 1 do for px in x - 1 ..= x + 1 {
+				if h(px, py, 404 + u32(k)) < 0.65 do put(&img, px, py, mix_rgb(rgb(112, 84, 92), rgb(170, 140, 128), h(px, py, 405)))
+			}
+		}
+	}
+	return
+}
+
+// Рогоз: широкие листья; наверху — бурый початок на стебле.
+@(private = "file")
+gen_cattail :: proc(top: bool) -> (img: Pixels) {
+	dark := rgb(62, 100, 40)
+	light := rgb(110, 146, 64)
+	for k in 0 ..< 3 {
+		x := 2 + k * 5 + int(h(k, 0, 410) * 2)
+		y0 := top ? 6 + int(h(k, 1, 411) * 6) : 0
+		for y in y0 ..< TEX_SIZE do for dx in 0 ..< 2 do put(&img, x + dx, y, mix_rgb(dark, light, f32(dx) * 0.5 + h(x, y, 412) * 0.3))
+	}
+	if top {
+		// початок: тёмно-бурый цилиндр на тонком стебле
+		for y in 1 ..< 10 do put(&img, 8, y, rgb(120, 130, 70))
+		for y in 3 ..< 9 do for x in 7 ..= 9 do put(&img, x, y, mix_rgb(rgb(78, 48, 26), rgb(104, 66, 36), h(x, y, 413)))
+	}
+	return
+}
+
+// Кувшинка: круглый лист с вырезом, жилки; у некоторых — белый цветок.
+@(private = "file")
+gen_lily_pad :: proc() -> (img: Pixels) {
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		dx, dy := f32(x) - 7.5, f32(y) - 7.5
+		r := math.sqrt(dx * dx + dy * dy)
+		if r > 6.8 do continue
+		ang := math.atan2(dy, dx)
+		if ang > 0.2 && ang < 0.75 do continue // вырез до середины
+		c := mix_rgb(rgb(52, 104, 36), rgb(84, 140, 52), h(x, y, 420) * 0.6 + 0.2)
+		if int(math.round(ang * 5)) % 2 == 0 && r > 1.5 do c = mix_rgb(c, rgb(110, 160, 70), 0.35) // жилки
+		img[y * TEX_SIZE + x] = c
+	}
+	// белый цветок с жёлтой серединкой
+	for y in 5 ..< 10 do for x in 4 ..< 9 {
+		dx, dy := f32(x) - 6, f32(y) - 7
+		if dx * dx + dy * dy <= 4.5 do img[y * TEX_SIZE + x] = dx * dx + dy * dy < 1 ? rgb(236, 200, 70) : rgb(244, 242, 236)
+	}
+	return
+}
+
 // Соль солончака: белая корка, разбитая на многоугольники валиками (соль
 // выпирает по трещинам), между ними чуть серее.
 @(private = "file")
@@ -703,6 +860,44 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_twigs([]RGBA{rgb(70, 44, 36), rgb(84, 54, 44), rgb(98, 64, 52), rgb(112, 76, 62)}, 340)
 	case .Salt:
 		return gen_salt()
+	case .Peat:
+		return gen_peat()
+	case .Sphagnum_Top:
+		return gen_sphagnum_top()
+	case .Sphagnum_Side:
+		return gen_sphagnum_side()
+	case .Mud:
+		return gen_mud()
+	case .Sedge:
+		return gen_sedge()
+	case .Reed:
+		return gen_reed(false)
+	case .Reed_Top:
+		return gen_reed(true)
+	case .Cattail:
+		return gen_cattail(false)
+	case .Cattail_Top:
+		return gen_cattail(true)
+	case .Lily_Pad:
+		return gen_lily_pad()
+	case .Willow_Log:
+		return gen_log_side([]RGBA{rgb(72, 66, 54), rgb(88, 80, 66), rgb(102, 94, 78), rgb(116, 108, 90)}, 430)
+	case .Willow_Log_Top:
+		return gen_log_top([]RGBA{rgb(88, 80, 66), rgb(102, 94, 78)}, rgb(196, 176, 130), rgb(178, 158, 114), rgb(156, 138, 98), 435)
+	case .Willow_Leaves:
+		return gen_leaves([]RGBA{rgb(62, 98, 44), rgb(76, 114, 54), rgb(92, 130, 66), rgb(110, 146, 80), rgb(132, 164, 100)}, 440)
+	case .Alder_Log:
+		return gen_log_side([]RGBA{rgb(52, 50, 46), rgb(64, 61, 56), rgb(76, 72, 66), rgb(90, 85, 78)}, 450)
+	case .Alder_Log_Top:
+		return gen_log_top([]RGBA{rgb(64, 61, 56), rgb(76, 72, 66)}, rgb(200, 140, 90), rgb(182, 124, 78), rgb(160, 106, 64), 455)
+	case .Alder_Leaves:
+		return gen_leaves([]RGBA{rgb(28, 64, 26), rgb(36, 78, 32), rgb(44, 90, 38), rgb(54, 102, 46), rgb(66, 116, 54)}, 460)
+	case .Mangrove_Log:
+		return gen_log_side([]RGBA{rgb(92, 70, 58), rgb(108, 84, 70), rgb(122, 96, 80), rgb(136, 110, 92)}, 470)
+	case .Mangrove_Log_Top:
+		return gen_log_top([]RGBA{rgb(108, 84, 70), rgb(122, 96, 80)}, rgb(176, 104, 76), rgb(158, 90, 64), rgb(138, 76, 54), 475)
+	case .Mangrove_Leaves:
+		return gen_leaves([]RGBA{rgb(26, 74, 36), rgb(34, 88, 44), rgb(44, 102, 54), rgb(56, 118, 64), rgb(70, 132, 76)}, 480)
 	case .Water:
 		return gen_water(0)
 	}

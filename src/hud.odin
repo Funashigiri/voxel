@@ -226,6 +226,19 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 			if s.phi > 0.05 do near = fmt.tprintf("%s; рядом озеро (гладь на %.0f м)", near, s.level)
 			panel_line(p, WHITE, near)
 		}
+		// болота (0.020): какое (по месту — как в блоках), торф, грунтовая вода
+		if face, gx, gz, ok := world_resolve(w, i32(math.floor(player.pos.x)), i32(math.floor(player.pos.z))); ok {
+			if col := world_column(w, column_key_of(face, gx, gz)); col != nil do s.wet = col.wet[column_index(gx, gz)]
+		}
+		if s.wet != .None || (s.kind == .None && s.wt > -1.0e8) {
+			line := s.wet != .None ? WETLAND_NAMES[s.wet] : "сухо"
+			if s.peat > 0.05 do line = fmt.tprintf("%s, торф %.1f м", line, s.peat)
+			if s.kind == .None && s.wt > -1.0e8 {
+				d := s.ground - s.wt
+				line = d > 0.05 ? fmt.tprintf("%s; грунтовая вода на %.1f м под землёй", line, d) : fmt.tprintf("%s; грунтовая вода у поверхности", line)
+			}
+			panel_line(p, AQUA, line)
+		}
 	}
 }
 

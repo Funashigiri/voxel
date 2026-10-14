@@ -34,6 +34,24 @@ Water_Kind :: enum u8 {
 	Salt, // корка соли (воды нет)
 }
 
+Wetland :: enum u8 {
+	None,
+	Marsh, // низинное болото, топь: осока, лужи-окна
+	Bog, // торфяное: сфагнум на торфе, кочки, мочажины
+	Swamp, // тропическое заболоченное
+	Mangrove, // мангры у тёплого моря
+	Salt_Marsh, // солёные марши у моря
+}
+
+WETLAND_NAMES := [Wetland]string {
+	.None       = "",
+	.Marsh      = "низинное болото",
+	.Bog        = "торфяное (сфагновое) болото",
+	.Swamp      = "тропическое болото",
+	.Mangrove   = "мангры",
+	.Salt_Marsh = "солёный марш",
+}
+
 Hydro_Sample :: struct {
 	ground: f64, // м над морем: земля (с руслами, долинами, берегами)
 	water:  f64, // м над морем: гладь (если есть — выше земли)
@@ -46,6 +64,10 @@ Hydro_Sample :: struct {
 	level:  f64, // уровень озера рядом (для F3)
 	cover:  f64, // дальний рельеф: доля клетки под рекой, что уже клетки (тонкая линия цветом)
 	phi:    f64, // насколько точка в клетках озера (0…1; озеро — от 0,5)
+	wet:    Wetland, // болото здесь (0.020)
+	peat:   f64, // торф под поверхностью, м
+	wt:     f64, // грунтовая вода, м над морем (−1e9 — глубоко)
+	wet_frac: f64, // дальний рельеф: доля клетки под болотом
 }
 
 HYDRO_Q_MIN :: 0.12 // м³/с: ручьи меньше не видно
@@ -79,6 +101,7 @@ Shape_Cache :: struct {
 	c0, e1, e2: [3]f64, // середина клетки и оси касательной плоскости
 	near:       [3][3]int, // клетки вокруг (−1 — нет)
 	water_near: bool, // рядом озеро или солончак
+	wet_near:   bool, // рядом грунтовая вода близко (болота)
 	all_lake:   bool, // вокруг только озеро (одно): граница далеко
 	ocean_near: bool,
 	n:          int,
@@ -143,12 +166,13 @@ cache_build :: proc(h: ^Hydro_Map, idx: int, with_curves: bool) {
 	ex /= math.sqrt(ex.x * ex.x + ex.y * ex.y + ex.z * ex.z)
 	c.e1 = ex
 	c.e2 = {c.c0.y * ex.z - c.c0.z * ex.y, c.c0.z * ex.x - c.c0.x * ex.z, c.c0.x * ex.y - c.c0.y * ex.x}
-	c.water_near, c.ocean_near = false, false
+	c.water_near, c.ocean_near, c.wet_near = false, false, false
 	c.all_lake = true
 	for dj in -1 ..= 1 do for di in -1 ..= 1 {
 		n := hydro_cell_at(h, face, ci + di, cj + dj)
 		c.near[dj + 1][di + 1] = n
 		if h.kind[n] != .Lake || h.level[n] != h.level[idx] do c.all_lake = false
+		if h.gw[n] >= 2 || (h.wetc[n] & WET_COLD != 0 && h.ai[n] >= 32) do c.wet_near = true // торф — где влажность хоть местами выше 0,8
 		#partial switch h.kind[n] {
 		case .Ocean:
 			c.ocean_near = true
@@ -347,6 +371,7 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 	cut, fill := e, e // долины: срез до самой глубокой, подсыпка до самой высокой
 	river := -1.0e12 // гладь реки здесь
 	mn: [MEANDER_OCT]f64 // поле извилистости в этой точке (считается, если рядом река)
+	riv_wt := -1.0e9 // грунтовая вода от рек рядом, м над морем
 	have_mn := false
 	for &cv in c.curves[:curves ? c.n : 0] {
 		if q.x < cv.lo.x || q.y < cv.lo.y || q.x > cv.hi.x || q.y > cv.hi.y do continue
@@ -375,6 +400,12 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 		}
 		dist := abs(sd - meander_off(&mn, w))
 		s.dist = min(s.dist, dist)
+		// грунтовая вода у реки — не ниже её глади (только в её пойме; дальше плавно сходит на нет)
+		{
+			Lr := (1 - t) * (1 - t) * cv.l0 + 2 * t * (1 - t) * cv.l1 + t * t * cv.l2
+			f := 1 - smooth01((dist - river_width(qq) * 0.5 - river_flood(river_width(qq), cv.slope) - 30) / 120)
+			riv_wt = max(riv_wt, Lr - 1000 * (1 - f))
+		}
 		flood := river_flood(w, cv.slope)
 		// дальний рельеф: реки уже клетки не видно, долина — хотя бы в клетку
 		visible := w >= 0.7 * cell
@@ -418,15 +449,18 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 		fill = max(fill, target)
 	}
 
-	// озёра и солончаки: клетки вокруг (граница изломана шумом)
+	// озёра, солончаки, море и болота: клетки сети вокруг (граница изломана шумом)
 	lake_l, salt_l := 0.0, 0.0
 	phi_lake, phi_salt, phi_ocean := 0.0, 0.0, 0.0
+	hs, peat_p := 0.0, 0.0 // подъём грунтовых вод и торфа над местным дном, м (между клетками — плавно)
+	wclass := Wet_Class.None
+	wflags: u8
 	if shape_force > 0 {
 		// отладка: кэш чужой клетки — озёра по её соседям не годятся
 	} else if c.all_lake {
 		phi_lake, lake_l = 1, f64(h.level[idx])
 		s.level, s.phi = lake_l, 1
-	} else if c.water_near || c.ocean_near {
+	} else if c.water_near || c.ocean_near || c.wet_near {
 		wx := f64(noise.noise_3d_improve_xz(h.seed + 901, p / 6000)) * 0.22 + f64(noise.noise_3d_improve_xz(h.seed + 903, p / 1300)) * 0.07
 		wz := f64(noise.noise_3d_improve_xz(h.seed + 902, p / 6000)) * 0.22 + f64(noise.noise_3d_improve_xz(h.seed + 904, p / 1300)) * 0.07
 		gx := clamp(fx + wx - 0.5 - f64(ci), -1, 0.999)
@@ -434,10 +468,18 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 		i0 := int(math.floor(gx))
 		j0 := int(math.floor(gz))
 		u, v := gx - f64(i0), gz - f64(j0)
-		best_l, best_s := 0.0, 0.0
+		best_l, best_s, best_w := 0.0, 0.0, 0.0
+		ai_c, cold := 0.0, 0.0
 		for b in 0 ..= 1 do for a in 0 ..= 1 {
 			n := c.near[j0 + b + 1][i0 + a + 1]
 			wgt := (a == 0 ? 1 - u : u) * (b == 0 ? 1 - v : v)
+			hs += wgt * f64(h.gw[n]) * 0.05
+			ai_c += wgt * f64(h.ai[n]) / 50
+			if h.wetc[n] & WET_COLD != 0 do cold += wgt
+			wc := Wet_Class(h.wetc[n] & 7)
+			if wgt > best_w {
+				best_w, wclass, wflags = wgt, wc, h.wetc[n] & ~u8(7)
+			}
 			#partial switch h.kind[n] {
 			case .Lake:
 				phi_lake += wgt
@@ -448,6 +490,12 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 			case .Ocean:
 				phi_ocean += wgt
 			}
+		}
+		// торф копится, где прохладно и осадков больше, чем может испариться; осадки
+		// колеблются от места к месту — как у климата блоков (worldgen.odin, block_climate)
+		if cold > 0 {
+			ai_l := ai_c * (1 + 0.25 * f64(fbm(h.seed + 701, p, 900, 2)))
+			peat_p = HYDRO_PEAT * cold * smooth01((ai_l - 0.8) / 0.2)
 		}
 		// у края — берег не ниже уровня (иначе вода растеклась бы за клетки озера)
 		if phi_lake > 0.05 && phi_lake < 0.5 && e < lake_l + 0.5 {
@@ -463,6 +511,35 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 		s.phi = phi_lake
 	}
 	ground := cut + fill - e // срез и подсыпка (у разных рек) — вместе, без скачков
+
+	// Болота (0.020). Грунтовая вода стоит над местным дном (самые низкие места
+	// рельефа вокруг) на подъём hs; у реки — от её глади, у озера — от его
+	// уровня. Где климат копит торф, торф за тысячелетия засыпал низины ровной
+	// поверхностью (с кочками и мочажинами) на высоту до HYDRO_PEAT.
+	wt, bog_top := -1.0e9, -1.0e9
+	base, relief := 0.0, 0.0
+	if hs + peat_p > 0.05 {
+		e1, a1 := elevation_amp(h.seed, p, max(1000, cell))
+		base, relief = e1 - a1, a1
+		// где долина реки срезала рельеф, река дренирует и грунтовую воду — ниже на столько же
+		wt = base + hs - max(e - ground, 0)
+		if peat_p > 0.05 do bog_top = wt + peat_p // торф — от своей грунтовой воды, не от рек
+	}
+	// у рек и озёр сыро (но окна воды — только на своей грунтовой воде: её уровень
+	// плавный, у рек и озёр он к краю поймы круто падает — вышла бы стена воды)
+	wt_base := wt
+	wt = max(wt, riv_wt)
+	if phi_lake > 0.05 do wt = max(wt, lake_l - 0.1 - 1000 * (1 - smooth01((phi_lake - 0.05) / 0.25)))
+	peat_fill := 0.0
+	if peat_p > 0.05 && ground < bog_top && cell <= 1.5 {
+		hum := f64(noise.noise_3d_improve_xz(h.seed + 911, p / 6)) * 0.18 // кочки
+		pool := smooth01((f64(noise.noise_3d_improve_xz(h.seed + 912, p / 30)) - 0.25) / 0.15) * 1.3 // мочажины
+		g2 := bog_top - 0.12 + hum - pool
+		if g2 > ground {
+			peat_fill = g2 - ground
+			lo = max(lo, g2)
+		}
+	}
 	s.ground = min(max(ground, lo), hi)
 
 	s.water = -1.0e9
@@ -484,6 +561,31 @@ hydro_sample :: proc(p: [3]f64, e: f64, cell: f64) -> (s: Hydro_Sample) {
 	if s.kind == .None && phi_salt >= 0.5 && s.ground < salt_l + 0.3 {
 		s.ground = salt_l // ровная корка соли
 		s.kind = .Salt
+	}
+	s.wt = wt
+	if s.kind == .None && wt > -1.0e8 {
+		top := max(wt, bog_top)
+		if cell > 1.5 {
+			// дальний рельеф: доля клетки под болотом (рельеф в клетке — от дна до дна + 2·размах)
+			s.wet_frac = clamp((top + 0.35 - base) / max(2 * relief, 0.5), 0, 1)
+			if s.wet_frac > 0 do s.wet = peat_p > 0.5 * HYDRO_PEAT ? .Bog : wclass == .Swamp ? .Swamp : .Marsh
+		} else if s.ground < top + 0.35 {
+			s.wet = peat_p > 0.5 * HYDRO_PEAT ? .Bog : wclass == .Swamp ? .Swamp : .Marsh
+			s.peat = peat_fill
+			// окна воды: ниже грунтовой воды — лужи и мочажины
+			pool_l := s.wet == .Bog ? bog_top - 0.12 : wt_base
+			if pool_l > -1.0e8 && s.ground < pool_l - 0.25 {
+				s.water = pool_l
+				s.kind = .Lake
+			}
+		}
+	}
+	// у моря: мангры (тёплое море) и солёные марши — на низком берегу и мелководье
+	// (у дальнего рельефа клетка крупнее — и полоса низкого берега в ней шире)
+	band := cell > 1.5 ? cell * 0.015 : 0
+	if wflags & (WET_MANGROVE | WET_SALT_MARSH) != 0 && phi_ocean > 0.05 && s.ground > -1.2 - band && s.ground < 0.8 + band && (s.kind == .None || s.kind == .Sea) {
+		s.wet = wflags & WET_MANGROVE != 0 ? .Mangrove : .Salt_Marsh
+		if cell > 1.5 do s.wet_frac = max(s.wet_frac, 0.6)
 	}
 	return
 }

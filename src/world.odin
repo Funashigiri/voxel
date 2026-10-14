@@ -69,6 +69,9 @@ Tree_Kind :: enum u8 {
 	Acacia,
 	Jungle,
 	Cactus,
+	Willow, // 0.020: у рек и озёр, на низинных болотах
+	Alder,
+	Mangrove,
 }
 
 Column :: struct {
@@ -98,6 +101,10 @@ Column :: struct {
 	// климат (0.015): природная зона и оттенок травы по блокам, условия в центре колонки
 	biome:    [CHUNK_AREA]Biome,
 	tint:     [CHUNK_AREA]u8, // сухость (младшие 4 бита) и холод (старшие) — для травы и листвы
+	// болота (0.020)
+	wet:      [CHUNK_AREA]Wetland,
+	peat:     [CHUNK_AREA]u8, // торф под поверхностью, блоков
+	wplant:   [CHUNK_AREA]Block, // растение у воды и на болоте (тростник, рогоз — в два блока над гладью или землёй)
 	clim:     Climate_Point,
 }
 
@@ -464,6 +471,7 @@ block_boxes :: proc(w: ^World, x, y, z: i32) -> (boxes: [5][2][3]f64, n: int) {
 	}
 	if loaded && !BLOCK_INFO[b].solid do return
 	boxes[0] = {o, o + 1}
+	if loaded && b == .Mud do boxes[0][1].y = f64(y) + 13.0 / 16 // ноги уходят в ил
 	// на снегу стоят выше блока — на сколько снег держит (отдельная коробка:
 	// если снега прибыло под ногами, сквозь блок не провалиться)
 	if loaded && snow_blocker(b) {

@@ -221,6 +221,44 @@ hydro_report :: proc(seed: u32) -> (errors: int) {
 		if bad > 0 do fail(&errors, "разрыв на границе клеток сети")
 	}
 
+	// болота (0.020): доля суши под ними по климату болот клетки (на Земле: в
+	// среднем ~6%; в тайге и тундре с торфом 15–25%, во влажных тропиках ~10%,
+	// в умеренном поясе ~5%, в сухих краях ~1%)
+	{
+		s := i64(seed)
+		CLS := [4]string{"сухо", "низинные", "торф", "тропики"}
+		n, wet: [4]int
+		kinds: [Wetland]int
+		example: [Wetland][2]f64 // широта и долгота первой точки вида (для -latlon)
+		mangrove_lat := 0.0
+		total, total_wet := 0, 0
+		for k := 0; k < N && total < 40000; k += 157 {
+			c := (k * 7919) % N
+			if h.kind[c] != .Land do continue
+			face := Cube_Face(c / (h.m * h.m))
+			rr := c % (h.m * h.m)
+			p := hydro_dir_at(h.m, face, f64(rr % h.m) + 0.5 + 0.45 * math.sin(f64(k) * 1.3), f64(rr / h.m) + 0.5 + 0.45 * math.cos(f64(k) * 0.7)) * h.radius
+			sm := terrain_surface(s, p, 0.5)
+			if sm.kind == .River || sm.kind == .Sea do continue
+			cl := int(h.wetc[c] & 7)
+			n[cl] += 1
+			total += 1
+			if sm.wet != .None {
+				wet[cl] += 1
+				total_wet += 1
+				kinds[sm.wet] += 1
+				la, lo := geo_latlon(p / h.radius)
+				if kinds[sm.wet] == 1 do example[sm.wet] = {la, lo}
+				if sm.wet == .Mangrove do mangrove_lat = max(mangrove_lat, abs(la))
+			}
+		}
+		fmt.printfln("болота: %.1f%% суши (%d точек); по климату:", f64(total_wet) / f64(max(total, 1)) * 100, total)
+		for i in 0 ..< 4 do fmt.printfln("  %s: %.1f%% (%d точек)", pad(CLS[i], 10), f64(wet[i]) / f64(max(n[i], 1)) * 100, n[i])
+		ml := kinds[.Mangrove] > 0 ? fmt.tprintf(" (не дальше %.0f° от экватора)", mangrove_lat) : ""
+		fmt.printfln("  из болот: низинные %d, торфяные %d, тропические %d, мангры %d%s, марши %d", kinds[.Marsh], kinds[.Bog], kinds[.Swamp], kinds[.Mangrove], ml, kinds[.Salt_Marsh])
+		for wk in Wetland do if wk != .None && kinds[wk] > 0 do fmt.printfln("  пример: %s — -latlon:%.2f,%.2f", WETLAND_NAMES[wk], example[wk].x, example[wk].y)
+	}
+
 	// цена точки: рельеф и рельеф с реками и озёрами (подряд по 256 м — как колонки мира)
 	{
 		s := i64(seed)

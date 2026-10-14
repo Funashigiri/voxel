@@ -95,6 +95,9 @@ Hydro_Map :: struct {
 	rcv:    []u8, // куда течёт (0…7 — соседи D8), 255 — никуда
 	level:  []f32, // м над морем: гладь реки, уровень озера, 0 — море
 	q:      []f32, // расход из клетки, м³/с
+	wetc:   []u8, // болота (0.020): класс климата (младшие 3 бита: Wet_Class) | 16 — у моря мангры | 32 — у моря марши
+	gw:     []u8, // подъём грунтовых вод над местным дном, по 5 см (бугор Дюпюи между ручьями)
+	ai:     []u8, // осадки к возможному испарению в низинах клетки, по 0,02 (местные колебания — в hydro_shape)
 	border: [][8]i32, // соседи клеток у рёбер граней (через рёбра — на другой грани)
 	edge:   []bool, // клетка у ребра грани (соседи — по таблице border)
 	doff:   [8]int, // сдвиг номера к соседу у внутренних клеток
@@ -327,6 +330,15 @@ build_runoff :: proc(data: rawptr, k, n: int) {
 		ai := P / max(PET, 1)
 		b.arid[idx] = ai < 0.05 ? 0 : ai < 0.2 ? 1 : ai < 0.5 ? 2 : ai < 0.65 ? 3 : 4
 		b.pe[idx] = f32(P - HYDRO_LAKE_E * PET)
+		// болота: грунтовые воды и климат болот — в низинах клетки (там и болота;
+		// там теплее, чем на средней её высоте, и испарение больше)
+		to, _, _ := climate_months_tab(&climate, b.tab, lat, 0, 1, 0) // море у этой широты
+		tw := t
+		for &tm in tw do tm += climate.lapse * (alt - max(f64(b.elev[idx] - b.amp[idx]), 0))
+		pet_w := hydro_pet(ra, tw, P, cont, b.month_days)
+		h.wetc[idx] = hydro_wet_class(tw, to, P, pet_w)
+		h.ai[idx] = u8(clamp(P / max(pet_w, 1) * 50, 0, 255))
+		h.gw[idx] = u8(clamp(hydro_mound(f64(b.runoff[idx]), Wet_Class(h.wetc[idx] & 7)) / 0.05, 0, 255))
 		// влажная эпоха прошлого (плювиал): ею прорезаны пороги впадин
 		b.runoff_w[idx] = f32(hydro_fu_runoff(P * HYDRO_PLUVIAL_P, PET * HYDRO_PLUVIAL_E))
 		b.pe_w[idx] = f32(P * HYDRO_PLUVIAL_P - HYDRO_LAKE_E * PET * HYDRO_PLUVIAL_E)
@@ -443,6 +455,9 @@ hydro_build :: proc(seed: u32, radius: f64, full_stats := false) {
 	climate_month_table(&climate, tab)
 	b.tab = tab
 	b.month_days = climate.year_h / 24 / 12 // месяц планеты длиннее — испаряется больше
+	h.wetc = make([]u8, N)
+	h.gw = make([]u8, N)
+	h.ai = make([]u8, N)
 	par_for(&b, build_climate_nodes)
 	par_for(&b, build_runoff)
 	t_clim := time.now()
@@ -939,6 +954,9 @@ hydro_free :: proc() {
 	delete(h.rcv)
 	delete(h.level)
 	delete(h.q)
+	delete(h.wetc)
+	delete(h.gw)
+	delete(h.ai)
 	delete(h.border)
 	delete(h.edge)
 	delete(h.stats.mouths)
@@ -1071,4 +1089,59 @@ hydro_river_levels :: proc(h: ^Hydro_Map, b: ^Build) {
 		}
 		h.level[c] = max(B[c], M[c])
 	}
+}
+
+// ---------------------------------------------------------------- болота (0.020)
+
+Wet_Class :: enum u8 {
+	None, // сухо: болота только у рек и озёр
+	Marsh, // низинные болота и топи (минеральные, без торфа)
+	Peat, // верховые торфяные болота: прохладно и влажно — торф копится
+	Swamp, // тропические заболоченные леса
+}
+
+WET_MANGROVE :: 16 // у тёплого моря — мангры
+WET_SALT_MARSH :: 32 // у моря умеренного пояса — солёные марши
+WET_COLD :: 64 // прохладно для торфа (в среднем за год не выше 7 °C); копится ли он — по местной влажности
+HYDRO_STREAM_L :: 400.0 // м: полурасстояние между ручьями (густота речной сети ~1–2 км на км²)
+// Водопроводимость грунта, м²/с (~10 м мощностью): в сухих краях — пески
+// (~10⁻³), под низинными болотами — суглинки, в тропиках — латеритные глины,
+// в холодном влажном климате — морена и торф (~10⁻⁴): вода стоит выше.
+HYDRO_TRANSMISSIVITY := [Wet_Class]f64{.None = 1.0e-3, .Marsh = 5.0e-4, .Peat = 1.0e-4, .Swamp = 3.0e-4}
+HYDRO_PEAT :: 4.0 // м: торф за голоцен (~0,4 мм в год за 10 тыс. лет)
+
+// Подъём грунтовых вод между ручьями (м) при годовом стоке runoff (мм):
+// бугор Дюпюи h = R·L²/(2T), питание R — половина стока (остальное стекает
+// поверху).
+hydro_mound :: proc "contextless" (runoff: f64, class: Wet_Class) -> f64 {
+	R := 0.5 * runoff / 1000 / (365.25 * 86400) // м/с
+	return R * HYDRO_STREAM_L * HYDRO_STREAM_L / (2 * HYDRO_TRANSMISSIVITY[class])
+}
+
+// Климат болот по месяцам t (°C, суша), морю to (°C), осадкам P и испарению PET (мм/год).
+hydro_wet_class :: proc "contextless" (t, to: [12]f64, P, PET: f64) -> u8 {
+	t_ann, t_min, t_max, to_min := 0.0, 1.0e9, -1.0e9, 1.0e9
+	for m in 0 ..< 12 {
+		t_ann += t[m] / 12
+		t_min = min(t_min, t[m])
+		t_max = max(t_max, t[m])
+		to_min = min(to_min, to[m])
+	}
+	ai := P / max(PET, 1)
+	c := Wet_Class.Marsh
+	switch {
+	case ai < 0.5 || t_max < 3:
+		c = .None // сухо или вечный лёд
+	case t_min >= 18:
+		c = .Swamp
+	case t_ann <= 7 && ai >= 0.9:
+		c = .Peat // торф копится, где холодно и осадков больше испарения
+	}
+	flags: u8 = t_ann <= 7 && t_max >= 3 && t_min < 18 ? WET_COLD : 0
+	if to_min >= 20 {
+		flags |= WET_MANGROVE
+	} else if to_min > -1 {
+		flags |= WET_SALT_MARSH
+	}
+	return u8(c) | flags
 }

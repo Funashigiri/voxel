@@ -84,6 +84,7 @@ Far_Palette :: struct {
 	grass, tall_grass, sand, stone, dirt, gravel, oak, birch, water, sandstone, limestone, granite: [3]f32,
 	snow, ice, spruce, acacia, jungle: [3]f32,
 	salt:   [3]f32,
+	sphagnum, mud, mangrove: [3]f32, // 0.020: болота
 }
 
 // Для фоновых потоков — только чтение.
@@ -242,6 +243,9 @@ far_palette :: proc() -> (p: Far_Palette) {
 	p.acacia = tex_average(.Acacia_Leaves)
 	p.jungle = tex_average(.Jungle_Leaves)
 	p.salt = tex_average(.Salt)
+	p.sphagnum = tex_average(.Sphagnum_Top)
+	p.mud = tex_average(.Mud)
+	p.mangrove = tex_average(.Mangrove_Leaves)
 	return
 }
 
@@ -326,8 +330,8 @@ grass_tint_rgb :: proc(c: [3]f32, dry, cold: f64) -> [3]f32 {
 
 // То же и узкая река (доля клетки river) — тонкой линией цветом.
 @(private = "file")
-far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Climate, under: Water_Kind, wl, river: f64) -> (col: [3]f32, h: f64, water: bool, decid, conif: f64, floor: [3]f32) {
-	col, h, water, decid, conif, floor = far_land(fs, p, v, slope, cell, bc, under, wl)
+far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Climate, under: Water_Kind, wl, river: f64, wet: Wetland = .None, wf: f64 = 0, shore := false) -> (col: [3]f32, h: f64, water: bool, decid, conif: f64, floor: [3]f32) {
+	col, h, water, decid, conif, floor = far_land(fs, p, v, slope, cell, bc, under, wl, wet, wf, shore)
 	if river > 0 && !water do col = mix3(col, fs.palette.water * 0.85, min(river * 1.5, 1))
 	return
 }
@@ -335,9 +339,10 @@ far_surface :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_
 // Цвет поверхности и её высота над уровнем моря (м) в точке шара p — по тем
 // же правилам, что блоки (природная зона, поверхность, деревья), только
 // плавно (доли вместо выбора). decid, conif — доли листопадных и хвойных крон.
-// under — вода здесь (гладь wl, м над морем) или солончак.
+// under — вода здесь (гладь wl, м над морем) или солончак; wet, wf — болото и
+// его доля в клетке; shore — рядом вода (кроны ниже: иначе у берега вдали стена леса).
 @(private = "file")
-far_land :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Climate, under: Water_Kind, wl: f64) -> (col: [3]f32, h: f64, water: bool, decid, conif: f64, floor: [3]f32) {
+far_land :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Climate, under: Water_Kind, wl: f64, wet: Wetland, wf: f64, shore: bool) -> (col: [3]f32, h: f64, water: bool, decid, conif: f64, floor: [3]f32) {
 	pal := &fs.palette
 	seed := i64(fs.seed)
 	biome := bc.k.biome
@@ -385,6 +390,21 @@ far_land :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Cli
 	case .Steppe, .Savanna, .Mediterranean:
 		ground = mix3(grass, pal.dirt, smooth(0.45, 0.65, n) * 0.6 + 0.08)
 	}
+	// болота (0.020): их доля в клетке — их цветом (как блоки: сфагнум, осока и тростник на иле)
+	if wet != .None && wf > 0 && biome != .Ice_Cap {
+		wc := mix3(grass, pal.mud, 0.35)
+		#partial switch wet {
+		case .Bog:
+			wc = pal.sphagnum
+		case .Swamp:
+			wc = mix3(grass, pal.mud, 0.45)
+		case .Mangrove:
+			wc = pal.mud
+		case .Salt_Marsh:
+			wc = mix3(grass, pal.mud, 0.3)
+		}
+		ground = mix3(ground, wc, wf)
+	}
 	// голая скала — пласты: в низких горах осадочные, в высоких — гранит
 	bare := mix3(pal.sandstone * 0.67 + pal.limestone * 0.33, pal.granite, smooth(1500, 2500, h))
 	col = mix3(ground, bare, stone)
@@ -392,6 +412,17 @@ far_land :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Cli
 	// лес: кроны закрывают землю и поднимают поверхность
 	cover := f64(forest_cover(seed, p, biome, bc.t_max, cell)) * (1 - stone) * (1 - beach) * (1 - smooth(1.5, 2.5, slope))
 	if biome == .Desert_Hot do cover = 0 // кактусы издали не видны
+	// на болотах — свои деревья (trees.odin, make_tree)
+	#partial switch wet {
+	case .Bog:
+		cover *= 1 - 0.75 * wf // на сфагнуме — редкие низкие деревья
+	case .Salt_Marsh:
+		cover *= 1 - wf
+	case .Marsh:
+		cover = cover * (1 - wf) + 0.4 * wf // ольшаники куртинами
+	case .Mangrove:
+		cover = cover * (1 - wf) + 0.8 * wf
+	}
 	crowns := smooth(0, 0.45, cover)
 	if crowns <= 0 do return col, h, false, 0, 0, {}
 	birch := clamp(smooth(0.1, 0.3, f64(fbm_lod(seed + 99, p, 160, 2, cell))) + 0.12, 0, 1)
@@ -410,9 +441,15 @@ far_land :: proc(fs: ^Far_Shared, p: [3]f64, v, slope, cell: f64, bc: ^Block_Cli
 		crown = pal.jungle
 	}
 	crown = mix3(crown, pal.spruce, spruce)
+	if wet == .Mangrove {
+		crown = mix3(crown, pal.mangrove, wf)
+		rise = rise * (1 - wf) + 0.6 * TREE_SPECIES[.Mangrove].h_max * wf
+	}
+	if wet == .Bog do rise *= 1 - 0.65 * wf // низкорослые
+	if shore do rise *= 0.3 // у самой воды кроны ниже — иначе вдали у берега встаёт стена леса
 	col = mix3(col, crown * 0.85, crowns * 0.9)
 	h += rise * crowns
-	evergreen := biome == .Savanna || biome == .Rainforest
+	evergreen := biome == .Savanna || biome == .Rainforest || wet == .Mangrove
 	conif = crowns * spruce
 	decid = evergreen ? 0 : crowns * (1 - spruce)
 	return col, h, false, decid, conif, {}
@@ -439,12 +476,15 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 	wl: [G * G]f64 // гладь воды, м над морем
 	wk: [G * G]Water_Kind
 	rc: [G * G]f64 // доля клетки под узкой рекой
+	wetk: [G * G]Wetland // болото и его доля в клетке (0.020)
+	wf: [G * G]f64
 	for j in 0 ..< G do for i in 0 ..< G {
 		d := geo_dir(g, t.key.face, x0 + f64(i - 1) * c, z0 + f64(j - 1) * c)
 		dirs[j * G + i] = d
 		s := terrain_surface(i64(fs.seed), d * R, cell)
 		v[j * G + i] = s.ground + Y_SEA - 0.5
 		wl[j * G + i], wk[j * G + i], rc[j * G + i] = s.water, s.kind, s.cover
+		wetk[j * G + i], wf[j * G + i] = s.wet, s.wet_frac
 	}
 	// климат меняется на сотни километров: 3×3 точки на тайл, между ними плавно
 	CG :: 3
@@ -458,6 +498,9 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 	fresh: [G * G]bool // озеро или река
 	depth: [G * G]f64
 	clim: [G * G][4]u8
+	// вода в узлах — у берега кроны ниже
+	wat_k: [G * G]bool
+	for k in 0 ..< G * G do wat_k[k] = (wk[k] == .Sea || wk[k] == .Lake || wk[k] == .River) && wl[k] > v[k] + 0.5 - Y_SEA
 	for j in 0 ..< G do for i in 0 ..< G {
 		k := j * G + i
 		il, ir := max(i - 1, 0), min(i + 1, G - 1)
@@ -476,7 +519,8 @@ far_build_tile :: proc(fs: ^Far_Shared, t: ^Far_Tile) {
 		bc := climate_blend({&cgrid[b * CG + a], &cgrid[b * CG + a + 1], &cgrid[(b + 1) * CG + a], &cgrid[(b + 1) * CG + a + 1]}, u - f64(a), w - f64(b), alt, dither, wet)
 		decid, conif: f64
 		floor: [3]f32
-		col[k], h[k], water[k], decid, conif, floor = far_surface(fs, pk, v[k], max(gx, gz), cell, &bc, wat ? wk[k] : (wk[k] == .Salt ? .Salt : .None), wl[k], rc[k])
+		shore := !wat && (wat_k[j * G + il] || wat_k[j * G + ir] || wat_k[jl * G + i] || wat_k[jr * G + i])
+		col[k], h[k], water[k], decid, conif, floor = far_surface(fs, pk, v[k], max(gx, gz), cell, &bc, wat ? wk[k] : (wk[k] == .Salt ? .Salt : .None), wl[k], rc[k], wetland_here(wetk[k], &bc), wf[k], shore)
 		clim[k] = {u8(clamp(bc.cont, 0, 1) * 255), u8(clamp(bc.wet * 100, 0, 255)), u8(clamp(decid, 0, 1) * 255), u8(clamp(conif, 0, 1) * 255)}
 		// у воды вместо климата — цвет дна (виден сквозь ближнюю воду у края блоков)
 		if water[k] do clim[k] = {u8(clamp(floor.r, 0, 1) * 255), u8(clamp(floor.g, 0, 1) * 255), u8(clamp(floor.b, 0, 1) * 255), 0}

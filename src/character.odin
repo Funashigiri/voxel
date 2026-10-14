@@ -353,6 +353,7 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 			accel = speed * (0.16277136 / (friction * friction * friction))
 			// по глубокому снегу идти тяжело: ноги вязнут на (глубина − на сколько держит)
 			if _, depth, support, ok := snow_underfoot(p, w); ok do accel /= 1 + 2.5 * max(depth - support, 0)
+			accel /= bog_drag(w, p.pos)
 		} else {
 			accel = p.sprinting ? 0.026 : 0.02
 		}
@@ -476,4 +477,21 @@ water_current :: proc(w: ^World, pos: [3]f64) -> (v: [2]f64) {
 	v = {math.cos(ang) * sp, math.sin(ang) * sp}
 	if m, placed := geo_frame_of(&w.geo, face); placed do v.x, v.y = xform_vec(m, v.x, v.y)
 	return
+}
+
+// Болото под ногами (0.020): по мягкому сфагнуму и торфу идти тяжелее, в иле
+// ноги вязнут (block_boxes: верх ила на 13/16). Мёрзлое и под снегом — твёрдо.
+bog_drag :: proc(w: ^World, pos: [3]f64) -> f64 {
+	b, ok := world_get_block(w, i32(math.floor(pos.x)), i32(math.floor(pos.y - 0.05)), i32(math.floor(pos.z)))
+	if !ok do return 1
+	if _, depth, _, snowy := snow_at_feet(w, pos); snowy && depth > 0.02 do return 1
+	#partial switch b {
+	case .Sphagnum:
+		return 1.5
+	case .Peat:
+		return 1.25
+	case .Mud:
+		return 2.2
+	}
+	return 1
 }

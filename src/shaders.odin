@@ -316,7 +316,9 @@ uniform float u_time;
 uniform float u_chunk_alt; // низ чанка над уровнем моря, м
 uniform vec4 u_layer_a;    // слои: верх травы, бок травы, высокая трава, листва дуба
 uniform vec4 u_layer_b;    // листва берёзы, хвоя ели, листва акации, листва тропического дерева
-uniform vec4 u_layer_c;    // одуванчик, мак
+uniform vec4 u_layer_c;    // одуванчик, мак, осока
+uniform vec4 u_layer_e;    // листва ивы, ольхи, мангра; кувшинка
+uniform vec4 u_layer_f;    // тростник (низ, верх), рогоз (низ, верх)
 uniform vec3 u_chunk_id;   // номер секции (по модулю 1024) — для шума, привязанного к миру
 uniform vec4 u_wind;       // ветер у земли: xy — по осям x, z кадра (м/с), z — порывы (м/с)
 out vec3 v_uvl;
@@ -326,7 +328,7 @@ out float v_light;
 out vec3 v_rel;
 out float v_alt;
 out vec2 v_tint;
-flat out int v_kind; // 1 — верх травы, 2 — бок травы, 3 — трава-растение, 4 — листопадная листва, 5 — вечнозелёная, 6 — прочий верх, 7 — цветы
+flat out int v_kind; // 1 — верх травы, 2 — бок травы, 3 — трава-растение, 4 — листопадная листва, 5 — вечнозелёная, 6 — прочий верх, 7 — цветы, 8 — тростник и рогоз, 9 — кувшинка
 flat out int v_face;
 flat out float v_hash;
 out vec4 v_snow;     // снег здесь (snow.odin): глубина (м), белизна, на хвое, плотность (т/м³)
@@ -375,6 +377,11 @@ void main() {
 	else if (base == u_layer_a.w || base == u_layer_b.x) kind = 4;
 	else if (base == u_layer_b.y || base == u_layer_b.z || base == u_layer_b.w) kind = 5;
 	else if (base == u_layer_c.x || base == u_layer_c.y) kind = 7;
+	else if (base == u_layer_c.z) kind = 3;
+	else if (base == u_layer_e.x || base == u_layer_e.y) kind = 4;
+	else if (base == u_layer_e.z) kind = 5;
+	else if (base == u_layer_e.w) kind = 9;
+	else if (base == u_layer_f.x || base == u_layer_f.y || base == u_layer_f.z || base == u_layer_f.w) kind = 8;
 	if ((flags & 1u) != 0u) kind = 0; // вода
 	v_wcode = (flags & 1u) != 0u ? int(a_tex.w) : -1;
 	v_kind = kind;
@@ -393,11 +400,19 @@ void main() {
 	// ветер: трава и цветы клонятся (верх стебля), листва колышется; сдвиг зависит
 	// от места в мире — соседние блоки листвы сдвигаются одинаково, щелей нет
 	float ws = length(u_wind.xy);
-	if (ws > 0.3 && (kind == 3 || kind == 7 || kind == 4 || kind == 5)) {
+	if (ws > 0.3 && (kind == 3 || kind == 7 || kind == 4 || kind == 5 || kind == 8)) {
 		vec2 wd = u_wind.xy / ws;
 		float gust = 0.5 + 0.5 * sin(u_time * 1.7 + dot(v_wpos.xz, wd) * 0.35 + v_wpos.x * 0.13);
 		float k = ws + (u_wind.z - ws) * gust * gust;
-		if (kind == 3 || kind == 7) {
+		if (kind == 8) {
+			// тростник в два блока: гнётся весь стебель — доля высоты от корня
+			// (у верхнего блока низ — середина стебля), стык блоков не расходится
+			bool upper = base == u_layer_f.y || base == u_layer_f.w;
+			float f = (upper ? 0.5 : 0.0) + (a_tex.y == 0u ? 0.5 : 0.0);
+			float bend = clamp(k / 14.0, 0.0, 0.5) * (0.8 + 0.2 * sin(u_time * 4.0 + v_wpos.x * 1.3 + v_wpos.z)) * 1.4 * f * f;
+			p.xz += wd * bend;
+			p.y -= bend * bend * 0.3;
+		} else if (kind == 3 || kind == 7) {
 			if (a_tex.y == 0u) { // верх стебля
 				float bend = clamp(k / 14.0, 0.0, 0.45) * (0.75 + 0.25 * sin(u_time * 5.0 + v_wpos.x * 1.3 + v_wpos.z));
 				p.xz += wd * bend;
@@ -439,6 +454,7 @@ uniform float u_lapse; // похолодание с высотой, К/м
 uniform vec4 u_layer_a;
 uniform vec4 u_layer_b;
 uniform vec4 u_layer_d; // веточки дуба и берёзы (голая крона), лёд
+uniform vec4 u_layer_e; // листва ивы, ольхи, мангра; кувшинка
 out vec4 o_color;
 ` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + SNOW_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
@@ -456,7 +472,8 @@ void main() {
 			if ((hb & 1) != 0) uv.x = 1.0 - uv.x;
 			if ((hb & 2) != 0) uv = uv.yx;
 			if ((hb & 4) != 0) uv.y = 1.0 - uv.y;
-			c = texture(u_atlas, vec3(uv, v_uvl.z == u_layer_a.w ? u_layer_d.x : u_layer_d.y));
+			bool oaky = v_uvl.z == u_layer_a.w || v_uvl.z == u_layer_e.y; // у ольхи ветки как у дуба, у ивы — как у берёзы
+			c = texture(u_atlas, vec3(uv, oaky ? u_layer_d.x : u_layer_d.y));
 			// вдали тонкие веточки не исчезают: в мипмапе прозрачность — доля
 			// веточек в клетке, и точка остаётся с такой вероятностью
 			float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
@@ -484,10 +501,13 @@ void main() {
 	if (u_season.w > 0.5 && v_kind > 0) {
 		float snow = snow_cover(t, u_season.y, u_season.z);
 		if (v_kind <= 3) base = grass_season(grass_tint(base, v_tint), t, u_season.z);
+		if (v_kind == 8) base = grass_season(grass_tint(base, v_tint * 0.5), t, u_season.z); // зимой стоит сухой соломой
+		// лист кувшинки отмирает к заморозкам, весной вырастает из корневища
+		if (v_kind == 9 && (snow > 0.2 || t < 6.0 + 4.0 * v_hash)) discard;
 		if (v_kind == 4 && !twigs) {
 			// листопадные: осенью желтеют, перед листопадом буреют
 			float bare = leaves_bare(t + (tree - 0.5) * 4.0, u_season.y);
-			vec3 autumn = autumn_color(v_uvl.z == u_layer_b.x, fract(tree * 3.7));
+			vec3 autumn = autumn_color(v_uvl.z == u_layer_b.x || v_uvl.z == u_layer_e.x, fract(tree * 3.7));
 			base = mix(leaf_autumn(grass_tint(base, v_tint * 0.5), t + (tree - 0.5) * 4.0, u_season.y, autumn), vec3(0.42, 0.3, 0.16), bare * 0.5);
 		}
 		// снег: внутри сетки — по погоде (snow.odin), за её краем — по климату
@@ -498,7 +518,7 @@ void main() {
 		if (v_kind == 3 && buried) discard; // траву прижало снегом
 		if (v_kind == 7 && ((win > 0.5 ? v_snow.x > 0.01 : snow > 0.2) || t < 5.0 + 3.0 * v_hash)) discard; // цветы — только в тёплое время
 		bool leaf = v_kind == 4 || v_kind == 5;
-		bool top = v_face == 2 && v_kind != 3;
+		bool top = v_face == 2 && v_kind != 3 && v_kind != 9;
 		if (v_kind == 2 && v_uvl.y < 0.19 && cov > 0.5) top = true; // снег свешивается с края, как у травы в Minecraft
 		if (top && !leaf) {
 			// тонкий и тающий снег лежит пятнами (по месту в мире — пятна не мерцают);

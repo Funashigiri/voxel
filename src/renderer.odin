@@ -14,7 +14,7 @@ Chunk_Shader :: struct {
 	prog:                                                 u32,
 	u_view_proj, u_origin, u_time, u_atlas, u_alpha_cutoff: i32,
 	u_fog, u_rot, u_side_shade:                           i32,
-	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c, u_layer_d, u_chunk_id, u_wind: i32,
+	u_chunk_alt, u_season, u_lapse, u_layer_a, u_layer_b, u_layer_c, u_layer_d, u_layer_e, u_layer_f, u_chunk_id, u_wind: i32,
 }
 
 Entity_Shader :: struct {
@@ -136,6 +136,8 @@ renderer_init :: proc(r: ^Renderer) -> bool {
 			u_layer_b      = loc(p, "u_layer_b"),
 			u_layer_c      = loc(p, "u_layer_c"),
 			u_layer_d      = loc(p, "u_layer_d"),
+			u_layer_e      = loc(p, "u_layer_e"),
+			u_layer_f      = loc(p, "u_layer_f"),
 			u_chunk_id     = loc(p, "u_chunk_id"),
 			u_wind         = loc(p, "u_wind"),
 		}
@@ -510,7 +512,9 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_f32(r.chunk.u_lapse, f32(climate.lapse))
 	eng.set_vec4(r.chunk.u_layer_a, {f32(Tex.Grass_Top), f32(Tex.Grass_Side), f32(Tex.Tall_Grass), f32(Tex.Oak_Leaves)})
 	eng.set_vec4(r.chunk.u_layer_b, {f32(Tex.Birch_Leaves), f32(Tex.Spruce_Leaves), f32(Tex.Acacia_Leaves), f32(Tex.Jungle_Leaves)})
-	eng.set_vec4(r.chunk.u_layer_c, {f32(Tex.Dandelion), f32(Tex.Poppy), -1, -1})
+	eng.set_vec4(r.chunk.u_layer_c, {f32(Tex.Dandelion), f32(Tex.Poppy), f32(Tex.Sedge), -1})
+	eng.set_vec4(r.chunk.u_layer_e, {f32(Tex.Willow_Leaves), f32(Tex.Alder_Leaves), f32(Tex.Mangrove_Leaves), f32(Tex.Lily_Pad)})
+	eng.set_vec4(r.chunk.u_layer_f, {f32(Tex.Reed), f32(Tex.Reed_Top), f32(Tex.Cattail), f32(Tex.Cattail_Top)})
 	eng.set_vec4(r.chunk.u_layer_d, {f32(Tex.Oak_Twigs), f32(Tex.Birch_Twigs), f32(Tex.Ice), -1})
 	if ws := fp.weather; ws != nil && ws.here_ok {
 		eng.set_vec4(r.chunk.u_wind, {f32(ws.wind_frame.x), f32(ws.wind_frame.z), f32(ws.here.gust), 0})
