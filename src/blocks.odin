@@ -54,6 +54,8 @@ Block :: enum u8 {
 	Spruce_Pole,
 	Acacia_Pole,
 	Jungle_Pole,
+	// реки и озёра (0.019)
+	Salt, // корка солончака
 }
 
 // Русские названия (F3: что под ногами).
@@ -104,6 +106,7 @@ BLOCK_NAMES := [Block]string {
 	.Spruce_Pole  = "тонкий ствол ели",
 	.Acacia_Pole  = "тонкий ствол акации",
 	.Jungle_Pole  = "тонкий ствол тропического дерева",
+	.Salt         = "соль (солончак)",
 }
 
 Render_Kind :: enum u8 {
@@ -178,6 +181,7 @@ blocks_init :: proc() {
 	BLOCK_INFO[.Iron_Core] = cube(all_faces(.Iron_Core))
 	BLOCK_INFO[.Snow] = cube(all_faces(.Snow))
 	BLOCK_INFO[.Ice] = cube(all_faces(.Ice))
+	BLOCK_INFO[.Salt] = cube(all_faces(.Salt))
 	BLOCK_INFO[.Spruce_Log] = cube(column_faces(.Spruce_Log, .Spruce_Log_Top, .Spruce_Log_Top))
 	BLOCK_INFO[.Acacia_Log] = cube(column_faces(.Acacia_Log, .Acacia_Log_Top, .Acacia_Log_Top))
 	BLOCK_INFO[.Jungle_Log] = cube(column_faces(.Jungle_Log, .Jungle_Log_Top, .Jungle_Log_Top))

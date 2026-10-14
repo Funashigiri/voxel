@@ -8,11 +8,12 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import eng "engine"
 import "vendor:glfw"
 
-VERSION :: "0.018"
+VERSION :: "0.019"
 VIEW_RADIUS :: 10 // чанков
 MOUSE_SENSITIVITY :: 0.0026 // радиан на пиксель (~0.15°, как в Minecraft)
 WORLD_BUDGET :: 0.005 // секунд на генерацию/меши за кадр
@@ -38,6 +39,9 @@ Options :: struct {
 	order_at:      f64, // через сколько секунд
 	select:        int, // 1, 2 или 3 (оба)
 	water_spawn:   bool, // появиться над водой
+	water_want:    Water_Kind, // -spawn:river|lake|sea — у реки, озера, моря
+	on_water:      bool, // -spawn:onlake — на самом озере (зимой — на льду)
+	water_mode:    string, // canyon — горная река, mouth — у устья
 	mountain_spawn: bool, // появиться над горами
 	cliff_spawn:   bool, // у самого крутого обрыва (слои пород)
 	tree_spawn:    bool, // у большого лиственного дерева, лицом к нему
@@ -50,6 +54,7 @@ Options :: struct {
 	stars_report:  bool, // сверить модель звёзд с настоящими звёздами — и выйти
 	climate_report: bool, // сверить климат с Землёй — и выйти
 	weather_report: bool, // прогнать погоду на климате Земли — и выйти
+	hydro_report:  bool, // построить реки и озёра мира, проверить — и выйти
 	biome:         string, // отладка: высадиться в природной зоне (forest, taiga, tundra, glacier, steppe, desert, savanna, rainforest…)
 	timescale:     f64, // ускорение времени (отладка)
 	start_day:     int, // день года при высадке (0 — случайный)
@@ -63,6 +68,7 @@ Options :: struct {
 	anomaly_dist:  f64, // > 0: высадка в стольких метрах от вершины куба (тест аномалии)
 	selftest:      bool, // проверить геометрию стыков граней и выйти
 	dump_textures: string,
+	probe:         bool, // отладка: напечатать землю и воду вдоль линии взгляда от места появления
 	no_vsync:      bool, // без вертикальной синхронизации (замер скорости)
 	alt:           f64, // отладка: камера выше на столько метров (вид с высоты)
 	view_km:       f64, // > 0: предел дальности дальнего рельефа, км
@@ -150,6 +156,8 @@ parse_options :: proc() -> (o: Options) {
 			o.climate_report = true
 		case "-wx":
 			o.wx_want = val
+		case "-hydro":
+			o.hydro_report = true
 		case "-weather":
 			o.weather_report = true
 		case "-stars":
@@ -159,7 +167,19 @@ parse_options :: proc() -> (o: Options) {
 		case "-universe":
 			o.universe_report = true
 		case "-spawn":
-			o.water_spawn = val == "water"
+			switch val {
+			case "river", "canyon", "mouth":
+				o.water_want = .River
+			case "lake", "onlake":
+				o.water_want = .Lake
+			case "sea":
+				o.water_want = .Sea
+			case "salt":
+				o.water_want = .Salt
+			}
+			o.water_spawn = val == "water" || o.water_want != .None
+			o.on_water = val == "onlake"
+			o.water_mode = val
 			o.mountain_spawn = val == "mountain"
 			o.cliff_spawn = val == "cliff"
 			o.tree_spawn = val == "tree"
@@ -168,6 +188,8 @@ parse_options :: proc() -> (o: Options) {
 			o.lat = strconv.parse_f64(las) or_else 40
 			o.lon = strconv.parse_f64(los) or_else 0
 			o.has_latlon = true
+		case "-probe":
+			o.probe = true
 		case "-selftest":
 			o.selftest = true
 		case "-edge":
@@ -284,6 +306,20 @@ main :: proc() {
 		return
 	}
 
+	if opts.hydro_report {
+		// реки и озёра мира: сеть стока и её проверки (без окна)
+		hp := home_planet(&system)
+		geo := geo_make(hp.radius_km)
+		if climate_key != {home.star.seed, u64(home.planet)} {
+			relief_init(opts.seed, geo.radius, system.home.gravity_g, hp.water * hp.mass_earth * M_EARTH_KG / 1000)
+			climate = climate_make(climate_input_for(&system, hp, opts.seed))
+			climate_key = {home.star.seed, u64(home.planet)}
+		}
+		hydro_build(opts.seed, geo.radius, full_stats = true)
+		if hydro_report(opts.seed) > 0 do os.exit(1)
+		return
+	}
+
 	if !eng.window_create(fmt.tprintf("Voxel %s", VERSION), opts.width, opts.height) do os.exit(1)
 	defer eng.window_destroy()
 	if opts.no_vsync do eng.window_set_vsync(false)
@@ -314,6 +350,11 @@ main :: proc() {
 		climate_key = {home.star.seed, u64(home.planet)}
 	}
 	world_climate_reset()
+	// реки и озёра: сеть стока на всю планету (hydro.odin) — в фоне, пока готовится
+	// остальное; дожидаемся перед первым рельефом с реками
+	hydro_thread: ^thread.Thread
+	if !hydro.ok || hydro.seed != i64(opts.seed) || hydro.radius != geo.radius do hydro_thread = hydro_build_async(opts.seed, geo.radius)
+	defer hydro_wait(&hydro_thread)
 	trees_reset()
 	// строение планеты (кора, мантия, ядро) — из массы, состава, возраста; глубже коры блоки идут по нему
 	interior := interior_make(body_interior_input(&system, &hp.body))
@@ -334,6 +375,7 @@ main :: proc() {
 	site_x, site_z: f64
 	site_x, site_z, lat, lon = geo_choose_site(&geo, lat, lon, opts.seed, true)
 	if errors := geo_check_links(&geo); errors > 0 do fmt.eprintln("ОШИБКА: рёбра граней не стыкуются:", errors)
+	hydro_wait(&hydro_thread)
 	if opts.selftest {
 		checked, errors := frame_selftest(geo)
 		fmt.printfln("selftest: рёбра %d ошибок; смена кадра: %d точек, %d ошибок", geo_check_links(&geo), checked, errors)
@@ -412,6 +454,7 @@ main :: proc() {
 	// рельеф до горизонта (тайлы строятся в фоне) и облака на настоящей высоте;
 	// у планет со слабой тяжестью атмосфера «выше» — дымка тоже
 	far: Far_Terrain
+	hydro_wait(&hydro_thread) // дальний рельеф и мир — уже с реками и озёрами
 	if !far_init(&far, world.geo, opts.seed) do os.exit(1)
 	defer far_destroy(&far)
 	if opts.view_km > 0 do far.max_dist = opts.view_km * 1000
@@ -447,7 +490,14 @@ main :: proc() {
 
 	sx, sz := i32(site_x), i32(site_z)
 	spawn := find_spawn(&world, sx, sz, opts.biome == "")
-	if opts.water_spawn do spawn = find_water_spawn(&world, sx, sz)
+	if opts.water_spawn {
+		p, yaw, found := find_water_spawn(&world, sx, sz, opts.water_want, on_water = opts.on_water, mode = opts.water_mode)
+		spawn = p
+		if found && opts.water_want != .None {
+			test_yaw = yaw
+			has_test_yaw = true
+		}
+	}
 	if opts.mountain_spawn do spawn = find_mountain_spawn(&world, sx, sz)
 	if opts.cliff_spawn {
 		spawn, test_yaw = find_cliff_spawn(&world, sx, sz)
@@ -460,6 +510,44 @@ main :: proc() {
 		}
 	}
 	if opts.anomaly_dist > 0 || opts.edge_dist > 0 do spawn = spawn_at(&world, sx, sz)
+	if opts.probe {
+		// отладка: земля и вода вдоль взгляда от места появления (каждые 4 м)
+		// поперёк взгляда: от −150 до +150 м через место появления
+		yaw := (has_test_yaw ? test_yaw : opts.yaw) + math.PI / 2
+		fx, fz := -math.sin(f64(yaw)), math.cos(f64(yaw))
+		for k in -75 ..< 75 {
+			x, z := spawn.x + fx * f64(k) * 2, spawn.z + fz * f64(k) * 2
+			s := terrain_surface(i64(opts.seed), geo_point(&world.geo, world.geo.face, i32(math.floor(x)), i32(math.floor(z))), 0.5)
+			fmt.printfln("зонд %4d м: %v земля %.2f вода %.2f озеро %.2f (ур. %.2f) река в %.1f м шир. %.1f", k * 2, s.kind, s.ground, s.water, s.phi, s.level, s.dist, s.width)
+		}
+		// поперёк: блоки и дальний рельеф (клетка 100 м)
+		for k in -40 ..= 40 {
+			x, z := spawn.x + fx * f64(k) * 10, spawn.z + fz * f64(k) * 10
+			pp := geo_point(&world.geo, world.geo.face, i32(math.floor(x)), i32(math.floor(z)))
+			s1 := terrain_surface(i64(opts.seed), pp, 0.5)
+			s2 := terrain_surface(i64(opts.seed), pp, 100)
+			fmt.printfln("разрез %4d м: блоки %.1f (%v), дальний %.1f (%v), рельеф %.1f / %.1f", k * 10, s1.ground, s1.kind, s2.ground, s2.kind, elevation(i64(opts.seed), pp, 0.5), elevation(i64(opts.seed), pp, 100))
+		}
+		// скачки земли больше 2 м между соседними точками (через 2 м) в квадрате 600×600 м
+		jumps := 0
+		for zz := -300.0; zz < 300; zz += 2 {
+			prev := 0.0
+			prev_dry := false
+			for xx := -300.0; xx < 300; xx += 2 {
+				gp := geo_point(&world.geo, world.geo.face, i32(math.floor(spawn.x + xx)), i32(math.floor(spawn.z + zz)))
+				sm := terrain_surface(i64(opts.seed), gp, 0.5)
+				g := sm.ground
+				dry := sm.kind == .None // кромки русел и берега — не в счёт
+				defer prev_dry = dry
+				if xx > -300 && dry && prev_dry && abs(g - prev) > 2 {
+					jumps += 1
+					if jumps <= 12 do fmt.printfln("скачок у (%.0f, %.0f): %.1f -> %.1f м", xx, zz, prev, g)
+				}
+				prev = g
+			}
+		}
+		fmt.printfln("скачков: %d", jumps)
+	}
 	// отладка: начать в ближайший день, когда здесь такая погода (её не подгоняем — ищем)
 	if opts.wx_want != "" && climate.ok {
 		face, gx, gz, ok := world_resolve(&world, i32(spawn.x), i32(spawn.z))

@@ -120,9 +120,35 @@ ridged_lod :: proc(seed: i64, p: [3]f64, scale: f64, octaves: int, cell: f64) ->
 	return sum / norm
 }
 
+// Доля размаха шума, что приходится на октавы мельче клетки (их в fbm_lod нет).
+@(private = "file")
+fbm_rest :: proc(scale: f64, octaves: int, cell: f64) -> f64 {
+	rest, amp, norm, wave := 0.0, 1.0, 0.0, scale
+	for _ in 0 ..< octaves {
+		rest += amp * (1 - clamp(wave / cell - 2, 0, 1))
+		norm += amp
+		amp *= 0.5
+		wave *= 0.5
+	}
+	return rest / norm
+}
+
 // Высота поверхности над уровнем моря, м (дно океана — со знаком минус),
 // без деталей мельче клетки cell, м.
 elevation :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
+	return elevation_ex(seed, p, cell, nil)
+}
+
+// То же и размах деталей мельче клетки (м): на сколько настоящая земля в
+// клетке бывает ниже средней (обычный край шума — 0,7 его предела). По нему
+// реки на сетке стока текут по низинам, а не по средней высоте (hydro.odin).
+elevation_amp :: proc(seed: i64, p: [3]f64, cell: f64) -> (e, amp: f64) {
+	e = elevation_ex(seed, p, cell, &amp)
+	return
+}
+
+@(private = "file")
+elevation_ex :: proc(seed: i64, p: [3]f64, cell: f64, amp: ^f64) -> f64 {
 	d := continent(seed, p, cell) - relief.thr
 	e: f64
 	if d < 0 {
@@ -132,6 +158,7 @@ elevation :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
 		abyss := 1600 * smooth(0.045, 0.16, x) // к середине океанов — глубже
 		hills := 0.0
 		if x > 0.03 do hills = 350 * fl(seed + 310, p, 25_000, 3, cell) * smooth(0.03, 0.06, x) // холмы дна
+		if amp != nil do amp^ += 0.7 * 350 * fbm_rest(25_000, 3, cell) * smooth(0.03, 0.06, x) * relief.depth_k
 		trench := 0.0
 		if x > 0.06 {
 			t := 1 - abs(fl(seed + 311, p, 900_000, 2, cell)) // глубоководные жёлоба — редкие длинные борозды
@@ -147,23 +174,38 @@ elevation :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
 		if belt > 0 {
 			rm := ridged_lod(seed + 323, p, 70_000, 9, cell)
 			e += 7000 * relief.mountain_k * belt * math.pow(rm, 1.6)
+			// гребни мельче клетки: отклонение (1 − |шум|)² от среднего — до ±0,5
+			if amp != nil do amp^ += 0.6 * 0.5 * fbm_rest(70_000, 9, cell) * 7000 * relief.mountain_k * belt * 1.6 * math.pow(max(rm, 0.05), 0.6)
 		}
 	}
 	// местный рельеф прежних версий: холмы и мелкие неровности
 	cont := fl(seed, p, 600, 3, cell)
 	e += cont * 14 + fl(seed + 11, p, 140, 4, cell) * (5 + 10 * clamp(cont + 0.3, 0, 1)) + fl(seed + 23, p, 36, 2, cell) * 1.8
+	if amp != nil do amp^ += 0.7 * (14 * fbm_rest(600, 3, cell) + 15 * fbm_rest(140, 4, cell) + 1.8 * fbm_rest(36, 2, cell))
 	return e
 }
 
-// Высота поверхности (последний блок земли) в точке шара p.
+// Высота поверхности (последний блок земли) в точке шара p — с руслами рек,
+// долинами и берегами озёр (hydro_shape.odin).
 terrain_height :: proc(seed: i64, p: [3]f64) -> i32 {
-	return i32(math.floor(elevation(seed, p, 0.5) + Y_SEA - 0.5))
+	return i32(math.floor(terrain_surface(seed, p, 0.5).ground + Y_SEA - 0.5))
+}
+
+// Земля и вода в точке шара p без деталей мельче клетки cell, м.
+terrain_surface :: proc(seed: i64, p: [3]f64, cell: f64) -> Hydro_Sample {
+	return hydro_sample(p, elevation(seed, p, cell), cell)
 }
 
 // То же для дальнего рельефа: непрерывно и без деталей мельче клетки cell, м.
 // Блоки — floor(v), их верх в среднем на v + 0,5.
 terrain_height_lod :: proc(seed: i64, p: [3]f64, cell: f64) -> f64 {
-	return elevation(seed, p, cell) + Y_SEA - 0.5
+	return terrain_surface(seed, p, cell).ground + Y_SEA - 0.5
+}
+
+// Блок, чей верх ближе всего к высоте w (м над морем): верхний блок земли или
+// воды (гладь моря — блок SEA_LEVEL).
+height_block :: proc "contextless" (w: f64) -> i32 {
+	return i32(math.floor(w + Y_SEA - 0.5))
 }
 
 // Густота леса по природной зоне (0..1): леса — сплошные массивы с полянами,
@@ -215,3 +257,11 @@ anomaly_ground :: proc(seed: u32, radius: f64, corner: int) -> i32 {
 }
 
 MONOLITH_ABOVE :: 64 // столп выше земли в вершине куба, блоков
+
+// Верхний блок земли в точке шара p и сухо ли там (нет ли над ним воды).
+terrain_dry :: proc(seed: i64, p: [3]f64) -> (h: i32, dry: bool) {
+	s := terrain_surface(seed, p, 0.5)
+	h = height_block(s.ground)
+	wet := (s.kind == .Sea || s.kind == .Lake || s.kind == .River) && height_block(s.water) > h
+	return h, !wet
+}

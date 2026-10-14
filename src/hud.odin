@@ -18,6 +18,8 @@ GOLD :: [4]u8{255, 214, 92, 255}
 @(private = "file")
 VIOLET :: [4]u8{196, 160, 255, 255}
 @(private = "file")
+AQUA :: [4]u8{130, 200, 255, 255}
+@(private = "file")
 LINE_BG :: [4]u8{40, 40, 40, 150}
 
 // Строка панели: несколько кусков текста в фиксированных колонках.
@@ -186,6 +188,51 @@ page_world :: proc(p: ^Panel, fp: ^Frame_Params) {
 	around := fp.around.y < 0 ? fmt.tprintf(", самое глубокое место %.0f м", -fp.around.y) : ""
 	panel_line(p, WHITE, fmt.tprintf("вокруг (до 40 км): самая высокая точка %.0f м%s; океан мира — %.0f%% поверхности",
 		fp.around.x, around, relief.ocean_frac * 100))
+	// реки и озёра (hydro.odin): вода здесь, ближайшая река
+	if hydro.ok {
+		s := terrain_surface(i64(w.seed), dir * geo.radius, 0.5)
+		depth := s.water - s.ground
+		speed := math.sqrt(s.flow.x * s.flow.x + s.flow.y * s.flow.y + s.flow.z * s.flow.z)
+		#partial switch s.kind {
+		case .River:
+			panel_line(p, AQUA, fmt.tprintf("река: ширина %.0f м, глубина %.1f м, расход %s, течение %.1f м/с", s.width, s.depth, flow_text(s.q), speed))
+		case .Lake:
+			panel_line(p, AQUA, fmt.tprintf("озеро: гладь на %.0f м над морем, глубина здесь %.1f м", s.water, depth))
+		}
+		// лёд на пресной воде (snow.odin): нарастает в мороз, тает весной
+		if (s.kind == .Lake || s.kind == .River) && w.snow != nil {
+			h := snow_here(w.snow, dir, s.water)
+			fast := s.kind == .River && speed > 0.75
+			switch {
+			case !h.ok:
+			case fast && h.t_water < 1:
+				panel_line(p, AQUA, fmt.tprintf("быстрая вода не замерзает (вода %.1f °C)", h.t_water))
+			case fast:
+				panel_line(p, AQUA, fmt.tprintf("вода у поверхности %.1f °C", h.t_water))
+			case h.ice >= 0.005:
+				panel_line(p, AQUA, fmt.tprintf("лёд %s%s%s", depth_text(h.ice), h.ice_snow > 0.005 ? fmt.tprintf(", на нём снег %s", depth_text(h.ice_snow)) : "",
+					h.ice >= 0.05 ? " — держит" : " — тонкий, не держит"))
+			case:
+				panel_line(p, AQUA, fmt.tprintf("льда нет, вода у поверхности %.1f °C", h.t_water))
+			}
+		}
+		#partial switch s.kind {
+		case .Sea:
+			panel_line(p, AQUA, fmt.tprintf("море: глубина здесь %.1f м", depth))
+		case .Salt:
+			panel_line(p, AQUA, fmt.tprintf("солончак: соль на дне пересохшего бессточного озера, %.0f м над морем", s.ground))
+		case .None:
+			near := s.dist < 5000 ? fmt.tprintf("до реки %s", dist_text(s.dist)) : "рек поблизости нет"
+			if s.phi > 0.05 do near = fmt.tprintf("%s; рядом озеро (гладь на %.0f м)", near, s.level)
+			panel_line(p, WHITE, near)
+		}
+	}
+}
+
+// Расход реки: м³/с, у малых — с десятыми.
+@(private = "file")
+flow_text :: proc(q: f64) -> string {
+	return q < 10 ? fmt.tprintf("%.1f м³/с", q) : fmt.tprintf("%.0f м³/с", q)
 }
 
 @(private = "file")

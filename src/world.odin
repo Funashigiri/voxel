@@ -84,7 +84,11 @@ Column :: struct {
 	trees:    [MAX_COL_TREES]Tree, // деревья, чья листва задевает колонку
 	tree_n:   int,
 	lo, hi:   i32, // полоса поверхности, блоки
-	water:    bool, // в колонке есть вода (поверхность моря)
+	water:    bool, // в колонке есть вода (море, озеро, река)
+	water_top: [CHUNK_AREA]i32, // верхний блок воды (min(i32) — воды нет), 0.019
+	wkind:    [CHUNK_AREA]Water_Kind,
+	wflow:    [CHUNK_AREA]u8, // течение: направление (4 бита, по сетке грани) | скорость << 4 (по 0,25 м/с) | 128 — пресная (замерзает)
+	water_lo, water_hi: i32, // где гладь в колонке (секции с ней строятся из блоков)
 	// недра: слои пород по колонкам блоков
 	sed:      [CHUNK_AREA]f32, // толщина осадочных слоёв, м
 	warp:     [CHUNK_AREA]f32, // сдвиг слоёв (наклон пластов), м
@@ -210,14 +214,14 @@ chunk_block :: #force_inline proc(c: ^Chunk, idx: i32) -> Block {
 // Секция sy колонки — из полосы поверхности (её нужно строить из блоков)?
 column_band_has :: proc(col: ^Column, sy: i32) -> bool {
 	if sy >= eng.floor_div(col.lo, CHUNK_SIZE) && sy <= eng.floor_div(col.hi, CHUNK_SIZE) do return true
-	return col.water && sy == eng.floor_div(SEA_LEVEL, CHUNK_SIZE)
+	return col.water && sy >= eng.floor_div(col.water_lo, CHUNK_SIZE) && sy <= eng.floor_div(col.water_hi, CHUNK_SIZE)
 }
 
 // Блок вне полосы поверхности: воздух, толща воды или камень (порода для
 // столкновений и граней неважна — всё равно сплошная).
 column_guess :: proc(col: ^Column, i: int, y: i32) -> Block {
 	if y <= col.height[i] do return col.monolith[i] ? .Monolith : .Stone
-	return y <= SEA_LEVEL ? .Water : .Air
+	return y <= col.water_top[i] ? .Water : .Air
 }
 
 // Блок в мировой (глобальной) клетке грани face. loaded = false — секция
@@ -375,8 +379,8 @@ world_update :: proc(w: ^World, center: [3]f64, budget_sec: f64) -> (all_ready: 
 			all_ready = false
 			break
 		}
-		lo_sy := eng.floor_div(min(col.lo, SEA_LEVEL), CHUNK_SIZE)
-		hi_sy := eng.floor_div(max(col.hi, SEA_LEVEL), CHUNK_SIZE)
+		lo_sy := eng.floor_div(col.water ? min(col.lo, col.water_lo) : col.lo, CHUNK_SIZE)
+		hi_sy := eng.floor_div(col.water ? max(col.hi, col.water_hi) : col.hi, CHUNK_SIZE)
 		covered := false
 		done := true
 		for sy in lo_sy ..= hi_sy {
@@ -450,6 +454,14 @@ block_boxes :: proc(w: ^World, x, y, z: i32) -> (boxes: [5][2][3]f64, n: int) {
 		boxes[0] = {o + {POST_LO, 0, POST_LO} / 16.0, o + {POST_HI, 16, POST_HI} / 16.0}
 		return boxes, 1
 	}
+	if loaded && b == .Water {
+		// лёд на пресной воде держит человека от ~5 см (snow.odin): плита у глади
+		if t := ice_on_water(w, x, y, z); t >= 0.05 {
+			boxes[0] = {o + {0, 0.875 - min(t, 0.875), 0}, o + {1, 0.9, 1}}
+			return boxes, 1
+		}
+		return
+	}
 	if loaded && !BLOCK_INFO[b].solid do return
 	boxes[0] = {o, o + 1}
 	// на снегу стоят выше блока — на сколько снег держит (отдельная коробка:
@@ -461,4 +473,20 @@ block_boxes :: proc(w: ^World, x, y, z: i32) -> (boxes: [5][2][3]f64, n: int) {
 		}
 	}
 	return boxes, 1
+}
+
+// Лёд на воде в блоке (x, y, z) кадра, м: только у глади пресной воды, где
+// течение не быстрее 0,75 м/с (быстрая вода не замерзает).
+ice_on_water :: proc(w: ^World, x, y, z: i32) -> f64 {
+	ss := w.snow
+	if ss == nil || !ss.front.ok do return 0
+	face, gx, gz, ok := world_resolve(w, x, z)
+	if !ok do return 0
+	col := world_column(w, column_key_of(face, gx, gz))
+	if col == nil do return 0
+	i := column_index(gx, gz)
+	code := col.wflow[i]
+	if col.water_top[i] != y || code & 128 == 0 || (code >> 4) & 7 > 3 do return 0
+	h := snow_here(ss, geo_frame_dir(&w.geo, f64(x) + 0.5, f64(z) + 0.5), f64(y) + 0.875 - Y_SEA)
+	return h.ok ? h.ice : 0
 }

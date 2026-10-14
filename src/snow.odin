@@ -41,6 +41,10 @@ Snow_Cell :: struct {
 	canopy: f32, // снег на хвое, мм
 	t_soil: f32, // верх почвы, °C
 	last:   f32, // часов с последнего снегопада
+	// лёд на озёрах и реках (0.019): вода остывает, потом нарастает лёд (закон Стефана)
+	ice:      f32, // толщина льда, м
+	ice_snow: f32, // снег на льду, мм воды
+	t_water:  f32, // верх воды, °C (подо льдом — 0)
 }
 
 Snow_Grid :: struct {
@@ -69,6 +73,8 @@ Snow_State :: struct {
 	front:   ^Snow_Grid, // у главного потока (текстура, физика, F3)
 	tex_buf: []f32, // RGBA по уровням для текстуры (готовит фоновый поток)
 	tex:     u32,
+	ice_buf: []f32, // лёд: толщина (м) и снег на нём (м) — RG по уровням
+	ice_tex: u32,
 	mutex:   sync.Mutex,
 	cond:    sync.Cond,
 	worker:  ^thread.Thread,
@@ -89,6 +95,9 @@ Snow_Here :: struct {
 	canopy: f64, // мм на хвое
 	cover:  f64, // доля покрытой земли
 	last:   f64, // часов с последнего снегопада
+	ice:      f64, // лёд на пресной воде здесь, м
+	ice_snow: f64, // снег на льду, м
+	t_water:  f64, // вода у поверхности, °C
 	ok:     bool,
 }
 
@@ -100,10 +109,19 @@ snow_state_init :: proc(ss: ^Snow_State, wm: ^Weather_Model, seed: u32, day_h: f
 	ss.back = new(Snow_Grid)
 	ss.front = new(Snow_Grid)
 	ss.tex_buf = make([]f32, SNOW_N * SNOW_N * SNOW_LEVELS * 4)
+	ss.ice_buf = make([]f32, SNOW_N * SNOW_N * SNOW_LEVELS * 2)
 	gl.GenTextures(1, &ss.tex)
 	// 3D-текстура: по высотам видеокарта сама смешивает соседние уровни (одна выборка)
 	gl.BindTexture(gl.TEXTURE_3D, ss.tex)
 	gl.TexImage3D(gl.TEXTURE_3D, 0, gl.RGBA16F, SNOW_N, SNOW_N, SNOW_LEVELS, 0, gl.RGBA, gl.FLOAT, nil)
+	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE)
+	gl.GenTextures(1, &ss.ice_tex)
+	gl.BindTexture(gl.TEXTURE_3D, ss.ice_tex)
+	gl.TexImage3D(gl.TEXTURE_3D, 0, gl.RG16F, SNOW_N, SNOW_N, SNOW_LEVELS, 0, gl.RG, gl.FLOAT, nil)
 	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
@@ -121,6 +139,8 @@ snow_state_destroy :: proc(ss: ^Snow_State) {
 	thread.join(ss.worker)
 	thread.destroy(ss.worker)
 	gl.DeleteTextures(1, &ss.tex)
+	gl.DeleteTextures(1, &ss.ice_tex)
+	delete(ss.ice_buf)
 	free(ss.work)
 	free(ss.back)
 	free(ss.front)
@@ -151,6 +171,11 @@ snow_step :: proc "contextless" (c: ^Snow_Cell, f: Snow_Forcing, dt: f64) {
 	snow_frac := ssmooth(2, 0, T)
 	P_snow := f.rain * snow_frac * dt
 	P_rain := f.rain * (1 - snow_frac) * dt
+	// лёд на воде — отдельно (ниже клетку снега могут переписать целиком)
+	ice, isw, tw := ice_step(c, f, dt, P_snow, f.sun * (1 - 0.75 * math.pow(clamp(f.cover, 0, 1), 3.4)))
+	defer {
+		c.ice, c.ice_snow, c.t_water = f32(ice), f32(isw), f32(tw)
+	}
 	swe := f64(c.swe)
 	rho := f64(c.rho)
 	alb := f64(c.albedo)
@@ -231,6 +256,43 @@ snow_step :: proc "contextless" (c: ^Snow_Cell, f: Snow_Forcing, dt: f64) {
 	c^ = {swe = f32(swe), rho = f32(rho), albedo = f32(alb), liquid = f32(liq), canopy = f32(can), t_soil = f32(ts), last = c.last}
 }
 
+// Лёд на стоячей и медленной пресной воде за dt часов (на этой высоте).
+// Осенью вода остывает за недели (перемешанный слой хранит тепло); когда она
+// у нуля, а воздух морозный, нарастает лёд — по закону Стефана: тем
+// медленнее, чем толще лёд и снег на нём (снег — шуба); тонкий — быстрее
+// (теплообмен с воздухом, ~15 Вт/(м²·К)). Весной тает от тепла и солнца:
+// сначала снег на льду, потом сам лёд (белизна льда ~0,45).
+@(private = "file")
+ice_step :: proc "contextless" (c: ^Snow_Cell, f: Snow_Forcing, dt, P_snow, G: f64) -> (ice, isw, tw: f64) {
+	T := f.t
+	ice, isw, tw = f64(c.ice), f64(c.ice_snow), f64(c.t_water)
+	if ice <= 0 {
+		tw += (T - tw) * (1 - math.exp(-dt / 360)) // ~15 суток
+		if tw > 0.05 || T > -1 {
+			tw = max(tw, 0.05)
+			return 0, 0, tw
+		}
+		ice, tw = 0.002, 0 // ледостав: первая корка
+	}
+	// снег ложится на лёд, если тот держит (тоньше — тает в воде)
+	if ice >= 0.05 do isw += P_snow
+	if T < 0 {
+		hs := isw / 250 // снег на льду плотный (ветер)
+		ice += 2.59e-5 * -T / (ice + 7.3 * hs + 0.147) * dt
+	}
+	melt := 0.0
+	if T > 0 do melt = 0.05 * T * dt
+	alb := isw > 1 ? 0.75 : 0.45
+	melt += 0.0094 * (1 - alb) * G * dt
+	if melt > 0 {
+		m := min(melt, isw)
+		isw -= m
+		ice -= (melt - m) / 917
+	}
+	if ice <= 0 do return 0, 0, 0.05
+	return
+}
+
 // Доля земли под снегом (Niu и Yang, 2007): тонкий снег лежит пятнами, а
 // подтаявший (серый, плотный) — тем более: сначала сходит там, где тоньше.
 // Сухой холодный слежавшийся снег лежит ровнее — показатель ниже.
@@ -298,9 +360,9 @@ snow_grid_setup :: proc(ss: ^Snow_State, g: ^Snow_Grid, req: Snow_Request) {
 		for k in 0 ..< SNOW_LEVELS {
 			c := &g.cells[(k * SNOW_N + j) * SNOW_N + i]
 			alt := g.lo + f64(k) * g.step
-			c^ = {rho = 100, albedo = 0.85, t_soil = f32(t - climate.lapse * alt), last = 1.0e6}
+			c^ = {rho = 100, albedo = 0.85, t_soil = f32(t - climate.lapse * alt), last = 1.0e6, t_water = f32(max(t - climate.lapse * alt, 0.1))}
 			// фирн: сами вечные снега — блоки снега в мире, сверху — слой, что лежит весь год
-			if alt > line do c^ = {swe = 300, rho = 500, albedo = 0.6, t_soil = -1, last = 1.0e6}
+			if alt > line do c^ = {swe = 300, rho = 500, albedo = 0.6, t_soil = -1, last = 1.0e6, t_water = 0.1}
 		}
 	}
 }
@@ -415,7 +477,7 @@ snow_worker :: proc(data: rawptr) {
 		sync.mutex_unlock(&ss.mutex)
 		if consumed && g.ok {
 			ss.back^ = g^
-			snow_fill_tex(ss.back, ss.tex_buf)
+			snow_fill_tex(ss.back, ss.tex_buf, ss.ice_buf)
 		}
 		sync.mutex_lock(&ss.mutex)
 		ss.busy = false
@@ -428,13 +490,15 @@ snow_worker :: proc(data: rawptr) {
 // Данные текстуры: глубина (м), белизна, снег на кронах (доля), плотность (т/м³);
 // долю покрытой земли шейдер считает из смешанных глубины, плотности и белизны.
 @(private = "file")
-snow_fill_tex :: proc(g: ^Snow_Grid, buf: []f32) {
+snow_fill_tex :: proc(g: ^Snow_Grid, buf, ice: []f32) {
 	for c, idx in g.cells {
 		depth := c.swe > 0 ? f64(c.swe) / f64(c.rho) : 0
 		buf[idx * 4 + 0] = f32(depth)
 		buf[idx * 4 + 1] = c.albedo
 		buf[idx * 4 + 2] = f32(clamp(f64(c.canopy) / SNOW_CANOPY_REF, 0, 1))
 		buf[idx * 4 + 3] = c.rho / 1000
+		ice[idx * 2 + 0] = c.ice
+		ice[idx * 2 + 1] = c.ice_snow / 250
 	}
 }
 
@@ -448,6 +512,8 @@ snow_update :: proc(ss: ^Snow_State, dir: [3]f64, t_h, season, hour: f64) {
 		ss.ready = false
 		gl.BindTexture(gl.TEXTURE_3D, ss.tex)
 		gl.TexSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, SNOW_N, SNOW_N, SNOW_LEVELS, gl.RGBA, gl.FLOAT, raw_data(ss.tex_buf))
+		gl.BindTexture(gl.TEXTURE_3D, ss.ice_tex)
+		gl.TexSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, SNOW_N, SNOW_N, SNOW_LEVELS, gl.RG, gl.FLOAT, raw_data(ss.ice_buf))
 		gl.BindTexture(gl.TEXTURE_3D, 0)
 	}
 	if ss.busy || ss.pending do return
@@ -486,6 +552,9 @@ snow_here :: proc(ss: ^Snow_State, d: [3]f64, alt: f64) -> (h: Snow_Here) {
 		h.swe += w * f64(c.swe)
 		h.albedo += w * f64(c.albedo)
 		h.canopy += w * f64(c.canopy)
+		h.ice += w * f64(c.ice)
+		h.ice_snow += w * f64(c.ice_snow) / 250
+		h.t_water += w * f64(c.t_water)
 		if c.swe > 0 do h.last = min(h.last, f64(c.last))
 	}
 	h.rho = h.depth > 1e-4 ? h.swe / h.depth : 100

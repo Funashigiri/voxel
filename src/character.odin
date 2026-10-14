@@ -300,8 +300,10 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 		if look <= 0 || input.jump || water_at(w, p.pos + {0, 0.9, 0}) do p.vel.y += (look - p.vel.y) * k
 		move_relative(p, strafe, forward, 0.02)
 		character_move(p, w)
-		p.vel.x *= 0.9
-		p.vel.z *= 0.9
+		// вода тормозит относительно себя: течение сносит пловца
+		cur := water_current(w, p.pos) / TICK_RATE
+		p.vel.x = cur.x + (p.vel.x - cur.x) * 0.9
+		p.vel.z = cur.y + (p.vel.z - cur.y) * 0.9
 		p.vel.y *= 0.8
 		if p.h_collision && input.jump do p.vel.y = 0.3
 	} else if p.in_water {
@@ -309,7 +311,10 @@ character_tick :: proc(p: ^Character, w: ^World, input: Move_Input) {
 		if p.sneaking do p.vel.y -= 0.04 // нырнуть
 		move_relative(p, strafe, forward, 0.02)
 		character_move(p, w)
-		p.vel *= 0.8
+		cur := water_current(w, p.pos) / TICK_RATE
+		p.vel.x = cur.x + (p.vel.x - cur.x) * 0.8
+		p.vel.y *= 0.8
+		p.vel.z = cur.y + (p.vel.z - cur.y) * 0.8
 		p.vel.y -= 0.02
 		if p.h_collision && input.jump do p.vel.y = 0.3 // выбраться на берег
 	} else if p.climb > 0 {
@@ -454,5 +459,21 @@ snow_at_feet :: proc(w: ^World, pos: [3]f64) -> (top, depth, support: f64, ok: b
 		}
 		y -= 1
 	}
+	return
+}
+
+// Течение воды в точке pos (кадр): скорость по x, z кадра, м/с (из колонки —
+// world.odin, Column.wflow; направление дано по сетке грани колонки).
+water_current :: proc(w: ^World, pos: [3]f64) -> (v: [2]f64) {
+	face, gx, gz, ok := world_resolve(w, i32(math.floor(pos.x)), i32(math.floor(pos.z)))
+	if !ok do return
+	col := world_column(w, column_key_of(face, gx, gz))
+	if col == nil do return
+	code := col.wflow[column_index(gx, gz)]
+	sp := f64((code >> 4) & 7) * 0.25
+	if sp == 0 do return
+	ang := f64(code & 15) / 16 * math.TAU
+	v = {math.cos(ang) * sp, math.sin(ang) * sp}
+	if m, placed := geo_frame_of(&w.geo, face); placed do v.x, v.y = xform_vec(m, v.x, v.y)
 	return
 }

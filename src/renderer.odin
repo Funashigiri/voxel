@@ -246,6 +246,7 @@ set_sky_uniforms :: proc(r: ^Renderer, prog: u32) {
 	eng.set_i32(eng.uniform_loc(prog, "u_fogmap"), 7)
 	eng.set_vec4(eng.uniform_loc(prog, "u_fog_cam"), r.fog_cam)
 	eng.set_i32(eng.uniform_loc(prog, "u_snow"), 6)
+	eng.set_i32(eng.uniform_loc(prog, "u_ice"), 8)
 	eng.set_vec3(eng.uniform_loc(prog, "u_snow_q0"), r.snow_q0)
 	eng.set_vec3(eng.uniform_loc(prog, "u_snow_e"), r.snow_e)
 	eng.set_vec3(eng.uniform_loc(prog, "u_snow_n"), r.snow_n)
@@ -298,6 +299,8 @@ update_air :: proc(r: ^Renderer, fp: ^Frame_Params) {
 		r.snow_lv = {f32(lv[0]), f32(lv[1]), f32(lv[2]), f32(lv[3])}
 		gl.ActiveTexture(gl.TEXTURE6)
 		gl.BindTexture(gl.TEXTURE_3D, ss.tex)
+		gl.ActiveTexture(gl.TEXTURE8)
+		gl.BindTexture(gl.TEXTURE_3D, ss.ice_tex)
 		gl.ActiveTexture(gl.TEXTURE0)
 	}
 }
@@ -508,7 +511,7 @@ render_frame :: proc(r: ^Renderer, frame: Frame_Params) {
 	eng.set_vec4(r.chunk.u_layer_a, {f32(Tex.Grass_Top), f32(Tex.Grass_Side), f32(Tex.Tall_Grass), f32(Tex.Oak_Leaves)})
 	eng.set_vec4(r.chunk.u_layer_b, {f32(Tex.Birch_Leaves), f32(Tex.Spruce_Leaves), f32(Tex.Acacia_Leaves), f32(Tex.Jungle_Leaves)})
 	eng.set_vec4(r.chunk.u_layer_c, {f32(Tex.Dandelion), f32(Tex.Poppy), -1, -1})
-	eng.set_vec4(r.chunk.u_layer_d, {f32(Tex.Oak_Twigs), f32(Tex.Birch_Twigs), -1, -1})
+	eng.set_vec4(r.chunk.u_layer_d, {f32(Tex.Oak_Twigs), f32(Tex.Birch_Twigs), f32(Tex.Ice), -1})
 	if ws := fp.weather; ws != nil && ws.here_ok {
 		eng.set_vec4(r.chunk.u_wind, {f32(ws.wind_frame.x), f32(ws.wind_frame.z), f32(ws.here.gust), 0})
 	} else {

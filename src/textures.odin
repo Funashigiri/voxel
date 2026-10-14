@@ -57,6 +57,8 @@ Tex :: enum u8 {
 	// деревья (0.016): голые ветви в кроне зимой
 	Oak_Twigs,
 	Birch_Twigs,
+	// реки и озёра (0.019): корка солончака
+	Salt,
 	Water, // первый кадр анимации воды, за ним ещё WATER_FRAMES-1 слоёв
 }
 
@@ -504,6 +506,35 @@ gen_ice :: proc() -> (img: Pixels) {
 	return
 }
 
+// Соль солончака: белая корка, разбитая на многоугольники валиками (соль
+// выпирает по трещинам), между ними чуть серее.
+@(private = "file")
+gen_salt :: proc() -> (img: Pixels) {
+	pal := []RGBA{rgb(214, 210, 200), rgb(224, 221, 212), rgb(232, 230, 222), rgb(240, 238, 232)}
+	// узлы многоугольников — по 4 на текстуру, повторяются через край
+	pts := [4][2]f32{{3, 4}, {11, 2}, {6, 11}, {14, 12}}
+	for y in 0 ..< TEX_SIZE do for x in 0 ..< TEX_SIZE {
+		d1, d2 := f32(1e9), f32(1e9)
+		for p in pts do for oy in -1 ..= 1 do for ox in -1 ..= 1 {
+			dx := f32(x) + 0.5 - p.x - f32(ox * TEX_SIZE)
+			dy := f32(y) + 0.5 - p.y - f32(oy * TEX_SIZE)
+			d := math.sqrt(dx * dx + dy * dy)
+			if d < d1 {
+				d2 = d1
+				d1 = d
+			} else if d < d2 {
+				d2 = d
+			}
+		}
+		c := pick(pal, 0.6 * h(x, y, 350) + 0.4 * vn(x, y, 4, 351))
+		edge := d2 - d1
+		if edge < 0.9 do c = rgb(248, 247, 243) // валик
+		else if edge < 1.8 do c = rgb(200, 196, 186) // тень у валика
+		img[y * TEX_SIZE + x] = c
+	}
+	return
+}
+
 // Кактус сбоку: зелёные рёбра с колючками.
 @(private = "file")
 gen_cactus_side :: proc() -> (img: Pixels) {
@@ -670,6 +701,8 @@ gen_texture :: proc(t: Tex) -> Pixels {
 		return gen_twigs([]RGBA{rgb(78, 70, 60), rgb(92, 82, 70), rgb(104, 93, 80), rgb(118, 106, 92)}, 330)
 	case .Birch_Twigs:
 		return gen_twigs([]RGBA{rgb(70, 44, 36), rgb(84, 54, 44), rgb(98, 64, 52), rgb(112, 76, 62)}, 340)
+	case .Salt:
+		return gen_salt()
 	case .Water:
 		return gen_water(0)
 	}

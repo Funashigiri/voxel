@@ -224,9 +224,9 @@ make_tree :: proc(w: ^World, face: Cube_Face, cx, cz: i32) -> (t: Tree, ok: bool
 	if tx < 3 || tz < 3 || tx > n - 5 || tz > n - 5 do return
 	if corner_dist(n, tx, tz) < MONOLITH_RADIUS + 4 do return
 	p := geo_point(&w.geo, face, tx, tz)
-	h := terrain_height(seed, p)
-	if h < SEA_LEVEL do return
-	bc := block_climate(w, face, tx, tz, f64(h) + 1 - Y_SEA, p)
+	h, dry := terrain_dry(seed, p)
+	if !dry do return // в воде деревья не растут
+	bc := block_climate(w, face, tx, tz, max(f64(h) + 1 - Y_SEA, 0), p)
 	cover := f64(forest_cover(seed, p, bc.k.biome, bc.t_max))
 	if f64(eng.hash2f(cx, cz, useed + 501)) > cover do return
 	slope: i32
@@ -699,8 +699,8 @@ find_tree_spawn :: proc(w: ^World, cx, cz: i32) -> (pos: [3]f64, yaw: f32, ok: b
 		dist := f64(best.crown) + 6
 		x := best.x + i32(math.round(math.cos(a) * dist))
 		z := best.z + i32(math.round(math.sin(a) * dist))
-		h := terrain_height(i64(w.seed), geo_point(&w.geo, face, x, z))
-		if h <= SEA_LEVEL + 1 || tree_in_the_way(w, face, x, h + 1, z) do continue
+		h, dry := terrain_dry(i64(w.seed), geo_point(&w.geo, face, x, z))
+		if !dry || h <= SEA_LEVEL + 1 || tree_in_the_way(w, face, x, h + 1, z) do continue
 		pos = {f64(x) + 0.5, f64(h) + 1, f64(z) + 0.5}
 		yaw = f32(math.atan2(-(f64(best.x) - f64(x)), f64(best.z) - f64(z)))
 		return pos, yaw, true

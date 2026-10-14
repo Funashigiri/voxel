@@ -463,6 +463,50 @@ climate_at :: proc(cm: ^Climate, c: ^Climate_Point, s: f64) -> (t, p: f64) {
 	return
 }
 
+// Те же 12 месяцев, сведённые по полосам широты (для миллионов клеток сети
+// стока, hydro.odin): над океаном, над сушей, осадки без множителя места.
+Climate_Month_Table :: struct {
+	to, tl, p: [CLIM_LAT][12]f32,
+	ra:        [CLIM_LAT][12]f32, // свет у верха атмосферы, Вт/м² (среднесуточный)
+}
+
+climate_month_table :: proc(cm: ^Climate, tab: ^Climate_Month_Table) {
+	for i in 0 ..< CLIM_LAT {
+		for m in 0 ..< 12 {
+			to, tl, pz, ra: f64
+			for q in 0 ..< 4 {
+				s := cm.season_eq + (f64(m) + (f64(q) + 0.5) / 4) / 12
+				x := math.mod(s, 1)
+				if x < 0 do x += 1
+				x *= CLIM_SEASON
+				k0 := int(x) % CLIM_SEASON
+				k1 := (k0 + 1) % CLIM_SEASON
+				g := x - math.floor(x)
+				to += math.lerp(f64(cm.t_ocean[i][k0]), f64(cm.t_ocean[i][k1]), g) / 4
+				tl += math.lerp(f64(cm.t_land[i][k0]), f64(cm.t_land[i][k1]), g) / 4
+				pz += math.lerp(f64(cm.p_zonal[i][k0]), f64(cm.p_zonal[i][k1]), g) / 4
+				ra += climate_daily_sun(cm, band_lat(i), s) / 4
+			}
+			tab.to[i][m], tab.tl[i][m], tab.p[i][m], tab.ra[i][m] = f32(to), f32(tl), f32(pz), f32(ra)
+		}
+	}
+}
+
+// Месяцы места по таблице — то же, что climate_months.
+climate_months_tab :: proc "contextless" (cm: ^Climate, tab: ^Climate_Month_Table, lat, cont, wet, alt: f64) -> (t, p, ra: [12]f64) {
+	x := (clamp(lat, -89, 89) + 89) / 2
+	i0 := min(int(x), CLIM_LAT - 2)
+	f := x - f64(i0)
+	for m in 0 ..< 12 {
+		to := f64(tab.to[i0][m]) * (1 - f) + f64(tab.to[i0 + 1][m]) * f
+		tl := f64(tab.tl[i0][m]) * (1 - f) + f64(tab.tl[i0 + 1][m]) * f
+		t[m] = to + cont * (tl - to) - cm.lapse * max(alt, 0)
+		p[m] = (f64(tab.p[i0][m]) * (1 - f) + f64(tab.p[i0 + 1][m]) * f) * wet
+		ra[m] = f64(tab.ra[i0][m]) * (1 - f) + f64(tab.ra[i0 + 1][m]) * f
+	}
+	return
+}
+
 // 12 «месяцев» года планеты.
 climate_months :: proc(cm: ^Climate, c: ^Climate_Point) -> (t, p: [12]f64) {
 	for m in 0 ..< 12 {

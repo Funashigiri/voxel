@@ -39,6 +39,7 @@ Padded :: struct {
 	tint:    [P * P]u8, // оттенок травы и листвы по климату (сухость, холод)
 	snow_h:  [P * P]i32, // куда долетает снег: первый y от низа секции
 	ever_h:  [P * P]i32, // выше — нет хвойной кроны (под ней снега меньше)
+	wflow:   [P * P]u8, // течение воды (world.odin: Column.wflow)
 }
 
 @(private = "file")
@@ -173,7 +174,9 @@ emit_cube_face :: proc(out: ^[dynamic]Chunk_Vertex, p: ^Padded, x, y, z: i32, fa
 			}
 		}
 	}
-	emit_quad(out, pos, uv, light, u16(face), layer, flags, p.tint[(z + 1) * P + (x + 1)], snow)
+	// у воды вместо оттенка — течение (направление, скорость, пресная ли)
+	tint := flags & FLAG_ANIMATED != 0 ? p.wflow[(z + 1) * P + (x + 1)] : p.tint[(z + 1) * P + (x + 1)]
+	emit_quad(out, pos, uv, light, u16(face), layer, flags, tint, snow)
 }
 
 @(private = "file")
@@ -316,6 +319,7 @@ emit_thin_wood :: proc(w: ^World, c: ^Chunk, p: ^Padded, out: ^[dynamic]Chunk_Ve
 
 @(private = "file")
 fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
+	missing := false
 	// колонки бортика берём через рёбра граней (сетка соседа может быть повёрнута)
 	x0 := c.key.x * CHUNK_SIZE
 	y0 := c.key.y * CHUNK_SIZE
@@ -330,9 +334,13 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 		col: ^Column
 		if ok do col = world_column(w, column_key_of(face, gx, gz))
 		if col == nil {
-			// пустота у вершины куба: со стороны столпа — как камень
+			// пустота у вершины куба: со стороны столпа — как камень; за краем
+			// загруженного — воздух, но рядом с водой — вода (иначе гладь у края
+			// загруженного рисовала бы стенку)
 			fill: Block = ok ? .Air : .Monolith
 			for y in i32(-1) ..= CHUNK_SIZE do p.blocks[pidx(px, y, pz)] = fill
+			if ok do missing = true
+			p.wflow[(pz + 1) * P + (px + 1)] = 0
 			p.light_h[(pz + 1) * P + (px + 1)] = min(i32)
 			p.snow_h[(pz + 1) * P + (px + 1)] = max(i32)
 			p.ever_h[(pz + 1) * P + (px + 1)] = min(i32)
@@ -357,8 +365,18 @@ fill_padded :: proc(w: ^World, c: ^Chunk, p: ^Padded) {
 		}
 		p.light_h[(pz + 1) * P + (px + 1)] = (w.bare ? col.sky_bare[ci] : col.sky[ci]) - y0
 		p.tint[(pz + 1) * P + (px + 1)] = col.tint[ci]
+		p.wflow[(pz + 1) * P + (px + 1)] = col.wflow[ci]
 		p.snow_h[(pz + 1) * P + (px + 1)] = col.sky_snow[ci] - y0
 		p.ever_h[(pz + 1) * P + (px + 1)] = col.sky_bare[ci] - y0
+	}
+	if !missing do return
+	// незагруженные колонки бортика: где у соседней внутренней клетки вода — тоже вода
+	for pz in i32(-1) ..= CHUNK_SIZE do for px in i32(-1) ..= CHUNK_SIZE {
+		if px >= 0 && pz >= 0 && px < CHUNK_SIZE && pz < CHUNK_SIZE do continue
+		ix, iz := clamp(px, 0, CHUNK_SIZE - 1), clamp(pz, 0, CHUNK_SIZE - 1)
+		for y in i32(-1) ..= CHUNK_SIZE {
+			if pb(p, px, y, pz) == .Air && pb(p, ix, y, iz) == .Water do p.blocks[pidx(px, y, pz)] = .Water
+		}
 	}
 }
 

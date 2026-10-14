@@ -132,6 +132,17 @@ vec4 snow_at(vec3 rel, float alt, out float inside) {
 	float l = clamp((alt - u_snow_lv.x) / u_snow_lv.y, 0.0, u_snow_lv.z - 1.0);
 	return textureLod(u_snow, vec3(uv, (l + 0.5) / u_snow_lv.z), 0.0);
 }
+uniform sampler3D u_ice; // лёд на пресной воде (snow.odin): толщина (м), снег на нём (м)
+// лёд в точке rel на высоте alt (за краем сетки — нет)
+vec2 ice_at(vec3 rel, float alt) {
+	if (u_snow_lv.w < 0.5) return vec2(0.0);
+	vec3 dq = u_cloud_q0 + u_cloud_jq * rel - u_snow_q0;
+	vec2 uv = vec2(0.5) + vec2(dot(dq, u_snow_e), dot(dq, u_snow_n));
+	vec2 e = abs(uv - 0.5);
+	if (max(e.x, e.y) > 0.5) return vec2(-1.0);
+	float l = clamp((alt - u_snow_lv.x) / u_snow_lv.y, 0.0, u_snow_lv.z - 1.0);
+	return textureLod(u_ice, vec3(uv, (l + 0.5) / u_snow_lv.z), 0.0).xy;
+}
 // доля покрытой земли (Niu и Yang, 2007; как snow_coverage в snow.odin): тонкий снег
 // и подтаявший (серый, плотный) лежит пятнами
 float snow_cov(vec4 s) {
@@ -322,6 +333,7 @@ out vec4 v_snow;     // снег здесь (snow.odin): глубина (м), б
 out float v_snow_in; // 1 — внутри сетки снега (за краем — по климату)
 out float v_expo;    // открытость снегу (0…1)
 out float v_hy;      // боковая грань: высота над низом блока (выше 1 — лёгший сверху снег)
+flat out int v_wcode; // вода: течение (world.odin, Column.wflow), иначе −1
 uniform vec3 u_cloud_q0;
 uniform mat3 u_cloud_jq;
 ` + SNOW_GLSL + `
@@ -343,6 +355,14 @@ void main() {
 	float layer = base;
 	if ((flags & 1u) != 0u) layer += float(int(u_time * 10.0) % 32); // WATER_FRAMES
 	v_uvl = vec3(vec2(a_tex.xy) * (1.0 / 16.0), layer);
+	if ((flags & 1u) != 0u) {
+		// вода: течение (world.odin, Column.wflow) — узор плывёт по нему; на
+		// уступах реки (боковые грани проточной воды) — стекает вниз
+		float sp = float((a_tex.w >> 4u) & 7u) * 0.25; // м/с
+		float ang = float(a_tex.w & 15u) * (6.2831853 / 16.0);
+		if (face == 2u) v_uvl.xy -= vec2(cos(ang), sin(ang)) * (sp * u_time);
+		else if (sp > 0.0) v_uvl.y -= 1.5 * u_time;
+	}
 	v_light = float(a_pos.w & 255u) / 255.0 * shade;
 	v_rel = p;
 	v_alt = u_chunk_alt + q.y;
@@ -356,6 +376,7 @@ void main() {
 	else if (base == u_layer_b.y || base == u_layer_b.z || base == u_layer_b.w) kind = 5;
 	else if (base == u_layer_c.x || base == u_layer_c.y) kind = 7;
 	if ((flags & 1u) != 0u) kind = 0; // вода
+	v_wcode = (flags & 1u) != 0u ? int(a_tex.w) : -1;
 	v_kind = kind;
 	vec3 cell = floor(q - vec3(0.01));
 	v_hash = fract(sin(dot(cell + u_origin * 0.0, vec3(12.9898, 78.233, 37.719)) + u_chunk_alt * 0.37) * 43758.5453);
@@ -409,6 +430,7 @@ in vec4 v_snow;
 in float v_snow_in;
 in float v_expo;
 in float v_hy;
+flat in int v_wcode;
 uniform sampler2DArray u_atlas;
 uniform float u_alpha_cutoff;
 uniform vec2 u_fog; // туман под водой
@@ -416,7 +438,7 @@ uniform vec4 u_season; // температура у моря сейчас (°C),
 uniform float u_lapse; // похолодание с высотой, К/м
 uniform vec4 u_layer_a;
 uniform vec4 u_layer_b;
-uniform vec4 u_layer_d; // веточки дуба и берёзы (голая крона)
+uniform vec4 u_layer_d; // веточки дуба и берёзы (голая крона), лёд
 out vec4 o_color;
 ` + SKY_GLSL + HAZE_GLSL + CLOUD_GLSL + FOG_GLSL + SNOW_GLSL + ANOMALY_GLSL + SEASON_GLSL + `
 void main() {
@@ -439,6 +461,18 @@ void main() {
 			// веточек в клетке, и точка остаётся с такой вероятностью
 			float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
 			if (c.a <= dither * 0.98 + 0.01) discard;
+		}
+	}
+	// лёд на пресной воде (snow.odin) — на глади, где течение не быстрее 0,75 м/с;
+	// тонкий — тёмный и прозрачный, толще — белёсый; снег на нём — сверху
+	float ice_snow = -1.0;
+	if (v_wcode >= 0 && (v_wcode & 128) != 0 && v_face == 2 && ((v_wcode >> 4) & 7) <= 3) {
+		vec2 ic = ice_at(v_rel, v_alt);
+		if (ic.x > 0.005) {
+			vec3 itex = texture(u_atlas, vec3(fract(v_wpos.xz), u_layer_d.z)).rgb;
+			float k = smoothstep(0.005, 0.1, ic.x);
+			c = vec4(mix(c.rgb * 0.75, itex, k), mix(0.85, 1.0, k));
+			ice_snow = ic.y;
 		}
 	}
 	if (!twigs && c.a < u_alpha_cutoff) discard;
@@ -479,6 +513,13 @@ void main() {
 			float k = top ? (twigs ? 0.6 : (v_kind == 5 ? 0.9 : 0.6)) : (twigs ? 0.15 : 0.35);
 			base = mix(base, snow_col, can * k);
 		}
+	}
+	// снег на льду (пятнами, пока тонкий)
+	if (ice_snow > 0.001) {
+		float grain = hash13(floor(v_wpos * 16.0) + 0.5);
+		float cov = tanh(ice_snow / 0.02);
+		float spot = cov > 0.995 ? 0.0 : clamp((0.7 * vnoise3(v_wpos * 0.4) + 0.3 * grain - 0.5) * 2.4 + 0.5, 0.0, 1.0);
+		if (spot < cov) base = snow_col * (0.96 + 0.04 * grain);
 	}
 	// бок блока выше его верха — это лёгший сверху снег
 	if (v_hy > 1.0 && u_season.w > 0.5) base = snow_col;
@@ -671,20 +712,30 @@ out vec4 v_col;
 out vec3 v_season; // температура здесь сейчас, её ход за месяц, осадки за месяц
 out vec2 v_crowns; // доли листопадных и хвойных крон
 out float v_alt;    // высота над морем, м
+out vec3 v_floor;   // у воды — цвет дна (сквозь ближнюю воду у края блоков)
+out float v_fresh;  // 1 — пресная вода (зимой лёд)
+out float v_low;    // 1 — вершина опущена под блоками (у воды — дно: наклонная гладь видна сквозь ближнюю воду)
 ` + LOGDEPTH_GLSL + `
 void main() {
 	vec3 P = u_org + a_off;
 	float r = length(P);
 	vec4 z = texture(u_clim, vec2((degrees(asin(clamp(P.y / r, -1.0, 1.0))) + 90.0) / 180.0, 0.5));
-	v_season = vec3(mix(z.x, z.y, a_clim.x) - u_lapse * max(r - u_radius, 0.0), z.w, z.z * a_clim.y * 2.55);
+	bool wv = a_color.a > 0.5; // у воды в a_clim — цвет дна, материковость возьмём среднюю
+	v_season = vec3(mix(z.x, z.y, wv ? 0.3 : a_clim.x) - u_lapse * max(r - u_radius, 0.0), z.w, wv ? 0.0 : z.z * a_clim.y * 2.55);
+	v_fresh = wv && a_color.a < 0.99 ? 1.0 : 0.0; // озеро или река (far_terrain.odin: a = 250)
 	v_crowns = a_clim.zw;
+	v_floor = a_clim.rgb;
 	v_alt = r - u_radius;
 	vec3 rel = u_rel_o + u_jinv * a_off;
 	if (u_floor > 0.5 && a_color.a > 0.5) rel.y -= max(a_normal.w * 127.0, 2.0);
 	// под блоками (у их края) рельеф опущен: блоки рисуются поверх, а щели на
 	// стыке закрывает он, а не небо
 	vec2 m = (u_mask_org.xy + rel.xz) / 16.0;
-	if (m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z && texelFetch(u_mask, ivec2(m), 0).r > 0.25) rel.y -= 6.0;
+	v_low = 0.0;
+	if (m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z && texelFetch(u_mask, ivec2(m), 0).r > 0.25) {
+		rel.y -= 6.0;
+		v_low = 1.0;
+	}
 	v_rel = rel;
 	v_n = u_jt * a_normal.xyz;
 	v_col = a_color;
@@ -699,6 +750,9 @@ in vec4 v_col;
 in vec3 v_season;
 in vec2 v_crowns;
 in float v_alt;
+in vec3 v_floor;
+in float v_fresh;
+in float v_low;
 uniform float u_season_on; // 1 — климат есть
 uniform sampler2D u_mask;   // какие чанки уже нарисованы блоками
 uniform vec3 u_mask_org;    // камера в маске (блоки), размер маски (чанки)
@@ -709,7 +763,7 @@ out vec4 o_color;
 void main() {
 	vec2 m = (u_mask_org.xy + v_rel.xz) / 16.0;
 	float under = m.x >= 0.0 && m.y >= 0.0 && m.x < u_mask_org.z && m.y < u_mask_org.z ? texelFetch(u_mask, ivec2(m), 0).r : 0.0;
-	if (under > 0.75) discard;
+	if (under > 0.75 && length(v_rel) < 990.0) discard; // блоки дальше 1000 м отсекает их дальняя плоскость (camera.odin)
 	vec3 n = normalize(v_n);
 	float dist = length(v_rel);
 	float water = v_col.a;
@@ -743,8 +797,24 @@ void main() {
 		base = mix(base, scol, clamp(cov * open + can * (0.55 * conif + 0.2 * decid), 0.0, 1.0));
 	}
 	vec3 col = apply_light(base * shade * cloud_shadow(v_rel));
-	if (water > 0.5 && (u_floor > 0.5 || under > 0.25 || dot(v_rel, n) > 0.0)) {
-		// гладь снизу или под ближней водой: сквозь неё должно быть видно тёмное дно
+	// лёд на озёрах и реках (snow.odin); за краем сетки снега — по климату
+	bool iced = false;
+	if (water > 0.5 && v_fresh > 0.5 * water && u_floor < 0.5 && under < 0.25 && dot(v_rel, n) <= 0.0) {
+		vec2 ic = ice_at(v_rel, v_alt);
+		if (ic.x < 0.0) ic = vec2(u_season_on > 0.5 ? 0.3 * smoothstep(-1.0, -6.0, v_season.x) : 0.0, 0.0);
+		if (ic.x > 0.005) {
+			vec3 ice_col = mix(v_col.rgb * 0.75, vec3(0.64, 0.75, 0.88), smoothstep(0.005, 0.1, ic.x));
+			ice_col = mix(ice_col, SNOW_COLOR, tanh(ic.y / 0.02));
+			col = apply_light(ice_col * shade * cloud_shadow(v_rel));
+			iced = true;
+		}
+	}
+	if (iced) {
+	} else if (water > 0.5 && (u_floor > 0.5 || under > 0.25 || v_low > 0.01)) {
+		// дно под ближней водой (у края блоков лучи уходят под неё): как у блоков — в тени воды
+		col = apply_light(v_floor * cloud_shadow(v_rel));
+	} else if (water > 0.5 && dot(v_rel, n) > 0.0) {
+		// гладь снизу
 		col = apply_light(v_col.rgb * 0.45);
 	} else if (water > 0.5) {
 		// гладь отражает небо, сильнее всего — у горизонта (скользящий взгляд)

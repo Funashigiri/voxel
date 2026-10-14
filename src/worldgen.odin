@@ -71,13 +71,26 @@ far_selftest :: proc(seed: u32, g: ^Planet_Geo) -> (ridge_mean, diff_mean, diff_
 
 // Поверхность и подстилка в клетке по климату: ледник — снег на льду, тундра
 // — мхи, осыпи и скалы у снеговой линии, пустыни — песок и щебень, сухие
-// степи и саванны — с проплешинами земли.
-surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32, bc: ^Block_Climate) -> (surface, filler: Block) {
-	if h < SEA_LEVEL - 1 {
+// степи и саванны — с проплешинами земли. Под водой (under — какой, depth —
+// блоков воды): дно моря — песок у берега, глубже ил и гравий; русло — галька
+// и песок; дно озера — песок у берега, глубже ил; солончак — корка соли.
+surface_for :: proc(seed: i64, p: [3]f64, h, slope: i32, bc: ^Block_Climate, under: Water_Kind = .None, depth: i32 = 0) -> (surface, filler: Block) {
+	#partial switch under {
+	case .Sea:
 		n := fbm(seed + 131, p, 24, 2)
-		if h >= SEA_LEVEL - 4 || n > 0.25 do return .Sand, .Sand
+		if depth <= 3 || n > 0.25 do return .Sand, .Sand
 		if n < -0.2 do return .Gravel, .Gravel
 		return .Dirt, .Dirt
+	case .River:
+		n := fbm(seed + 132, p, 7, 2) // течение уносит мелкое: в стремнине галька, в затишье песок
+		return n > -0.15 ? .Gravel : .Sand, .Gravel
+	case .Lake:
+		n := fbm(seed + 133, p, 30, 2)
+		if depth <= 2 || n > 0.35 do return .Sand, .Sand
+		if n < -0.25 do return .Gravel, .Gravel
+		return .Dirt, .Dirt // ил
+	case .Salt:
+		return .Salt, .Sand
 	}
 	biome := bc.k.biome
 	if biome == .Ice_Cap do return .Snow, .Ice // ледник спускается и к самому морю
@@ -133,9 +146,24 @@ generate_column :: proc(w: ^World, col: ^Column) {
 
 	points: [N * N][3]f64
 	heights: [N * N]i32
+	wtop: [N * N]i32 // верхний блок воды (min(i32) — нет)
+	wkind: [N * N]Water_Kind
+	wflow: [N * N]u8
+	salt: [N * N]bool
 	for j in 0 ..< N do for i in 0 ..< N {
-		points[j * N + i] = geo_point(&w.geo, face, x0 + i32(i) - PAD, z0 + i32(j) - PAD)
-		heights[j * N + i] = terrain_height(seed, points[j * N + i])
+		k := j * N + i
+		points[k] = geo_point(&w.geo, face, x0 + i32(i) - PAD, z0 + i32(j) - PAD)
+		s := terrain_surface(seed, points[k], 0.5)
+		heights[k] = height_block(s.ground)
+		wtop[k] = min(i32)
+		if s.kind == .Sea || s.kind == .Lake || s.kind == .River {
+			if t := height_block(s.water); t > heights[k] {
+				wtop[k] = t
+				wkind[k] = s.kind
+				wflow[k] = water_flow_code(face, points[k], s.flow, s.kind != .Sea)
+			}
+		}
+		salt[k] = s.kind == .Salt
 	}
 	slope_at :: proc(heights: ^[N * N]i32, i, j: int) -> i32 {
 		h := heights[j * N + i]
@@ -151,26 +179,36 @@ generate_column :: proc(w: ^World, col: ^Column) {
 	pillar_top := anomaly_ground(w.seed, w.geo.radius, corner) + MONOLITH_ABOVE
 
 	col.lo, col.hi = max(i32), min(i32)
+	col.water_lo, col.water_hi = max(i32), min(i32)
 	for lz in 0 ..< i32(CHUNK_SIZE) do for lx in 0 ..< i32(CHUNK_SIZE) {
 		i := int(lz * CHUNK_SIZE + lx)
 		pi, pj := int(lx) + PAD, int(lz) + PAD
-		h := heights[pj * N + pi]
-		col.points[i] = points[pj * N + pi]
+		k := pj * N + pi
+		h := heights[k]
+		col.points[i] = points[k]
+		col.water_top[i] = wtop[k]
+		col.wkind[i] = wkind[k]
+		col.wflow[i] = wflow[k]
 		if corner_dist(n, x0 + lx, z0 + lz) < MONOLITH_RADIUS {
 			col.monolith[i] = true
 			col.height[i] = pillar_top
 			col.surface[i], col.filler[i] = .Monolith, .Monolith
+			col.water_top[i] = min(i32)
 		} else {
 			col.height[i] = h
-			bc := block_climate(w, face, x0 + lx, z0 + lz, h < SEA_LEVEL ? -1 : f64(h) + 1 - Y_SEA, col.points[i])
+			// под морем — морская зона; суша ниже уровня моря и дно озёр — по климату суши
+			bc := block_climate(w, face, x0 + lx, z0 + lz, wkind[k] == .Sea ? -1 : max(f64(h) + 1 - Y_SEA, 0), col.points[i])
 			col.biome[i] = bc.k.biome
 			col.tint[i] = bc.tint
-			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj), &bc)
+			under := wtop[k] > h ? wkind[k] : (salt[k] ? .Salt : .None)
+			col.surface[i], col.filler[i] = surface_for(seed, col.points[i], h, slope_at(&heights, pi, pj), &bc, under, wtop[k] > h ? wtop[k] - h : 0)
 		}
 		col.sky[i] = col.height[i] + 1
-		if col.height[i] < SEA_LEVEL {
+		if col.water_top[i] > col.height[i] {
 			col.water = true
-			col.sky[i] = SEA_LEVEL + 1 // вода гасит свет неба
+			col.sky[i] = col.water_top[i] + 1 // вода гасит свет неба
+			col.water_lo = min(col.water_lo, col.water_top[i])
+			col.water_hi = max(col.water_hi, col.water_top[i])
 		}
 		col.sky_bare[i] = col.sky[i]
 		col.sky_snow[i] = col.sky[i]
@@ -254,8 +292,8 @@ strata :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
 column_block :: proc(col: ^Column, i: int, y: i32, seed: u32) -> Block {
 	h := col.height[i]
 	if y > h {
-		if y == SEA_LEVEL && col.biome[i] == .Sea_Ice do return .Ice // многолетний лёд на море
-		return y <= SEA_LEVEL ? .Water : .Air
+		if y == col.water_top[i] && col.wkind[i] == .Sea && col.biome[i] == .Sea_Ice do return .Ice // многолетний лёд на море
+		return y <= col.water_top[i] ? .Water : .Air
 	}
 	if col.monolith[i] do return .Monolith
 	if col.surface[i] == .Stone do return strata(col, i, y, seed) // голая скала: сразу пласты
@@ -356,12 +394,12 @@ generate_section :: proc(w: ^World, col: ^Column, c: ^Chunk) {
 	c.fill = first
 }
 
-// Высота и уклон колонки (для поиска места появления).
+// Высота и уклон колонки (для поиска места появления); dry — над землёй нет воды.
 @(private = "file")
-column_at :: proc(w: ^World, x, z: i32) -> (h, slope: i32, p: [3]f64) {
+column_at :: proc(w: ^World, x, z: i32) -> (h, slope: i32, p: [3]f64, dry: bool) {
 	s := i64(w.seed)
 	p = geo_point(&w.geo, w.geo.face, x, z)
-	h = terrain_height(s, p)
+	h, dry = terrain_dry(s, p)
 	for d in ([4][2]i32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
 		slope = max(slope, abs(h - terrain_height(s, geo_point(&w.geo, w.geo.face, x + d.x, z + d.y))))
 	}
@@ -379,8 +417,8 @@ find_spawn :: proc(w: ^World, cx, cz: i32, zone := true) -> [3]f64 {
 				face, gx, gz, ok := world_resolve(w, x, z)
 				if !ok do continue // пустота у вершины
 				if corner_dist(w.geo.n, x, z) < MONOLITH_RADIUS + 2 do continue
-				h, slope, p := column_at(w, x, z)
-				if h <= SEA_LEVEL + 2 do continue
+				h, slope, p, dry := column_at(w, x, z)
+				if !dry || h <= SEA_LEVEL + 2 do continue // не в воде и не у самого моря
 				bc := block_climate(w, face, gx, gz, f64(h) + 1 - Y_SEA, p)
 				surface, _ := surface_for(i64(w.seed), p, h, slope, &bc)
 				if zone && !(surface == .Grass && climate_start_zone(bc.k)) do continue
@@ -390,30 +428,125 @@ find_spawn :: proc(w: ^World, cx, cz: i32, zone := true) -> [3]f64 {
 			}
 		}
 	}
-	h, _, _ := column_at(w, cx, cz)
+	h, _, _, _ := column_at(w, cx, cz)
 	return {f64(cx) + 0.5, f64(h) + 1, f64(cz) + 0.5}
 }
 
 // Отладка: ровно в колонке (x, z) — на суше или на воде.
 spawn_at :: proc(w: ^World, x, z: i32) -> [3]f64 {
-	h, _, _ := column_at(w, x, z)
-	if h < SEA_LEVEL do return {f64(x) + 0.5, SEA_LEVEL - 0.4, f64(z) + 0.5}
+	h, _, p, dry := column_at(w, x, z)
+	if !dry do return {f64(x) + 0.5, f64(height_block(terrain_surface(i64(w.seed), p, 0.5).water)) - 0.4, f64(z) + 0.5}
 	return {f64(x) + 0.5, f64(h) + 1, f64(z) + 0.5}
 }
 
-// Отладка: точка над глубокой водой недалеко от (cx, cz).
-find_water_spawn :: proc(w: ^World, cx, cz: i32) -> [3]f64 {
-	for r := i32(0); r < 1200; r += 4 {
-		for dz := -r; dz <= r; dz += 4 {
-			for dx := -r; dx <= r; dx += 4 {
-				if max(abs(dx), abs(dz)) != r do continue
-				if terrain_height(i64(w.seed), geo_point(&w.geo, w.geo.face, cx + dx, cz + dz)) < SEA_LEVEL - 5 {
-					return {f64(cx + dx) + 0.5, SEA_LEVEL - 0.4, f64(cz + dz) + 0.5}
+// Отладка: вода недалеко от (cx, cz). want: .None — любая глубокая рядом;
+// .River — река шире min_w (встаём в её середину), .Lake, .Sea — встаём на
+// берегу лицом к воде. Сначала ищется по сети стока, потом — точно.
+find_water_spawn :: proc(w: ^World, cx, cz: i32, want: Water_Kind = .None, min_w: f64 = 12, on_water := false, mode := "") -> (pos: [3]f64, yaw: f32, ok: bool) {
+	seed := i64(w.seed)
+	h := &hydro
+	if h.ok && want != .None {
+		d0 := geo_frame_dir(&w.geo, f64(cx) + 0.5, f64(cz) + 0.5)
+		face, fx, fz := hydro_locate(h.m, d0)
+		best_d := max(f64)
+		target, ahead: [3]f64 // куда встать; куда смотреть (вниз по реке)
+		R :: 25 // клеток сети вокруг
+		for dj in -R ..= R do for di in -R ..= R {
+			n := hydro_cell_at(h, face, int(fx) + di, int(fz) + dj)
+			pt: [3]f64
+			#partial switch want {
+			case .River:
+				if h.kind[n] != .Land || h.rcv[n] == 255 || HYDRO_W_K * math.sqrt(f64(h.q[n])) < min_w do continue
+				r := hydro_nb(h, n, int(h.rcv[n]))
+				if r < 0 || h.kind[r] != .Land do continue
+				switch mode {
+				case "canyon": // горная река: гладь падает круче 6 м на км
+					if f64(h.level[n] - h.level[r]) < 0.006 * h.cell do continue
+				case "mouth": // за одну клетку до моря
+					if h.rcv[r] == 255 do continue
+					if rr := hydro_nb(h, r, int(h.rcv[r])); rr < 0 || h.kind[rr] != .Ocean do continue
+				}
+				pt = hydro_node(h, n) + hydro_node(h, r) // середина пути — точно на реке (там изгибы сходят на нет)
+				pt /= math.sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z)
+				if dd := pt - d0; dd.x * dd.x + dd.y * dd.y + dd.z * dd.z < best_d do ahead = hydro_node(h, r)
+			case .Lake:
+				if h.kind[n] != .Lake do continue
+				pt = hydro_cell_dir(h, n)
+			case .Sea:
+				if h.kind[n] != .Ocean do continue
+				pt = hydro_cell_dir(h, n)
+			case .Salt:
+				if h.kind[n] != .Salt do continue
+				pt = hydro_cell_dir(h, n)
+			case:
+				continue
+			}
+			dd := pt - d0
+			if dist := dd.x * dd.x + dd.y * dd.y + dd.z * dd.z; dist < best_d {
+				best_d, target = dist, pt
+			}
+		}
+		if best_d < max(f64) {
+			tf, x, z := geo_locate(&w.geo, target)
+			if m, placed := geo_frame_of(&w.geo, tf); placed {
+				x, z = xform_pos(m, x, z)
+				if want == .River {
+					// в середине реки, лицом вниз по течению; русло извилисто — ищем воду рядом
+					bx, bz, found := kind_near(w, i32(math.floor(x)), i32(math.floor(z)), .River)
+					if !found do return find_spawn(w, cx, cz), 0, false
+					x, z = f64(bx), f64(bz)
+					s := terrain_surface(seed, geo_point(&w.geo, w.geo.face, bx, bz), 0.5)
+					af, ax, az := geo_locate(&w.geo, ahead)
+					yw: f32 = 0
+					if am, ap := geo_frame_of(&w.geo, af); ap {
+						ax, az = xform_pos(am, ax, az)
+						yw = f32(math.atan2(-(ax - x), az - z))
+					}
+					return {math.floor(x) + 0.5, f64(height_block(s.water)) - 0.4, math.floor(z) + 0.5}, yw, true
+				}
+				if want == .Salt {
+					// на самой корке соли, лицом к месту высадки
+					bx, bz, found := kind_near(w, i32(math.floor(x)), i32(math.floor(z)), .Salt)
+					if !found do return find_spawn(w, cx, cz), 0, false
+					h2, _ := terrain_dry(seed, geo_point(&w.geo, w.geo.face, bx, bz))
+					return {f64(bx) + 0.5, f64(h2) + 1, f64(bz) + 0.5}, f32(math.atan2(-(f64(cx) - f64(bx)), f64(cz) - f64(bz))), true
+				}
+				// к берегу: от воды в сторону места высадки, пока не станет сухо
+				dx, dz := f64(cx) - x, f64(cz) - z
+				l := math.sqrt(dx * dx + dz * dz)
+				if l > 1 {
+					dx, dz = dx / l, dz / l
+					for s := 0.0; s < 60_000; s += 6 {
+						bx, bz := i32(math.floor(x + dx * s)), i32(math.floor(z + dz * s))
+						if _, _, _, inside := world_resolve(w, bx, bz); !inside do break
+						if hh, dry := terrain_dry(seed, geo_point(&w.geo, w.geo.face, bx, bz)); dry {
+							// ещё немного от воды — чтобы видеть её с берега (или на воду — на лёд)
+							back := on_water ? s - 25 : s + 12
+							bx, bz = i32(math.floor(x + dx * back)), i32(math.floor(z + dz * back))
+							if on_water {
+								sw := terrain_surface(seed, geo_point(&w.geo, w.geo.face, bx, bz), 0.5)
+								return {f64(bx) + 0.5, f64(height_block(sw.water)) + 1, f64(bz) + 0.5}, f32(math.atan2(-dx, dz)), true
+							}
+							hh, _ = terrain_dry(seed, geo_point(&w.geo, w.geo.face, bx, bz))
+							return {f64(bx) + 0.5, f64(hh) + 1, f64(bz) + 0.5}, f32(math.atan2(dx, -dz)), true
+						}
+					}
 				}
 			}
 		}
 	}
-	return find_spawn(w, cx, cz)
+	for r := i32(0); r < 1200; r += 4 {
+		for dz := -r; dz <= r; dz += 4 {
+			for dx := -r; dx <= r; dx += 4 {
+				if max(abs(dx), abs(dz)) != r do continue
+				s := terrain_surface(seed, geo_point(&w.geo, w.geo.face, cx + dx, cz + dz), 0.5)
+				if s.kind != .None && s.kind != .Salt && height_block(s.water) - height_block(s.ground) >= 5 {
+					return {f64(cx + dx) + 0.5, f64(height_block(s.water)) - 0.4, f64(cz + dz) + 0.5}, 0, true
+				}
+			}
+		}
+	}
+	return find_spawn(w, cx, cz), 0, false
 }
 
 // Отладка: самый крутой обрыв в радиусе 3 км от (cx, cz) — встаём у подножия
@@ -607,4 +740,30 @@ undergrowth :: proc(seed: u32, wx, wz: i32, biome: Biome) -> (tall: i32, leaves:
 		if b < 0.09 do return b < 0.045 ? 2 : 1, .Jungle_Leaves
 	}
 	return 0, .Air
+}
+
+// Отладка: ближайшая к (x, z) клетка с водой вида kind (до 1,5 км, по спирали);
+// у реки — ближе к середине русла.
+@(private = "file")
+kind_near :: proc(w: ^World, x, z: i32, kind: Water_Kind) -> (bx, bz: i32, ok: bool) {
+	seed := i64(w.seed)
+	best := -1.0
+	r_found := i32(-1)
+	for r := i32(0); r < 1500; r += 3 {
+		for dz := -r; dz <= r; dz += 3 {
+			for dx := -r; dx <= r; dx += 3 {
+				if max(abs(dx), abs(dz)) != r do continue
+				if _, _, _, inside := world_resolve(w, x + dx, z + dz); !inside do continue
+				s := terrain_surface(seed, geo_point(&w.geo, w.geo.face, x + dx, z + dz), 0.5)
+				if s.kind != kind do continue
+				// ближе к середине русла — лучше (s.dist — до середины)
+				if best < 0 || s.dist < best {
+					best, bx, bz, ok = s.dist, x + dx, z + dz, true
+				}
+				if r_found < 0 do r_found = r
+			}
+		}
+		if ok && r > r_found + 120 do return // русло уже пройдено поперёк
+	}
+	return
 }
